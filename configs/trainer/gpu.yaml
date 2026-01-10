@@ -1,0 +1,12 @@
+# GPU trainer configuration
+defaults:
+  - default
+
+# GPU-specific settings
+accelerator: gpu
+devices: 1
+precision: 16-mixed  # Mixed precision for faster training
+
+# Multi-GPU settings (uncomment for distributed training)
+# devices: -1  # Use all available GPUs
+# strategy: ddp  # Distributed Data Parallel

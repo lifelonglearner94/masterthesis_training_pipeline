@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: default
+  - model: null          # Keeps src/models agnostic
+  - callbacks: default
+  - logger: wandb
+  - trainer: default
+  - paths: default
+  - experiment: null
+  - debug: null
+
+task_name: "train"
+tags: ["dev"]
+train: True
+test: True
+
+# Gold Standard Requirement:
+deterministic: True
+seed: 42

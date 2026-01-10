@@ -1,0 +1,42 @@
+# Weights & Biases logger configuration
+wandb:
+  _target_: pytorch_lightning.loggers.WandbLogger
+
+  # Project name in W&B
+  project: "titans-vs-vit-research"
+
+  # Run name (null = auto-generated)
+  name: null
+
+  # Save directory
+  save_dir: "${paths.output_dir}"
+
+  # Offline mode (set to True if no internet)
+  offline: False
+
+  # Unique run id
+  id: null
+
+  # Anonymous mode
+  anonymous: null
+
+  # Project version
+  version: null
+
+  # Log model checkpoints
+  log_model: False
+
+  # Prefix for logged keys
+  prefix: ""
+
+  # W&B entity (team or username)
+  entity: null
+
+  # Experiment group
+  group: null
+
+  # Tags for the run
+  tags: ${tags}
+
+  # Job type
+  job_type: null

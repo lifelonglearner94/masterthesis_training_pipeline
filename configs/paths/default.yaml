@@ -1,0 +1,17 @@
+# Default paths configuration
+# These paths are relative to the project root
+
+# Root directory of the project
+root_dir: ${hydra:runtime.cwd}
+
+# Data directory
+data_dir: ${paths.root_dir}/data
+
+# Logs directory
+log_dir: ${paths.root_dir}/logs
+
+# Output directory for this run
+output_dir: ${hydra:runtime.output_dir}
+
+# Working directory
+work_dir: ${hydra:runtime.cwd}

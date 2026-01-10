@@ -1,0 +1,13 @@
+# Default callbacks configuration
+defaults:
+  - model_checkpoint
+
+rich_progress:
+  _target_: pytorch_lightning.callbacks.RichProgressBar
+
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: "val/loss"
+  patience: 10
+  mode: "min"
+  verbose: True

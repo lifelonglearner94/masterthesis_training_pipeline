@@ -1,0 +1,38 @@
+# Default trainer configuration
+_target_: pytorch_lightning.Trainer
+
+# Training settings
+default_root_dir: ${paths.output_dir}
+min_epochs: 1
+max_epochs: 10
+
+# Hardware settings
+accelerator: auto
+devices: auto
+precision: 32
+
+# Determinism
+deterministic: ${deterministic}
+
+# Gradient settings
+gradient_clip_val: null
+gradient_clip_algorithm: null
+accumulate_grad_batches: 1
+
+# Validation settings
+check_val_every_n_epoch: 1
+val_check_interval: 1.0
+
+# Logging
+log_every_n_steps: 50
+
+# Development settings
+fast_dev_run: False
+limit_train_batches: 1.0
+limit_val_batches: 1.0
+limit_test_batches: 1.0
+
+# Checkpointing
+enable_checkpointing: True
+enable_progress_bar: True
+enable_model_summary: True

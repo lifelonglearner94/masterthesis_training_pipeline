@@ -1,0 +1,18 @@
+# Debug configuration
+# Use this for quick debugging runs
+
+# @package _global_
+
+defaults:
+  - /trainer: default
+
+# Reduce dataset size for debugging
+trainer:
+  fast_dev_run: True
+  accelerator: cpu
+
+# Disable logging for debug
+logger: null
+
+# Disable callbacks for debug
+callbacks: null
