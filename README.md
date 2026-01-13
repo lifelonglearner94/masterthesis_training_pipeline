@@ -31,6 +31,31 @@ uv run src/train.py experiment=example
 uv run src/train.py model=hope trainer=gpu seed=123
 ```
 
+### AC Predictor Model
+
+The repository includes an Action-Conditioned Vision Transformer Predictor (from V-JEPA2) for training on pre-computed encoder features.
+
+```bash
+# Train AC Predictor with pre-computed features
+uv run src/train.py model=ac_predictor data=precomputed_features
+
+# With GPU and custom batch size
+uv run src/train.py model=ac_predictor data=precomputed_features trainer=gpu data.batch_size=16
+```
+
+**Expected data format** (`.npy` files):
+```
+data/
+├── train/
+│   ├── episode_0000/
+│   │   ├── features.npy   # [T+1, N, D] encoder features
+│   │   ├── actions.npy    # [T, 7] end-effector changes
+│   │   └── states.npy     # [T, 7] end-effector states
+│   └── ...
+└── val/
+    └── ...
+```
+
 ### Testing
 
 ```bash

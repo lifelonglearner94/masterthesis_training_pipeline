@@ -1,0 +1,44 @@
+# @package _global_
+
+# AC Predictor Model Configuration
+# Action-Conditioned Vision Transformer Predictor from V-JEPA2
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.ac_predictor.ACPredictorModule
+
+  # Model architecture
+  img_size: [224, 224]
+  patch_size: 16
+  num_frames: 16
+  tubelet_size: 2
+  embed_dim: 768
+  predictor_embed_dim: 1024
+  depth: 24
+  num_heads: 16
+  mlp_ratio: 4.0
+  action_embed_dim: 7  # 7D: position (3), orientation (3), gripper (1)
+  use_rope: true
+  is_frame_causal: true
+  use_activation_checkpointing: false
+  use_extrinsics: false
+
+  # Dropout / regularization
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # Loss settings
+  T_teacher: 15  # Teacher-forcing prediction steps
+  T_rollout: 2   # Rollout prediction steps
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # Optimizer settings
+  learning_rate: 1e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  warmup_epochs: 10
+  max_epochs: ${trainer.max_epochs}
