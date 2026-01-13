@@ -115,10 +115,10 @@ uv run src/train.py --multirun hparams_search=optuna
 
 ```bash
 # Build image
-docker build -t titans-vit-research .
+docker build -t hope-vit-research .
 
 # Run training
-docker run --gpus all titans-vit-research python src/train.py
+docker run --gpus all hope-vit-research python src/train.py
 ```
 
 ## 📊 Logging

@@ -2,8 +2,8 @@
 wandb:
   _target_: pytorch_lightning.loggers.WandbLogger
 
-  # Project name in W&B
-  project: "titans-vs-vit-research"
+  # Project name in W&B (from WANDB_PROJECT env var)
+  project: ${oc.env:WANDB_PROJECT,hope-vs-vit-research}
 
   # Run name (null = auto-generated)
   name: null
@@ -29,8 +29,8 @@ wandb:
   # Prefix for logged keys
   prefix: ""
 
-  # W&B entity (team or username)
-  entity: null
+  # W&B entity (team or username, from WANDB_ENTITY env var)
+  entity: ${oc.env:WANDB_ENTITY,null}
 
   # Experiment group
   group: null

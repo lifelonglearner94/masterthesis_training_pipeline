@@ -11,3 +11,15 @@ early_stopping:
   patience: 10
   mode: "min"
   verbose: True
+
+# W&B callbacks for experiment tracking
+watch_model:
+  _target_: src.callbacks.wandb_callbacks.WatchModelCallback
+  log: "gradients"
+  log_freq: 100
+  log_graph: True
+
+log_predictions:
+  _target_: src.callbacks.wandb_callbacks.LogPredictionsCallback
+  num_samples: 8
+  log_every_n_epochs: 1

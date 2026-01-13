@@ -3,6 +3,10 @@ import pyrootutils
 # Finds the root of the repo automatically
 root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 import hydra
 from omegaconf import DictConfig
 import pytorch_lightning as pl

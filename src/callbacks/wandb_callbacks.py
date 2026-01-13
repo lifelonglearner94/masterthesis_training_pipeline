@@ -3,8 +3,14 @@
 from typing import Any, Dict, Optional
 
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning import Callback, LightningModule, Trainer
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 class WatchModelCallback(Callback):
@@ -44,9 +50,10 @@ class WatchModelCallback(Callback):
 
 
 class LogPredictionsCallback(Callback):
-    """Callback to log sample predictions to W&B.
+    """Callback to log sample predictions and prediction quality to W&B.
 
-    Override this class to implement custom prediction logging.
+    Logs prediction error histograms and sample prediction comparisons
+    for action-conditioned predictor models.
     """
 
     def __init__(
@@ -62,6 +69,24 @@ class LogPredictionsCallback(Callback):
         """
         self.num_samples = num_samples
         self.log_every_n_epochs = log_every_n_epochs
+        self._val_outputs: list[Dict[str, Any]] = []
+
+    def on_validation_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        """Store validation outputs for later logging."""
+        if trainer.current_epoch % self.log_every_n_epochs != 0:
+            return
+
+        # Only collect from first few batches
+        if batch_idx < self.num_samples and outputs is not None:
+            self._val_outputs.append(outputs)
 
     @rank_zero_only
     def on_validation_epoch_end(
@@ -69,8 +94,50 @@ class LogPredictionsCallback(Callback):
     ) -> None:
         """Log predictions at the end of validation epoch."""
         if trainer.current_epoch % self.log_every_n_epochs != 0:
+            self._val_outputs.clear()
             return
 
-        # Override this method to implement custom logging
-        # Example: Log images, text, or other predictions to W&B
-        pass
+        if wandb is None or not self._val_outputs:
+            self._val_outputs.clear()
+            return
+
+        # Find W&B logger
+        wandb_logger = None
+        for logger in trainer.loggers:
+            if hasattr(logger, "experiment") and hasattr(logger.experiment, "log"):
+                wandb_logger = logger
+                break
+
+        if wandb_logger is None:
+            self._val_outputs.clear()
+            return
+
+        try:
+            # Collect prediction errors from stored outputs
+            errors = []
+            for output in self._val_outputs:
+                if isinstance(output, dict):
+                    # Handle different output formats
+                    if "loss" in output:
+                        errors.append(float(output["loss"]))
+                    elif "val_loss" in output:
+                        errors.append(float(output["val_loss"]))
+                elif isinstance(output, torch.Tensor):
+                    errors.append(float(output.mean()))
+
+            if errors:
+                # Log error distribution histogram
+                wandb_logger.experiment.log({
+                    "val/prediction_error_histogram": wandb.Histogram(errors),
+                    "val/mean_batch_error": sum(errors) / len(errors),
+                    "val/max_batch_error": max(errors),
+                    "val/min_batch_error": min(errors),
+                    "epoch": trainer.current_epoch,
+                })
+
+        except Exception as e:
+            # Silently handle logging errors to not interrupt training
+            pass
+
+        finally:
+            self._val_outputs.clear()

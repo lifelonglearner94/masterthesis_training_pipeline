@@ -11,6 +11,7 @@ dependencies = [
     "hydra-colorlog>=1.2.0",
     "hydra-optuna-sweeper>=1.2.0",
     "wandb>=0.16.0",
+    "python-dotenv>=1.0.0",
     "pyrootutils>=1.0.4",
     "rich>=13.7.0",
     "numpy<2.0.0",  # Pin to avoid 2.0 conflicts with some DL libraries

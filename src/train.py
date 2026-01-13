@@ -3,6 +3,10 @@ import pyrootutils
 # Finds the root of the repo automatically
 root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 import hydra
 from omegaconf import DictConfig
 import pytorch_lightning as pl
@@ -11,6 +15,7 @@ from pytorch_lightning.loggers import Logger
 from typing import List, Optional
 
 from src.utils import instantiators
+from src.utils.logging_utils import log_hyperparameters
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config.yaml")
 def main(cfg: DictConfig) -> Optional[float]:
@@ -37,11 +42,14 @@ def main(cfg: DictConfig) -> Optional[float]:
         _convert_="partial"
     )
 
-    # 6. Train
+    # 6. Log hyperparameters
+    log_hyperparameters({"cfg": cfg, "model": model, "trainer": trainer})
+
+    # 7. Train
     if cfg.get("train"):
         trainer.fit(model=model, datamodule=datamodule)
 
-    # 7. Test
+    # 8. Test
     if cfg.get("test"):
         trainer.test(model=model, datamodule=datamodule, ckpt_path="best")
 
