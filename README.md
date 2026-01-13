@@ -84,7 +84,6 @@ make test
 ├── tests/                  # Unit tests
 ├── pyproject.toml          # Project dependencies (PEP 621)
 ├── uv.lock                 # Locked dependencies
-├── Dockerfile              # Container definition
 └── Makefile                # Workflow automation
 ```
 
