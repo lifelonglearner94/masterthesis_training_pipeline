@@ -1,6 +1,6 @@
-# Titans vs ViT Research
+# HOPE vs ViT Research
 
-Gold standard research repository comparing Titans and Vision Transformers (ViT).
+Gold standard research repository comparing HOPE and Vision Transformers (ViT).
 
 ## 🚀 Quick Start
 
@@ -28,7 +28,7 @@ make train
 uv run src/train.py experiment=example
 
 # Train with custom overrides
-uv run src/train.py model=titans trainer=gpu seed=123
+uv run src/train.py model=hope trainer=gpu seed=123
 ```
 
 ### Testing
