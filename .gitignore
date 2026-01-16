@@ -99,7 +99,7 @@ logs/
 *.log
 
 # Data
-data/
+#data/
 
 # Model checkpoints
 checkpoints/

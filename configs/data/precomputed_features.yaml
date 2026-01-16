@@ -1,0 +1,21 @@
+# Pre-computed V-JEPA2 features data configuration
+# For training the AC Predictor with pre-encoded video features
+
+_target_: src.datamodules.PrecomputedFeaturesDataModule
+
+# Data paths
+data_dir: ${paths.data_dir}
+
+# File structure settings
+feature_map_name: "vjepa2_vitl16"  # Name of feature map file (without .npy)
+clip_prefix: "clip_"  # Prefix for clip directories
+
+# Dataset settings
+num_frames: 16  # Number of frames per sample (T in loss formulation)
+patches_per_frame: null  # Auto-detect from data (H*W)
+use_extrinsics: false
+
+# DataLoader settings
+batch_size: 32
+num_workers: 4
+pin_memory: true
