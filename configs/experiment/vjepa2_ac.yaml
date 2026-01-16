@@ -1,18 +1,12 @@
 # @package _global_
-# V-JEPA2 AC Predictor Training Configuration
-# Use as: uv run src/train.py experiment=vjepa2_ac
+# =============================================================================
+# V-JEPA2 AC Predictor - SINGLE SOURCE OF TRUTH
+# =============================================================================
+# Use as: uv run src/train.py experiment=vjepa2_ac paths.data_dir=/path/to/clips
 #
-# Settings based on V-JEPA2 paper:
-# - AdamW optimizer with weight_decay=0.04
-# - LR schedule: warmup → constant → decay (iteration-based)
-#   - Initial LR: 7.5e-5 → Peak LR: 4.25e-4 (4,500 iters warmup)
-#   - Constant phase: 85,500 iterations at peak LR
-#   - Decay phase: 4,500 iterations (linear decay to 0)
-# - Batch size: 256 video clips
-# - Gradient clipping: 1.01
-# - L1 loss with teacher-forcing + rollout (T=2)
-
-
+# This file consolidates ALL important settings. Edit values here, not in
+# configs/model/ac_predictor.yaml or configs/data/precomputed_features.yaml.
+# =============================================================================
 
 defaults:
   - override /data: precomputed_features
@@ -21,44 +15,66 @@ defaults:
   - override /callbacks: default
   - override /logger: wandb
 
-# Experiment metadata
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
 task_name: "vjepa2_ac_predictor"
 tags: ["vjepa2", "ac_predictor", "robotics"]
-
-# Training settings
 seed: 42
 train: True
 test: True
 
-# Override trainer settings
-trainer:
-  max_epochs: 100  # Will be overridden by iteration-based scheduling
-  gradient_clip_val: 1.01
-  gradient_clip_algorithm: norm
+# =============================================================================
+# ⚠️  MEMORY-CRITICAL SETTINGS (tune these for your 32GB RAM)
+# =============================================================================
+# If you run out of memory, reduce these values in order:
+#   1. batch_size: 8 → 4 → 2
+#   2. T_teacher: 5 → 3 → 2
+#   3. num_workers: 2 → 0
+#   4. use_activation_checkpointing: true (trades speed for ~50% less memory)
 
-# Override data settings
 data:
-  batch_size: 32
+  batch_size: 8                    # ⚠️ REDUCED from 32 (saves ~4x memory)
+  num_workers: 2                   # ⚠️ REDUCED from 4 (each worker duplicates data)
+  pin_memory: true
 
-# Override model settings
 model:
-  # Action dimension (inferred from data: 2D actions)
-  action_embed_dim: 2
-
-  # Loss settings (already correct in default)
+  # --- Memory settings ---
+  T_teacher: 5                     # ⚠️ REDUCED from 15 (saves ~3x activation memory)
   T_rollout: 2
+  use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
+
+  # --- Model architecture (keep defaults from ac_predictor.yaml) ---
+  # Uncomment to override:
+  # embed_dim: 1024
+  # predictor_embed_dim: 384
+  # depth: 24
+  # num_heads: 16
+  # mlp_ratio: 4.0
+
+  # --- Action dimension (dataset-specific) ---
+  action_embed_dim: 2              # 2D actions for this dataset
+
+  # --- Loss weights ---
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
 
-  # Optimizer settings (V-JEPA2 paper)
-  learning_rate: 4.25e-4  # Peak LR
+  # --- Optimizer (V-JEPA2 paper settings) ---
+  learning_rate: 4.25e-4           # Peak LR
   weight_decay: 0.04
   betas: [0.9, 0.999]
 
-  # Iteration-based LR schedule (V-JEPA2 paper)
-  # Total: 4,500 + 85,500 + 4,500 = 94,500 iterations
+  # --- LR schedule (iteration-based, V-JEPA2 paper) ---
   use_iteration_scheduler: true
   warmup_iters: 450
   constant_iters: 8550
   decay_iters: 450
   warmup_start_lr: 7.5e-5
+
+# =============================================================================
+# TRAINER SETTINGS
+# =============================================================================
+trainer:
+  max_epochs: 100
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
