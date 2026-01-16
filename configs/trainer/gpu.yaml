@@ -1,11 +1,13 @@
-# GPU trainer configuration
+# CUDA GPU trainer configuration
+# NOTE: This config is for NVIDIA CUDA GPUs only.
+# For Apple Silicon (MPS) or CPU, use trainer=auto or trainer=default
 defaults:
   - default
 
-# GPU-specific settings
+# CUDA GPU-specific settings
 accelerator: gpu
 devices: 1
-precision: 16-mixed  # Mixed precision for faster training
+precision: 16-mixed  # Mixed precision for faster training on CUDA
 
 # Multi-GPU settings (uncomment for distributed training)
 # devices: -1  # Use all available GPUs

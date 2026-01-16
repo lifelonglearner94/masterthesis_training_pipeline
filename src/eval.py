@@ -15,6 +15,7 @@ from pytorch_lightning.loggers import Logger
 from typing import List, Optional
 
 from src.utils import instantiators
+from src.utils.device_utils import log_device_info
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config.yaml")
 def main(cfg: DictConfig) -> Optional[float]:
@@ -23,6 +24,9 @@ def main(cfg: DictConfig) -> Optional[float]:
     This method is wrapped in optional @task_wrapper decorator, which applies extra
     utilities before and after the call.
     """
+    # 0. Log hardware info at startup
+    log_device_info()
+
     # 1. Gold Standard: Determinism
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed, workers=True)

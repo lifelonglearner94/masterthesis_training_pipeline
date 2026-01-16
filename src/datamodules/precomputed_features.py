@@ -33,6 +33,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
+from src.utils.device_utils import should_pin_memory
+
 
 class PrecomputedFeaturesDataset(Dataset):
     """Dataset for pre-computed V-JEPA2 encoder features."""
@@ -176,7 +178,7 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         use_extrinsics: bool = False,
         batch_size: int = 32,
         num_workers: int = 4,
-        pin_memory: bool = True,
+        pin_memory: bool | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the DataModule.
@@ -188,7 +190,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
             use_extrinsics: Whether to load extrinsics data
             batch_size: Batch size for DataLoaders
             num_workers: Number of worker processes for data loading
-            pin_memory: Whether to pin memory for faster GPU transfer
+            pin_memory: Whether to pin memory for faster GPU transfer.
+                       If None, auto-detects based on CUDA availability.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -199,7 +202,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         self.use_extrinsics = use_extrinsics
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.pin_memory = pin_memory
+        # Auto-detect pin_memory if not specified (only beneficial for CUDA)
+        self.pin_memory = pin_memory if pin_memory is not None else should_pin_memory()
 
         self.train_dataset: PrecomputedFeaturesDataset | None = None
         self.val_dataset: PrecomputedFeaturesDataset | None = None

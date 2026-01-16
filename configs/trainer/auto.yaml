@@ -1,0 +1,13 @@
+# Auto-detect trainer configuration (CUDA > MPS > CPU)
+# Use this for cross-platform compatibility
+defaults:
+  - default
+
+# Auto-detect best available accelerator
+# Priority: CUDA GPU > Apple MPS > CPU
+accelerator: auto
+devices: auto
+
+# Use full precision for maximum compatibility
+# Note: MPS has limited fp16 support, CPU doesn't benefit from mixed precision
+precision: 32

@@ -21,7 +21,7 @@ uv sync
 ### Training
 
 ```bash
-# Train with default config
+# Train with default config (auto-detects best hardware)
 make train
 
 # Train with specific experiment
@@ -30,6 +30,44 @@ uv run src/train.py experiment=example
 # Train with custom overrides
 uv run src/train.py model=hope trainer=gpu seed=123
 ```
+
+## 💻 Hardware Support
+
+This repository supports multiple hardware platforms with automatic detection:
+
+| Platform | Accelerator | Precision | Notes |
+|----------|-------------|-----------|-------|
+| **NVIDIA CUDA** | `gpu` | `16-mixed` | Best performance, FlashAttention available |
+| **Apple Silicon (MPS)** | `mps` | `32` | Good performance, limited fp16 support |
+| **CPU** | `cpu` | `32` | Slowest, but always works |
+
+### Platform-Specific Training
+
+```bash
+# Auto-detect best available hardware (recommended)
+uv run src/train.py trainer=auto
+
+# Force NVIDIA CUDA GPU (fails if not available)
+uv run src/train.py trainer=gpu
+
+# Use default (also auto-detects)
+uv run src/train.py
+```
+
+### Hardware Detection
+
+The pipeline automatically logs detected hardware at startup:
+```
+============================================================
+Hardware Detection
+============================================================
+Device: Apple Silicon (MPS)
+Precision: 32
+PyTorch Lightning Accelerator: mps
+============================================================
+```
+
+On non-CUDA systems, you'll see a warning about FlashAttention not being available. This is expected - the pipeline uses PyTorch's `scaled_dot_product_attention` with automatic backend selection.
 
 ### AC Predictor Model
 
