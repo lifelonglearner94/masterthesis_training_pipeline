@@ -68,11 +68,17 @@ class ACPredictorModule(pl.LightningModule):
         loss_weight_teacher: float = 1.0,
         loss_weight_rollout: float = 1.0,
         # Optimizer settings
-        learning_rate: float = 1e-4,
-        weight_decay: float = 0.05,
+        learning_rate: float = 4.25e-4,
+        weight_decay: float = 0.04,
         betas: tuple[float, float] = (0.9, 0.999),
         warmup_epochs: int = 10,
         max_epochs: int = 100,
+        # Iteration-based LR schedule (V-JEPA2 paper)
+        use_iteration_scheduler: bool = False,
+        warmup_iters: int = 4500,
+        constant_iters: int = 85500,
+        decay_iters: int = 4500,
+        warmup_start_lr: float = 7.5e-5,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -111,6 +117,13 @@ class ACPredictorModule(pl.LightningModule):
         self.betas = betas
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+
+        # Iteration-based LR schedule (V-JEPA2 paper)
+        self.use_iteration_scheduler = use_iteration_scheduler
+        self.warmup_iters = warmup_iters
+        self.constant_iters = constant_iters
+        self.decay_iters = decay_iters
+        self.warmup_start_lr = warmup_start_lr
 
         # Grid size for reshaping
         self.grid_height = img_size[0] // patch_size
@@ -285,7 +298,15 @@ class ACPredictorModule(pl.LightningModule):
         return self._shared_step(batch, "test")
 
     def configure_optimizers(self) -> dict:
-        """Configure optimizer and learning rate scheduler."""
+        """Configure optimizer and learning rate scheduler.
+
+        Supports two scheduling modes:
+        1. Epoch-based (default): Cosine annealing with linear warmup
+        2. Iteration-based (V-JEPA2 paper): Warmup → Constant → Decay
+           - Linear warmup from warmup_start_lr to learning_rate
+           - Constant phase at peak learning_rate
+           - Linear decay from learning_rate to 0
+        """
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
@@ -293,19 +314,59 @@ class ACPredictorModule(pl.LightningModule):
             betas=self.betas,
         )
 
-        # Cosine annealing with warmup
-        def lr_lambda(epoch: int) -> float:
-            if epoch < self.warmup_epochs:
-                return epoch / self.warmup_epochs
-            progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
-            return 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item())
+        if self.use_iteration_scheduler:
+            # Iteration-based: Warmup → Constant → Decay (V-JEPA2 paper)
+            # Total iterations = warmup_iters + constant_iters + decay_iters
+            warmup_iters = self.warmup_iters
+            constant_iters = self.constant_iters
+            decay_iters = self.decay_iters
+            warmup_end = warmup_iters
+            constant_end = warmup_end + constant_iters
+            total_iters = constant_end + decay_iters
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            # Scale factor for warmup: start_lr / peak_lr
+            warmup_start_factor = self.warmup_start_lr / self.learning_rate
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-            },
-        }
+            def lr_lambda_iter(step: int) -> float:
+                if step < warmup_end:
+                    # Linear warmup from warmup_start_lr to learning_rate
+                    progress = step / warmup_iters
+                    return warmup_start_factor + (1.0 - warmup_start_factor) * progress
+                elif step < constant_end:
+                    # Constant at peak learning_rate
+                    return 1.0
+                elif step < total_iters:
+                    # Linear decay from learning_rate to 0
+                    progress = (step - constant_end) / decay_iters
+                    return 1.0 - progress
+                else:
+                    # After total_iters, stay at 0
+                    return 0.0
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_iter)
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",  # Iteration-based
+                    "frequency": 1,
+                },
+            }
+        else:
+            # Epoch-based: Cosine annealing with linear warmup (default)
+            def lr_lambda_epoch(epoch: int) -> float:
+                if epoch < self.warmup_epochs:
+                    return epoch / self.warmup_epochs
+                progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
+                return 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item())
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_epoch)
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                },
+            }

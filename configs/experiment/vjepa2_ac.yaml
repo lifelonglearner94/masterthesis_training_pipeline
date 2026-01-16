@@ -1,0 +1,60 @@
+# V-JEPA2 AC Predictor Training Configuration
+# Use as: uv run src/train.py experiment=vjepa2_ac
+#
+# Settings based on V-JEPA2 paper:
+# - AdamW optimizer with weight_decay=0.04
+# - LR schedule: warmup → constant → decay (iteration-based)
+#   - Initial LR: 7.5e-5 → Peak LR: 4.25e-4 (4,500 iters warmup)
+#   - Constant phase: 85,500 iterations at peak LR
+#   - Decay phase: 4,500 iterations (linear decay to 0)
+# - Batch size: 256 video clips
+# - Gradient clipping: 1.01
+# - L1 loss with teacher-forcing + rollout (T=2)
+
+# @package _global_
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# Experiment metadata
+task_name: "vjepa2_ac_predictor"
+tags: ["vjepa2", "ac_predictor", "robotics"]
+
+# Training settings
+seed: 42
+train: True
+test: True
+
+# Override trainer settings
+trainer:
+  max_epochs: 100  # Will be overridden by iteration-based scheduling
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
+
+# Override data settings
+data:
+  batch_size: 32
+
+# Override model settings
+model:
+  # Loss settings (already correct in default)
+  T_rollout: 2
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # Optimizer settings (V-JEPA2 paper)
+  learning_rate: 4.25e-4  # Peak LR
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Iteration-based LR schedule (V-JEPA2 paper)
+  # Total: 4,500 + 85,500 + 4,500 = 94,500 iterations
+  use_iteration_scheduler: true
+  warmup_iters: 450
+  constant_iters: 8550
+  decay_iters: 450
+  warmup_start_lr: 7.5e-5

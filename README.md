@@ -25,7 +25,7 @@ uv sync
 make train
 
 # Train with specific experiment
-uv run src/train.py experiment=example
+uv run src/train.py experiment=vjepa2_ac
 
 # Train with custom overrides
 uv run src/train.py model=hope trainer=gpu seed=123
