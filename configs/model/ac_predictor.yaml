@@ -15,7 +15,7 @@ model:
   num_frames: 16
   tubelet_size: 2
   embed_dim: 1024
-  predictor_embed_dim: 1024
+  predictor_embed_dim: 384
   depth: 24
   num_heads: 16
   mlp_ratio: 4.0
