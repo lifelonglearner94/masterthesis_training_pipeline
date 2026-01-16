@@ -304,10 +304,14 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
             collate_fn=collate_fn,
         )
 
-    def val_dataloader(self) -> DataLoader:
-        """Create validation DataLoader."""
+    def val_dataloader(self) -> DataLoader | None:
+        """Create validation DataLoader.
+
+        Returns None if no validation dataset is configured, which signals
+        to PyTorch Lightning to skip validation entirely.
+        """
         if self.val_dataset is None:
-            raise RuntimeError("Validation dataset not initialized. Call setup() first.")
+            return None
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,

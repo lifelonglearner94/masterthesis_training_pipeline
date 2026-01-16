@@ -5,12 +5,9 @@ defaults:
 rich_progress:
   _target_: pytorch_lightning.callbacks.RichProgressBar
 
-early_stopping:
-  _target_: pytorch_lightning.callbacks.EarlyStopping
-  monitor: "val/loss"
-  patience: 10
-  mode: "min"
-  verbose: True
+# Early stopping is disabled - training runs for full max_epochs
+# Evaluation is done post-training via linear probing on saved checkpoints
+# See docs/ac_predictor_training_faq.md for rationale
 
 # W&B callbacks for experiment tracking
 watch_model:

@@ -20,8 +20,10 @@ gradient_clip_algorithm: null
 accumulate_grad_batches: 1
 
 # Validation settings
-check_val_every_n_epoch: 1
-val_check_interval: 1.0
+# Validation is disabled - evaluation is done post-training (see FAQ)
+check_val_every_n_epoch: null
+val_check_interval: null
+num_sanity_val_steps: 0
 
 # Logging
 log_every_n_steps: 50
@@ -29,7 +31,7 @@ log_every_n_steps: 50
 # Development settings
 fast_dev_run: False
 limit_train_batches: 1.0
-limit_val_batches: 1.0
+limit_val_batches: 0
 limit_test_batches: 1.0
 
 # Checkpointing
