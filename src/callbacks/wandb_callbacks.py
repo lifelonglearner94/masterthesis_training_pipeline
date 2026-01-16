@@ -21,7 +21,7 @@ class WatchModelCallback(Callback):
 
     def __init__(
         self,
-        log: str = "gradients",
+        log: Optional[str] = "gradients",
         log_freq: int = 100,
         log_graph: bool = True,
     ) -> None:
@@ -32,7 +32,15 @@ class WatchModelCallback(Callback):
             log_freq: Frequency of logging in training steps.
             log_graph: Whether to log the model graph.
         """
-        self.log = log
+        # Handle string "None" from YAML config - convert to actual None
+        if log is None or (isinstance(log, str) and log.lower() == "none"):
+            self.log = None
+        elif log in ("gradients", "parameters", "all"):
+            self.log = log
+        else:
+            raise ValueError(
+                f"Invalid log value: {log!r}. Must be one of 'gradients', 'parameters', 'all', or None"
+            )
         self.log_freq = log_freq
         self.log_graph = log_graph
 
@@ -41,12 +49,17 @@ class WatchModelCallback(Callback):
         """Watch model at the start of training."""
         for logger in trainer.loggers:
             if hasattr(logger, "experiment") and hasattr(logger.experiment, "watch"):
-                logger.experiment.watch(
-                    pl_module,
-                    log=self.log,
-                    log_freq=self.log_freq,
-                    log_graph=self.log_graph,
-                )
+                try:
+                    logger.experiment.watch(
+                        pl_module,
+                        log=self.log,
+                        log_freq=self.log_freq,
+                        log_graph=self.log_graph,
+                    )
+                except Exception as e:
+                    # Log warning but don't fail training if watch fails
+                    import warnings
+                    warnings.warn(f"Failed to watch model with W&B: {e}")
 
 
 class LogPredictionsCallback(Callback):
