@@ -1,27 +1,24 @@
 """DataModule for pre-computed V-JEPA2 encoder features.
 
-This module loads pre-computed encoder features, actions, and states from numpy files
-for training the AC Predictor model.
+This module loads pre-computed encoder features and actions from numpy files
+for training the AC Predictor model. States are zero-filled by default.
 
 Expected data format:
     - features: .npy files with shape [T+1, N, D] or [T+1, H, W, D]
       where T+1 is the number of frames, N = H*W is patches per frame, D is embed_dim
-    - actions: .npy files with shape [T, action_dim] (7D end-effector changes)
-    - states: .npy files with shape [T, action_dim] (7D end-effector states)
+    - actions: .npy files with shape [T+1, action_dim] (will be sliced to [T, action_dim])
+    - states: Created as zeros with shape [T, action_dim]
     - (optional) extrinsics: .npy files with shape [T, action_dim-1]
 
 Directory structure:
     data_dir/
-    ├── train/
-    │   ├── episode_0000/
-    │   │   ├── features.npy
-    │   │   ├── actions.npy
-    │   │   └── states.npy
-    │   ├── episode_0001/
-    │   ...
-    └── val/
-        ├── episode_0000/
-        ...
+    ├── clip_00001/
+    │   ├── feature_maps/
+    │   │   └── vjepa2_vitl16.npy   # [T+1, N, D]
+    │   └── actions_states/
+    │       └── actions.npy         # [T+1, action_dim]
+    ├── clip_00002/
+    └── ...
 """
 
 from pathlib import Path
@@ -45,46 +42,61 @@ class PrecomputedFeaturesDataset(Dataset):
         num_frames: int = 16,
         patches_per_frame: int | None = None,
         use_extrinsics: bool = False,
+        feature_map_name: str = "vjepa2_vitl16",
+        clip_prefix: str = "clip_",
     ) -> None:
         """Initialize the dataset.
 
         Args:
-            data_dir: Path to directory containing episode subdirectories
+            data_dir: Path to directory containing clip subdirectories
             num_frames: Number of frames to load (T in the loss formulation)
             patches_per_frame: Number of patches per frame (H*W). If None, inferred from data.
             use_extrinsics: Whether to load extrinsics data
+            feature_map_name: Name of the feature map file (without .npy extension)
+            clip_prefix: Prefix for clip directories (e.g., "clip_")
         """
         self.data_dir = Path(data_dir)
         self.num_frames = num_frames
         self.patches_per_frame = patches_per_frame
         self.use_extrinsics = use_extrinsics
+        self.feature_map_name = feature_map_name
+        self.clip_prefix = clip_prefix
 
-        # Find all episode directories
+        # Find all clip directories with the expected structure
         self.episode_dirs = sorted([
             d for d in self.data_dir.iterdir()
-            if d.is_dir() and (d / "features.npy").exists()
+            if d.is_dir()
+            and d.name.startswith(clip_prefix)
+            and (d / "feature_maps" / f"{feature_map_name}.npy").exists()
         ])
 
         if len(self.episode_dirs) == 0:
-            raise ValueError(f"No valid episodes found in {data_dir}")
+            raise ValueError(
+                f"No valid clips found in {data_dir}. "
+                f"Expected structure: {clip_prefix}XXXXX/feature_maps/{feature_map_name}.npy"
+            )
+
+        # Infer action_dim from first clip
+        first_actions = np.load(self.episode_dirs[0] / "actions_states" / "actions.npy")
+        self.action_dim = first_actions.shape[-1]
 
     def __len__(self) -> int:
         return len(self.episode_dirs)
 
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
-        """Load a single episode.
+        """Load a single clip.
 
         Returns:
             Dictionary with keys:
                 - features: [T+1, N, D] tensor
                 - actions: [T, action_dim] tensor
-                - states: [T, action_dim] tensor
+                - states: [T, action_dim] tensor (zeros)
                 - extrinsics (optional): [T, action_dim-1] tensor
         """
         episode_dir = self.episode_dirs[idx]
 
-        # Load features
-        features = np.load(episode_dir / "features.npy")
+        # Load features from clip_XXXXX/feature_maps/{feature_map_name}.npy
+        features = np.load(episode_dir / "feature_maps" / f"{self.feature_map_name}.npy")
 
         # Handle different feature shapes: [T+1, N, D] or [T+1, H, W, D]
         if features.ndim == 4:
@@ -94,15 +106,16 @@ class PrecomputedFeaturesDataset(Dataset):
         # Limit to num_frames + 1 (for target)
         T_plus_1 = min(features.shape[0], self.num_frames + 1)
         features = features[:T_plus_1]
-
-        # Load actions and states
-        actions = np.load(episode_dir / "actions.npy")
-        states = np.load(episode_dir / "states.npy")
-
-        # Limit to num_frames
         T = T_plus_1 - 1
-        actions = actions[:T]
-        states = states[:T]
+
+        # Load actions from clip_XXXXX/actions_states/actions.npy
+        # Actions array has T+1 rows, slice off the last row to get T actions
+        actions = np.load(episode_dir / "actions_states" / "actions.npy")
+        actions = actions[:-1]  # Drop last row: [T+1, action_dim] -> [T, action_dim]
+        actions = actions[:T]   # Limit to num_frames
+
+        # Create zero-filled states array (same shape as actions)
+        states = np.zeros((T, self.action_dim), dtype=np.float32)
 
         result = {
             "features": torch.from_numpy(features).float(),
@@ -112,7 +125,7 @@ class PrecomputedFeaturesDataset(Dataset):
 
         # Optionally load extrinsics
         if self.use_extrinsics:
-            extrinsics_path = episode_dir / "extrinsics.npy"
+            extrinsics_path = episode_dir / "actions_states" / "extrinsics.npy"
             if extrinsics_path.exists():
                 extrinsics = np.load(extrinsics_path)[:T]
                 result["extrinsics"] = torch.from_numpy(extrinsics).float()
@@ -124,6 +137,7 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     """Custom collate function to handle variable-length sequences.
 
     Pads sequences to the maximum length in the batch.
+    Infers action_dim from the batch data.
     """
     # Find max lengths
     max_T_plus_1 = max(item["features"].shape[0] for item in batch)
@@ -132,7 +146,8 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     # Get dimensions from first item
     N = batch[0]["features"].shape[1]
     D = batch[0]["features"].shape[2]
-    action_dim = batch[0]["actions"].shape[1]
+    # Infer action_dim from actions tensor shape
+    action_dim = batch[0]["actions"].shape[-1]
 
     # Check for extrinsics
     has_extrinsics = "extrinsics" in batch[0]
@@ -143,7 +158,7 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     actions = torch.zeros(B, max_T, action_dim)
     states = torch.zeros(B, max_T, action_dim)
     if has_extrinsics:
-        extrinsics_dim = batch[0]["extrinsics"].shape[1]
+        extrinsics_dim = batch[0]["extrinsics"].shape[-1]
         extrinsics = torch.zeros(B, max_T, extrinsics_dim)
 
     # Fill in data
@@ -176,6 +191,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         num_frames: int = 16,
         patches_per_frame: int | None = None,
         use_extrinsics: bool = False,
+        feature_map_name: str = "vjepa2_vitl16",
+        clip_prefix: str = "clip_",
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool | None = None,
@@ -184,10 +201,12 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         """Initialize the DataModule.
 
         Args:
-            data_dir: Root directory containing train/val/test subdirectories
+            data_dir: Root directory containing clip subdirectories
             num_frames: Number of frames per sample (T in the loss formulation)
             patches_per_frame: Number of patches per frame (H*W)
             use_extrinsics: Whether to load extrinsics data
+            feature_map_name: Name of the feature map file (without .npy extension)
+            clip_prefix: Prefix for clip directories (e.g., "clip_")
             batch_size: Batch size for DataLoaders
             num_workers: Number of worker processes for data loading
             pin_memory: Whether to pin memory for faster GPU transfer.
@@ -200,6 +219,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         self.num_frames = num_frames
         self.patches_per_frame = patches_per_frame
         self.use_extrinsics = use_extrinsics
+        self.feature_map_name = feature_map_name
+        self.clip_prefix = clip_prefix
         self.batch_size = batch_size
         self.num_workers = num_workers
         # Auto-detect pin_memory if not specified (only beneficial for CUDA)
@@ -210,35 +231,29 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         self.test_dataset: PrecomputedFeaturesDataset | None = None
 
     def setup(self, stage: str | None = None) -> None:
-        """Set up datasets for each stage."""
-        if stage == "fit" or stage is None:
-            train_dir = self.data_dir / "train"
-            if train_dir.exists():
-                self.train_dataset = PrecomputedFeaturesDataset(
-                    data_dir=train_dir,
-                    num_frames=self.num_frames,
-                    patches_per_frame=self.patches_per_frame,
-                    use_extrinsics=self.use_extrinsics,
-                )
+        """Set up datasets for each stage.
 
-            val_dir = self.data_dir / "val"
-            if val_dir.exists():
-                self.val_dataset = PrecomputedFeaturesDataset(
-                    data_dir=val_dir,
-                    num_frames=self.num_frames,
-                    patches_per_frame=self.patches_per_frame,
-                    use_extrinsics=self.use_extrinsics,
-                )
+        Uses data_dir directly (flat structure with clip_* directories).
+        All clips are used for training - no train/val split.
+        """
+        dataset_kwargs = {
+            "data_dir": self.data_dir,
+            "num_frames": self.num_frames,
+            "patches_per_frame": self.patches_per_frame,
+            "use_extrinsics": self.use_extrinsics,
+            "feature_map_name": self.feature_map_name,
+            "clip_prefix": self.clip_prefix,
+        }
+
+        if stage == "fit" or stage is None:
+            # Use all clips for training (no split)
+            self.train_dataset = PrecomputedFeaturesDataset(**dataset_kwargs)
+            # No validation dataset for now
+            self.val_dataset = None
 
         if stage == "test" or stage is None:
-            test_dir = self.data_dir / "test"
-            if test_dir.exists():
-                self.test_dataset = PrecomputedFeaturesDataset(
-                    data_dir=test_dir,
-                    num_frames=self.num_frames,
-                    patches_per_frame=self.patches_per_frame,
-                    use_extrinsics=self.use_extrinsics,
-                )
+            # Use same clips for testing
+            self.test_dataset = PrecomputedFeaturesDataset(**dataset_kwargs)
 
     def train_dataloader(self) -> DataLoader:
         """Create training DataLoader."""

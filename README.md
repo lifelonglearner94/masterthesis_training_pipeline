@@ -74,24 +74,26 @@ On non-CUDA systems, you'll see a warning about FlashAttention not being availab
 The repository includes an Action-Conditioned Vision Transformer Predictor (from V-JEPA2) for training on pre-computed encoder features.
 
 ```bash
-# Train AC Predictor with pre-computed features
-uv run src/train.py model=ac_predictor data=precomputed_features
+# Train AC Predictor with V-JEPA2 settings (recommended)
+uv run src/train.py experiment=vjepa2_ac paths.data_dir=/path/to/your/clips
+
+# Train with default settings
+uv run src/train.py model=ac_predictor data=precomputed_features paths.data_dir=/path/to/your/clips
 
 # With GPU and custom batch size
-uv run src/train.py model=ac_predictor data=precomputed_features trainer=gpu data.batch_size=16
+uv run src/train.py model=ac_predictor data=precomputed_features trainer=gpu data.batch_size=16 paths.data_dir=/path/to/your/clips
 ```
 
 **Expected data format** (`.npy` files):
 ```
-data/
-├── train/
-│   ├── episode_0000/
-│   │   ├── features.npy   # [T+1, N, D] encoder features
-│   │   ├── actions.npy    # [T, 7] end-effector changes
-│   │   └── states.npy     # [T, 7] end-effector states
-│   └── ...
-└── val/
-    └── ...
+data_dir/
+├── clip_00001/
+│   ├── feature_maps/
+│   │   └── vjepa2_vitl16.npy   # [T+1, N, D] encoder features
+│   └── actions_states/
+│       └── actions.npy         # [T+1, action_dim] (last row is dropped to get expected [T, action_dim])
+├── clip_00002/
+└── ...
 ```
 
 ### Testing

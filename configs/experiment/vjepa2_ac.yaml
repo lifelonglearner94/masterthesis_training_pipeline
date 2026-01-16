@@ -41,6 +41,9 @@ data:
 
 # Override model settings
 model:
+  # Action dimension (inferred from data: 2D actions)
+  action_embed_dim: 2
+
   # Loss settings (already correct in default)
   T_rollout: 2
   loss_weight_teacher: 1.0

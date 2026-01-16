@@ -45,7 +45,7 @@ class ACPredictorModule(pl.LightningModule):
     def __init__(
         self,
         # Model architecture
-        img_size: tuple[int, int] = (224, 224),
+        img_size: tuple[int, int] = (256, 256),
         patch_size: int = 16,
         num_frames: int = 16,
         tubelet_size: int = 2,
