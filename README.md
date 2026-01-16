@@ -31,6 +31,8 @@ uv run src/train.py experiment=vjepa2_ac
 uv run src/train.py model=hope trainer=gpu seed=123
 ```
 
+
+
 ## 💻 Hardware Support
 
 This repository supports multiple hardware platforms with automatic detection:
@@ -83,6 +85,20 @@ uv run src/train.py model=ac_predictor data=precomputed_features paths.data_dir=
 # With GPU and custom batch size
 uv run src/train.py model=ac_predictor data=precomputed_features trainer=gpu data.batch_size=16 paths.data_dir=/path/to/your/clips
 ```
+# Use clips 0-4999 (5000 clips)
+data:
+  clip_start: 0
+  clip_end: 5000
+
+# Use clips 5000-9999
+data:
+  clip_start: 5000
+  clip_end: 10000
+
+# Use all clips from 1000 onwards
+data:
+  clip_start: 1000
+  clip_end: null
 
 **Expected data format** (`.npy` files):
 ```

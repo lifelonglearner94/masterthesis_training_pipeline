@@ -34,7 +34,7 @@ test: True
 #   4. use_activation_checkpointing: true (trades speed for ~50% less memory)
 
 data:
-  batch_size: 8                    # ⚠️ REDUCED from 32 (saves ~4x memory)
+  batch_size: 16                    # ⚠️ REDUCED from 32 (saves ~4x memory)
   num_workers: 2                   # ⚠️ REDUCED from 4 (each worker duplicates data)
   pin_memory: true
 

@@ -44,7 +44,11 @@ from src.utils.device_utils import should_pin_memory
 
 
 class PrecomputedFeaturesDataset(Dataset):
-    """Dataset for pre-computed V-JEPA2 encoder features."""
+    """Dataset for pre-computed V-JEPA2 encoder features.
+
+    Supports optional clip range filtering via clip_start and clip_end parameters.
+    This allows selecting a subset of clips for training (e.g., clips 0-5000).
+    """
 
     def __init__(
         self,
@@ -54,6 +58,8 @@ class PrecomputedFeaturesDataset(Dataset):
         use_extrinsics: bool = False,
         feature_map_name: str = "vjepa2_vitl16",
         clip_prefix: str = "clip_",
+        clip_start: int | None = None,
+        clip_end: int | None = None,
     ) -> None:
         """Initialize the dataset.
 
@@ -65,6 +71,10 @@ class PrecomputedFeaturesDataset(Dataset):
             use_extrinsics: Whether to load extrinsics data
             feature_map_name: Name of the feature map file (without .npy extension)
             clip_prefix: Prefix for clip directories (e.g., "clip_")
+            clip_start: Start of clip range (inclusive). If None, no lower bound.
+                Clips are filtered by their numeric ID (e.g., clip_00042 -> 42).
+            clip_end: End of clip range (exclusive). If None, no upper bound.
+                Example: clip_start=0, clip_end=5000 selects clips 0-4999.
         """
         self.data_dir = Path(data_dir)
         self.num_frames = num_frames
@@ -72,6 +82,8 @@ class PrecomputedFeaturesDataset(Dataset):
         self.use_extrinsics = use_extrinsics
         self.feature_map_name = feature_map_name
         self.clip_prefix = clip_prefix
+        self.clip_start = clip_start
+        self.clip_end = clip_end
 
         # Find all clip directories with the expected structure
         self.episode_dirs = sorted([
@@ -80,6 +92,23 @@ class PrecomputedFeaturesDataset(Dataset):
             and d.name.startswith(clip_prefix)
             and (d / "feature_maps" / f"{feature_map_name}.npy").exists()
         ])
+
+        # Filter by clip range if specified
+        if clip_start is not None or clip_end is not None:
+            filtered_dirs = []
+            for d in self.episode_dirs:
+                # Extract numeric ID from clip directory name (e.g., "clip_00042" -> 42)
+                try:
+                    clip_id = int(d.name.replace(clip_prefix, ""))
+                except ValueError:
+                    continue  # Skip directories with non-numeric suffixes
+                # Apply range filter (start inclusive, end exclusive)
+                if clip_start is not None and clip_id < clip_start:
+                    continue
+                if clip_end is not None and clip_id >= clip_end:
+                    continue
+                filtered_dirs.append(d)
+            self.episode_dirs = filtered_dirs
 
         if len(self.episode_dirs) == 0:
             raise ValueError(
@@ -229,6 +258,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         use_extrinsics: bool = False,
         feature_map_name: str = "vjepa2_vitl16",
         clip_prefix: str = "clip_",
+        clip_start: int | None = None,
+        clip_end: int | None = None,
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool | None = None,
@@ -243,6 +274,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
             use_extrinsics: Whether to load extrinsics data
             feature_map_name: Name of the feature map file (without .npy extension)
             clip_prefix: Prefix for clip directories (e.g., "clip_")
+            clip_start: Start of clip range (inclusive). If None, no lower bound.
+            clip_end: End of clip range (exclusive). If None, no upper bound.
             batch_size: Batch size for DataLoaders
             num_workers: Number of worker processes for data loading
             pin_memory: Whether to pin memory for faster GPU transfer.
@@ -257,6 +290,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         self.use_extrinsics = use_extrinsics
         self.feature_map_name = feature_map_name
         self.clip_prefix = clip_prefix
+        self.clip_start = clip_start
+        self.clip_end = clip_end
         self.batch_size = batch_size
         self.num_workers = num_workers
         # Auto-detect pin_memory if not specified (only beneficial for CUDA)
@@ -279,6 +314,8 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
             "use_extrinsics": self.use_extrinsics,
             "feature_map_name": self.feature_map_name,
             "clip_prefix": self.clip_prefix,
+            "clip_start": self.clip_start,
+            "clip_end": self.clip_end,
         }
 
         if stage == "fit" or stage is None:
