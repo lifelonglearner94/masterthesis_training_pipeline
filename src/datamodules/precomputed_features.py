@@ -3,20 +3,30 @@
 This module loads pre-computed encoder features and actions from numpy files
 for training the AC Predictor model. States are zero-filled by default.
 
+Temporal Handling:
+    V-JEPA2 uses tublet encoding (tubelet_size=2), so features have half the temporal
+    resolution of the original video frames. Actions/states are adjusted accordingly:
+    - T_encoded = original_frames // tubelet_size (e.g., 16 frames -> 8 encoded)
+    - T_actions = T_encoded - 1 (actions have one less timestep than features)
+
+    For actions, only the value at index 1 (second timestep) is preserved and
+    moved to index 0 in the output array. This handles the case where the important
+    action occurs at the second timestep in the original data.
+
 Expected data format:
-    - features: .npy files with shape [T+1, N, D] or [T+1, H, W, D]
-      where T+1 is the number of frames, N = H*W is patches per frame, D is embed_dim
-    - actions: .npy files with shape [T+1, action_dim] (will be sliced to [T, action_dim])
-    - states: Created as zeros with shape [T, action_dim]
+    - features: .npy files with shape [T*N, D] (flattened) or [T, N, D] or [T, H, W, D]
+      where T is the encoded temporal dim, N = H*W is patches per frame, D is embed_dim
+    - actions: .npy files with shape [T_original, action_dim] (will be resampled)
+    - states: Created as zeros with shape [T_actions, action_dim]
     - (optional) extrinsics: .npy files with shape [T, action_dim-1]
 
 Directory structure:
     data_dir/
     ├── clip_00001/
     │   ├── feature_maps/
-    │   │   └── vjepa2_vitl16.npy   # [T+1, N, D]
+    │   │   └── vjepa2_vitl16.npy   # [T*N, D] or [T, N, D]
     │   └── actions_states/
-    │       └── actions.npy         # [T+1, action_dim]
+    │       └── actions.npy         # [T_original, action_dim]
     ├── clip_00002/
     └── ...
 """
@@ -40,7 +50,7 @@ class PrecomputedFeaturesDataset(Dataset):
         self,
         data_dir: str | Path,
         num_frames: int = 16,
-        patches_per_frame: int | None = None,
+        patches_per_frame: int = 256,
         use_extrinsics: bool = False,
         feature_map_name: str = "vjepa2_vitl16",
         clip_prefix: str = "clip_",
@@ -50,7 +60,8 @@ class PrecomputedFeaturesDataset(Dataset):
         Args:
             data_dir: Path to directory containing clip subdirectories
             num_frames: Number of frames to load (T in the loss formulation)
-            patches_per_frame: Number of patches per frame (H*W). If None, inferred from data.
+            patches_per_frame: Number of patches per frame (H*W). Required for reshaping
+                flattened features. Default 256 (16x16 patches for ViT-L).
             use_extrinsics: Whether to load extrinsics data
             feature_map_name: Name of the feature map file (without .npy extension)
             clip_prefix: Prefix for clip directories (e.g., "clip_")
@@ -86,36 +97,61 @@ class PrecomputedFeaturesDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
         """Load a single clip.
 
+        Handles temporal alignment for V-JEPA2 tublet encoding:
+        - Features are reshaped from [T*N, D] to [T, N, D] if flattened
+        - T_actions = T - 1 (actions have one less timestep than features)
+        - Actions: only value at index 1 is preserved, moved to index 0
+        - States: zero-filled array with shape [T_actions, action_dim]
+
         Returns:
             Dictionary with keys:
-                - features: [T+1, N, D] tensor
-                - actions: [T, action_dim] tensor
-                - states: [T, action_dim] tensor (zeros)
-                - extrinsics (optional): [T, action_dim-1] tensor
+                - features: [T, N, D] tensor (T encoded timesteps)
+                - actions: [T-1, action_dim] tensor (resampled)
+                - states: [T-1, action_dim] tensor (zeros)
+                - extrinsics (optional): [T-1, action_dim-1] tensor
         """
         episode_dir = self.episode_dirs[idx]
 
         # Load features from clip_XXXXX/feature_maps/{feature_map_name}.npy
         features = np.load(episode_dir / "feature_maps" / f"{self.feature_map_name}.npy")
 
-        # Handle different feature shapes: [T+1, N, D] or [T+1, H, W, D]
-        if features.ndim == 4:
-            T_plus_1, H, W, D = features.shape
-            features = features.reshape(T_plus_1, H * W, D)
+        # Handle different feature shapes:
+        # - [T*N, D] flattened -> reshape to [T, N, D]
+        # - [T, N, D] already correct shape
+        # - [T, H, W, D] -> reshape to [T, H*W, D]
+        if features.ndim == 2:
+            # Flattened format [T*N, D] -> [T, N, D]
+            total_tokens, D = features.shape
+            T_encoded = total_tokens // self.patches_per_frame
+            features = features.reshape(T_encoded, self.patches_per_frame, D)
+        elif features.ndim == 4:
+            # [T, H, W, D] -> [T, H*W, D]
+            T_encoded, H, W, D = features.shape
+            features = features.reshape(T_encoded, H * W, D)
+        else:
+            # Already [T, N, D]
+            T_encoded = features.shape[0]
 
-        # Limit to num_frames + 1 (for target)
-        T_plus_1 = min(features.shape[0], self.num_frames + 1)
-        features = features[:T_plus_1]
-        T = T_plus_1 - 1
+        # Limit to num_frames (for target prediction, we keep T_encoded frames)
+        T_encoded = min(T_encoded, self.num_frames + 1)
+        features = features[:T_encoded]
+
+        # Calculate T_actions = T_encoded - 1
+        # Actions/states have one less timestep than features
+        T_actions = T_encoded - 1
 
         # Load actions from clip_XXXXX/actions_states/actions.npy
-        # Actions array has T+1 rows, slice off the last row to get T actions
-        actions = np.load(episode_dir / "actions_states" / "actions.npy")
-        actions = actions[:-1]  # Drop last row: [T+1, action_dim] -> [T, action_dim]
-        actions = actions[:T]   # Limit to num_frames
+        # Original actions have T_original timesteps, but only index 1 is important
+        # We create a new array with T_actions timesteps, placing the important
+        # value (from index 1) at index 0
+        actions_original = np.load(episode_dir / "actions_states" / "actions.npy")
+        actions = np.zeros((T_actions, self.action_dim), dtype=np.float32)
+        # Preserve the important action value from index 1 -> index 0
+        if actions_original.shape[0] > 1:
+            actions[0] = actions_original[1]
 
-        # Create zero-filled states array (same shape as actions)
-        states = np.zeros((T, self.action_dim), dtype=np.float32)
+        # Create zero-filled states array
+        states = np.zeros((T_actions, self.action_dim), dtype=np.float32)
 
         result = {
             "features": torch.from_numpy(features).float(),

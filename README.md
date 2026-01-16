@@ -89,12 +89,14 @@ uv run src/train.py model=ac_predictor data=precomputed_features trainer=gpu dat
 data_dir/
 ├── clip_00001/
 │   ├── feature_maps/
-│   │   └── vjepa2_vitl16.npy   # [T+1, N, D] encoder features
+│   │   └── vjepa2_vitl16.npy   # [T*N, D] flattened or [T, N, D] (e.g., 2048x1024 for 8 timesteps, 256 patches)
 │   └── actions_states/
-│       └── actions.npy         # [T+1, action_dim] (last row is dropped to get expected [T, action_dim])
+│       └── actions.npy         # [T_original, action_dim] (value at index 1 is preserved -> index 0)
 ├── clip_00002/
 └── ...
 ```
+
+**Note on temporal alignment**: V-JEPA2 uses tublet encoding (tubelet_size=2), so feature maps have `T_encoded = original_frames // 2` timesteps. Actions/states are automatically adjusted to `T_actions = T_encoded - 1`. For 16 original frames → 8 encoded timesteps → 7 action timesteps.
 
 ### Testing
 

@@ -10,7 +10,7 @@ model:
   _target_: src.models.ac_predictor.ACPredictorModule
 
   # Model architecture
-  img_size: [224, 224]
+  img_size: [256, 256]
   patch_size: 16
   num_frames: 16
   tubelet_size: 2

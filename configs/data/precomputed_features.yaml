@@ -12,7 +12,7 @@ clip_prefix: "clip_"  # Prefix for clip directories
 
 # Dataset settings
 num_frames: 16  # Number of frames per sample (T in loss formulation)
-patches_per_frame: null  # Auto-detect from data (H*W)
+patches_per_frame: 256  # Patches per frame for ViT-L (16x16 patches)
 use_extrinsics: false
 
 # DataLoader settings

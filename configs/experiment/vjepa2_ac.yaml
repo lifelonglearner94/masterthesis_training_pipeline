@@ -1,3 +1,4 @@
+# @package _global_
 # V-JEPA2 AC Predictor Training Configuration
 # Use as: uv run src/train.py experiment=vjepa2_ac
 #
@@ -11,7 +12,7 @@
 # - Gradient clipping: 1.01
 # - L1 loss with teacher-forcing + rollout (T=2)
 
-# @package _global_
+
 
 defaults:
   - override /data: precomputed_features
