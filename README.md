@@ -112,7 +112,9 @@ data_dir/
 └── ...
 ```
 
-**Note on temporal alignment**: V-JEPA2 uses tublet encoding (tubelet_size=2), so feature maps have `T_encoded = original_frames // 2` timesteps. Actions/states are automatically adjusted to `T_actions = T_encoded - 1`. For 16 original frames → 8 encoded timesteps → 7 action timesteps.
+**Note on temporal alignment**: V-JEPA2 uses tublet encoding (tubelet_size=2), so feature maps have `num_timesteps = original_frames // 2`. Actions/states are automatically adjusted to `T_actions = num_timesteps - 1`. For 16 original frames → 8 encoded timesteps → 7 action timesteps.
+
+**IMPORTANT**: The `num_timesteps` parameter in configs refers to ENCODED timesteps, NOT original video frames.
 
 ### Testing
 

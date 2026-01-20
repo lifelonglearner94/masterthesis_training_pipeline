@@ -4,10 +4,13 @@ This module loads pre-computed encoder features and actions from numpy files
 for training the AC Predictor model. States are zero-filled by default.
 
 Temporal Handling:
-    V-JEPA2 uses tublet encoding (tubelet_size=2), so features have half the temporal
-    resolution of the original video frames. Actions/states are adjusted accordingly:
-    - T_encoded = original_frames // tubelet_size (e.g., 16 frames -> 8 encoded)
-    - T_actions = T_encoded - 1 (actions have one less timestep than features)
+    Features are pre-encoded with V-JEPA2 tubelet encoding (tubelet_size=2), so they
+    already have half the temporal resolution of the original video frames:
+    - num_timesteps = 8 (pre-encoded from 16 original frames with tubelet_size=2)
+    - T_actions = num_timesteps - 1 (actions have one less timestep than features)
+
+    IMPORTANT: The `num_timesteps` parameter refers to ENCODED timesteps in the
+    precomputed .npy files, NOT original video frames.
 
     For actions, only the value at index 1 (second timestep) is preserved and
     moved to index 0 in the output array. This handles the case where the important
@@ -53,7 +56,7 @@ class PrecomputedFeaturesDataset(Dataset):
     def __init__(
         self,
         data_dir: str | Path,
-        num_frames: int = 16,
+        num_timesteps: int = 8,
         patches_per_frame: int = 256,
         use_extrinsics: bool = False,
         feature_map_name: str = "vjepa2_vitl16",
@@ -65,7 +68,9 @@ class PrecomputedFeaturesDataset(Dataset):
 
         Args:
             data_dir: Path to directory containing clip subdirectories
-            num_frames: Number of frames to load (T in the loss formulation)
+            num_timesteps: Number of encoded timesteps to load from precomputed features.
+                This is T in the loss formulation. For V-JEPA2 with tubelet_size=2,
+                this equals original_frames // 2 (e.g., 16 frames -> 8 timesteps).
             patches_per_frame: Number of patches per frame (H*W). Required for reshaping
                 flattened features. Default 256 (16x16 patches for ViT-L).
             use_extrinsics: Whether to load extrinsics data
@@ -77,13 +82,20 @@ class PrecomputedFeaturesDataset(Dataset):
                 Example: clip_start=0, clip_end=5000 selects clips 0-4999.
         """
         self.data_dir = Path(data_dir)
-        self.num_frames = num_frames
+        self.num_timesteps = num_timesteps
         self.patches_per_frame = patches_per_frame
         self.use_extrinsics = use_extrinsics
         self.feature_map_name = feature_map_name
         self.clip_prefix = clip_prefix
         self.clip_start = clip_start
         self.clip_end = clip_end
+
+        # Validate num_timesteps
+        if num_timesteps < 2:
+            raise ValueError(
+                f"num_timesteps must be >= 2 (got {num_timesteps}). "
+                "Need at least 2 timesteps for context + target."
+            )
 
         # Find all clip directories with the expected structure
         self.episode_dirs = sorted([
@@ -161,8 +173,8 @@ class PrecomputedFeaturesDataset(Dataset):
             # Already [T, N, D]
             T_encoded = features.shape[0]
 
-        # Limit to num_frames (for target prediction, we keep T_encoded frames)
-        T_encoded = min(T_encoded, self.num_frames + 1)
+        # Limit to num_timesteps (for target prediction, we keep T+1 frames: T context + 1 target)
+        T_encoded = min(T_encoded, self.num_timesteps + 1)
         features = features[:T_encoded]
 
         # Calculate T_actions = T_encoded - 1
@@ -253,7 +265,7 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
     def __init__(
         self,
         data_dir: str = "data",
-        num_frames: int = 16,
+        num_timesteps: int = 8,
         patches_per_frame: int | None = None,
         use_extrinsics: bool = False,
         feature_map_name: str = "vjepa2_vitl16",
@@ -269,7 +281,9 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
 
         Args:
             data_dir: Root directory containing clip subdirectories
-            num_frames: Number of frames per sample (T in the loss formulation)
+            num_timesteps: Number of encoded timesteps per sample. This is T in the
+                loss formulation. For V-JEPA2 with tubelet_size=2, this equals
+                original_frames // 2 (e.g., 16 frames -> 8 timesteps).
             patches_per_frame: Number of patches per frame (H*W)
             use_extrinsics: Whether to load extrinsics data
             feature_map_name: Name of the feature map file (without .npy extension)
@@ -285,7 +299,7 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         self.save_hyperparameters()
 
         self.data_dir = Path(data_dir)
-        self.num_frames = num_frames
+        self.num_timesteps = num_timesteps
         self.patches_per_frame = patches_per_frame
         self.use_extrinsics = use_extrinsics
         self.feature_map_name = feature_map_name
@@ -309,7 +323,7 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         """
         dataset_kwargs = {
             "data_dir": self.data_dir,
-            "num_frames": self.num_frames,
+            "num_timesteps": self.num_timesteps,
             "patches_per_frame": self.patches_per_frame,
             "use_extrinsics": self.use_extrinsics,
             "feature_map_name": self.feature_map_name,

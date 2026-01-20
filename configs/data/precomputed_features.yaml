@@ -1,5 +1,9 @@
 # Pre-computed V-JEPA2 features data configuration
 # For training the AC Predictor with pre-encoded video features
+#
+# IMPORTANT: num_timesteps refers to ENCODED timesteps in the precomputed .npy files,
+# NOT original video frames. For V-JEPA2 with tubelet_size=2:
+#   num_timesteps = original_frames // 2 (e.g., 16 frames -> 8 timesteps)
 
 _target_: src.datamodules.PrecomputedFeaturesDataModule
 
@@ -20,7 +24,7 @@ clip_end: 5000    # End of clip range (exclusive), null = no upper bound
 # e.g., train: clip_start=0, clip_end=4000 | val: clip_start=4000, clip_end=5000
 
 # Dataset settings
-num_frames: 16  # Number of frames per sample (T in loss formulation)
+num_timesteps: 8  # Encoded timesteps per sample (16 original frames / tubelet_size=2)
 patches_per_frame: 256  # Patches per frame for ViT-L (16x16 patches)
 use_extrinsics: false
 

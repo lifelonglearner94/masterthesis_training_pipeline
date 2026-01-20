@@ -2,6 +2,10 @@
 
 # AC Predictor Model Configuration
 # Action-Conditioned Vision Transformer Predictor from V-JEPA2
+#
+# IMPORTANT: num_timesteps refers to ENCODED timesteps from precomputed features,
+# NOT original video frames. For V-JEPA2 with tubelet_size=2:
+#   num_timesteps = original_frames // 2 (e.g., 16 frames -> 8 timesteps)
 
 defaults:
   - /model/_empty  # Override empty default
@@ -12,8 +16,7 @@ model:
   # Model architecture
   img_size: [256, 256]
   patch_size: 16
-  num_frames: 16
-  tubelet_size: 2
+  num_timesteps: 8  # Encoded timesteps (16 original frames / tubelet_size=2)
   embed_dim: 1024
   predictor_embed_dim: 384
   depth: 24
@@ -30,8 +33,8 @@ model:
   attn_drop_rate: 0.0
   drop_path_rate: 0.1
 
-  # Loss settings
-  T_teacher: 15  # Teacher-forcing prediction steps
+  # Loss settings (max T_teacher = num_timesteps - 1 = 7)
+  T_teacher: 7  # Teacher-forcing prediction steps
   T_rollout: 2   # Rollout prediction steps
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0

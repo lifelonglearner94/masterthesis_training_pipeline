@@ -6,6 +6,12 @@
 #
 # This file consolidates ALL important settings. Edit values here, not in
 # configs/model/ac_predictor.yaml or configs/data/precomputed_features.yaml.
+#
+# TEMPORAL DIMENSIONS:
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Available prediction steps: 7 (num_timesteps - 1 = 8 - 1)
+#   - T_teacher/T_rollout must be <= 7
 # =============================================================================
 
 defaults:
@@ -40,12 +46,13 @@ data:
 
 model:
   # --- Memory settings ---
-  T_teacher: 5                     # ⚠️ REDUCED from 15 (saves ~3x activation memory)
+  T_teacher: 5                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
   T_rollout: 2
   use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
 
   # --- Model architecture (keep defaults from ac_predictor.yaml) ---
   # Uncomment to override:
+  # num_timesteps: 8  # Encoded timesteps (default, matches precomputed features)
   # embed_dim: 1024
   # predictor_embed_dim: 384
   # depth: 24
@@ -75,6 +82,6 @@ model:
 # TRAINER SETTINGS
 # =============================================================================
 trainer:
-  max_epochs: 100
+  max_epochs: 9
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm

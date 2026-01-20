@@ -32,14 +32,17 @@ class ACPredictorModule(pl.LightningModule):
     - Rollout loss: enforces consistency over multiple recurrent prediction steps
 
     Expected batch format:
-        - features: [B, T+1, N, D] - Pre-computed V-JEPA2 encoder features for T+1 frames
+        - features: [B, T+1, N, D] - Pre-computed V-JEPA2 encoder features for T+1 timesteps
         - actions: [B, T, action_dim] - 7D end-effector state changes
         - states: [B, T, action_dim] - 7D end-effector states
 
     Where:
-        - T is the number of prediction steps (default: 15 for teacher-forcing)
+        - T is the number of encoded timesteps (e.g., 8 for 16 original frames with tubelet_size=2)
         - N is the number of patches per frame (H*W)
         - D is the embedding dimension
+
+    Note: num_timesteps refers to the ENCODED temporal dimension of precomputed features,
+    NOT the original video frame count.
     """
 
     def __init__(
@@ -47,8 +50,7 @@ class ACPredictorModule(pl.LightningModule):
         # Model architecture
         img_size: tuple[int, int] = (256, 256),
         patch_size: int = 16,
-        num_frames: int = 16,
-        tubelet_size: int = 2,
+        num_timesteps: int = 8,
         embed_dim: int = 768,
         predictor_embed_dim: int = 1024,
         depth: int = 24,
@@ -63,7 +65,7 @@ class ACPredictorModule(pl.LightningModule):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         # Loss settings
-        T_teacher: int = 15,
+        T_teacher: int = 7,
         T_rollout: int = 2,
         loss_weight_teacher: float = 1.0,
         loss_weight_rollout: float = 1.0,
@@ -84,12 +86,14 @@ class ACPredictorModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
+        # Store num_timesteps for validation
+        self.num_timesteps = num_timesteps
+
         # Build the predictor model
         self.model = vit_ac_predictor(
             img_size=img_size,
             patch_size=patch_size,
-            num_frames=num_frames,
-            tubelet_size=tubelet_size,
+            num_timesteps=num_timesteps,
             embed_dim=embed_dim,
             predictor_embed_dim=predictor_embed_dim,
             depth=depth,
@@ -108,6 +112,23 @@ class ACPredictorModule(pl.LightningModule):
         # Loss hyperparameters
         self.T_teacher = T_teacher
         self.T_rollout = T_rollout
+
+        # Validate T_teacher and T_rollout against available timesteps
+        max_prediction_steps = num_timesteps - 1  # Need at least 1 context + 1 target
+        if T_teacher > max_prediction_steps:
+            import warnings
+            warnings.warn(
+                f"T_teacher ({T_teacher}) exceeds available prediction steps ({max_prediction_steps}) "
+                f"for num_timesteps={num_timesteps}. Will be clamped to {max_prediction_steps} at runtime.",
+                UserWarning
+            )
+        if T_rollout > max_prediction_steps:
+            import warnings
+            warnings.warn(
+                f"T_rollout ({T_rollout}) exceeds available prediction steps ({max_prediction_steps}) "
+                f"for num_timesteps={num_timesteps}. Will be clamped to {max_prediction_steps} at runtime.",
+                UserWarning
+            )
         self.loss_weight_teacher = loss_weight_teacher
         self.loss_weight_rollout = loss_weight_rollout
 

@@ -17,5 +17,5 @@ model_checkpoint:
   save_weights_only: False
   every_n_train_steps: null
   train_time_interval: null
-  every_n_epochs: 25  # Periodic snapshots for retroactive validation
+  every_n_epochs: 5  # Periodic snapshots for retroactive validation
   save_on_train_epoch_end: True

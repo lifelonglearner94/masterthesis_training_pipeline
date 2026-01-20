@@ -15,14 +15,18 @@ from src.models.ac_predictor.utils.tensors import trunc_normal_
 
 
 class VisionTransformerPredictorAC(nn.Module):
-    """Action Conditioned Vision Transformer Predictor"""
+    """Action Conditioned Vision Transformer Predictor.
+
+    This predictor operates on PRE-ENCODED features from V-JEPA2 encoder.
+    The temporal dimension has already been reduced by tubelet encoding,
+    so num_timesteps represents the encoded temporal dimension.
+    """
 
     def __init__(
         self,
         img_size=(256, 256),
         patch_size=16,
-        num_frames=1,
-        tubelet_size=2,
+        num_timesteps=8,
         embed_dim=768,
         predictor_embed_dim=1024,
         depth=24,
@@ -61,9 +65,8 @@ class VisionTransformerPredictorAC(nn.Module):
         self.img_height, self.img_width = img_size
         self.patch_size = patch_size
         # --
-        self.num_frames = num_frames
-        self.tubelet_size = tubelet_size
-        self.is_video = num_frames > 1
+        self.num_timesteps = num_timesteps
+        self.is_video = num_timesteps > 1
 
         self.grid_height = img_size[0] // self.patch_size
         self.grid_width = img_size[1] // self.patch_size
@@ -108,7 +111,7 @@ class VisionTransformerPredictorAC(nn.Module):
 
         attn_mask = None
         if self.is_frame_causal:
-            grid_depth = self.num_frames // self.tubelet_size
+            grid_depth = self.num_timesteps  # Already encoded temporal dimension
             grid_height = self.img_height // self.patch_size
             grid_width = self.img_width // self.patch_size
             attn_mask = build_action_block_causal_attention_mask(
@@ -134,12 +137,34 @@ class VisionTransformerPredictorAC(nn.Module):
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
     def forward(self, x, actions, states, extrinsics=None):
-        """
-        :param x: context tokens
+        """Forward pass through the AC predictor.
+
+        Args:
+            x: Context tokens [B, T*N, D] where T is num_timesteps, N = H*W patches
+            actions: Action sequences [B, T, action_dim]
+            states: State sequences [B, T, action_dim]
+            extrinsics: Optional extrinsic parameters [B, T, action_dim-1]
+
+        Returns:
+            Predicted features [B, T*N, D]
         """
         # Map tokens to predictor dimensions
         x = self.predictor_embed(x)
         B, N_ctxt, D = x.size()
+        T = N_ctxt // (self.grid_height * self.grid_width)
+
+        # Validate input temporal dimension
+        expected_patches = self.grid_height * self.grid_width
+        if N_ctxt % expected_patches != 0:
+            raise ValueError(
+                f"Input token count ({N_ctxt}) is not divisible by patches_per_frame "
+                f"({expected_patches}). Check that input features match model config."
+            )
+        if T > self.num_timesteps:
+            raise ValueError(
+                f"Input has {T} timesteps but model was configured for max {self.num_timesteps}. "
+                f"Either reduce input sequence length or increase model.num_timesteps."
+            )
         T = N_ctxt // (self.grid_height * self.grid_width)
 
         # Interleave action tokens
