@@ -20,8 +20,11 @@ clip_prefix: "clip_"  # Prefix for clip directories
 # Example: clip_start=0, clip_end=5000 selects clips 0-4999
 clip_start: 0  # Start of clip range (inclusive), null = no lower bound
 clip_end: 5000    # End of clip range (exclusive), null = no upper bound
-# TODO: For train/val split, consider using separate configs with different ranges
-# e.g., train: clip_start=0, clip_end=4000 | val: clip_start=4000, clip_end=5000
+
+# Validation split (percentage-based)
+# The last N% of clips (by ID) are used for validation.
+# e.g., val_split=0.1 with clip_end=5000 uses clips 4500-4999 for validation
+val_split: 0.1  # Fraction for validation (0.0 = no validation, 0.1 = 10%)
 
 # Dataset settings
 num_timesteps: 8  # Encoded timesteps per sample (16 original frames / tubelet_size=2)

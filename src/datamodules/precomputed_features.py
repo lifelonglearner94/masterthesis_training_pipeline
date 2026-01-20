@@ -272,6 +272,7 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         clip_prefix: str = "clip_",
         clip_start: int | None = None,
         clip_end: int | None = None,
+        val_split: float = 0.0,
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool | None = None,
@@ -290,6 +291,9 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
             clip_prefix: Prefix for clip directories (e.g., "clip_")
             clip_start: Start of clip range (inclusive). If None, no lower bound.
             clip_end: End of clip range (exclusive). If None, no upper bound.
+            val_split: Fraction of clips to use for validation (e.g., 0.1 = 10%).
+                The last N% of clips (by ID) are used for validation.
+                Must be in range [0.0, 1.0). If 0.0, no validation set is created.
             batch_size: Batch size for DataLoaders
             num_workers: Number of worker processes for data loading
             pin_memory: Whether to pin memory for faster GPU transfer.
@@ -306,6 +310,7 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         self.clip_prefix = clip_prefix
         self.clip_start = clip_start
         self.clip_end = clip_end
+        self.val_split = val_split
         self.batch_size = batch_size
         self.num_workers = num_workers
         # Auto-detect pin_memory if not specified (only beneficial for CUDA)
@@ -319,28 +324,74 @@ class PrecomputedFeaturesDataModule(pl.LightningDataModule):
         """Set up datasets for each stage.
 
         Uses data_dir directly (flat structure with clip_* directories).
-        All clips are used for training - no train/val split.
+        If val_split > 0, the last N% of clips (by ID) are used for validation.
         """
-        dataset_kwargs = {
+        # Compute effective clip range
+        effective_start = self.clip_start if self.clip_start is not None else 0
+        effective_end = self.clip_end  # May be None
+
+        # Calculate train/val split point if val_split is specified
+        if self.val_split > 0.0:
+            if self.val_split >= 1.0:
+                raise ValueError(
+                    f"val_split must be in range [0.0, 1.0), got {self.val_split}"
+                )
+            if effective_end is None:
+                raise ValueError(
+                    "clip_end must be specified when using val_split to determine "
+                    "the validation range. Set clip_end to the total number of clips."
+                )
+            total_clips = effective_end - effective_start
+            val_clips = int(total_clips * self.val_split)
+            # Ensure at least 1 clip in validation if val_split > 0
+            val_clips = max(1, val_clips)
+            # Ensure at least 1 clip remains for training
+            if val_clips >= total_clips:
+                raise ValueError(
+                    f"val_split={self.val_split} would leave no clips for training. "
+                    f"Total clips: {total_clips}, val clips: {val_clips}"
+                )
+            val_start = effective_end - val_clips
+            train_end = val_start
+        else:
+            # No validation split
+            train_end = effective_end
+            val_start = None
+
+        # Base dataset kwargs (without clip range)
+        base_kwargs = {
             "data_dir": self.data_dir,
             "num_timesteps": self.num_timesteps,
             "patches_per_frame": self.patches_per_frame,
             "use_extrinsics": self.use_extrinsics,
             "feature_map_name": self.feature_map_name,
             "clip_prefix": self.clip_prefix,
-            "clip_start": self.clip_start,
-            "clip_end": self.clip_end,
         }
 
         if stage == "fit" or stage is None:
-            # Use all clips for training (no split)
-            self.train_dataset = PrecomputedFeaturesDataset(**dataset_kwargs)
-            # No validation dataset for now
-            self.val_dataset = None
+            # Training dataset: clips from start to split point
+            self.train_dataset = PrecomputedFeaturesDataset(
+                **base_kwargs,
+                clip_start=effective_start,
+                clip_end=train_end,
+            )
+            # Validation dataset: clips from split point to end (if val_split > 0)
+            if val_start is not None:
+                self.val_dataset = PrecomputedFeaturesDataset(
+                    **base_kwargs,
+                    clip_start=val_start,
+                    clip_end=effective_end,
+                )
+            else:
+                self.val_dataset = None
 
         if stage == "test" or stage is None:
-            # Use same clips for testing
-            self.test_dataset = PrecomputedFeaturesDataset(**dataset_kwargs)
+            # Test uses same range as training (or full range if no split)
+            self.test_dataset = PrecomputedFeaturesDataset(
+                **base_kwargs,
+                clip_start=effective_start,
+                clip_end=train_end,
+            )
 
     def train_dataloader(self) -> DataLoader:
         """Create training DataLoader."""
