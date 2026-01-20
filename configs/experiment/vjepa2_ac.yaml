@@ -95,15 +95,15 @@ model:
 
   # --- LR schedule (iteration-based, V-JEPA2 paper) ---
   use_iteration_scheduler: true
-  warmup_iters: 280
-  constant_iters: 2240
-  decay_iters: 280
+  warmup_iters: 400
+  constant_iters: 3895
+  decay_iters: 400
   warmup_start_lr: 7.5e-5
 
 # =============================================================================
 # TRAINER SETTINGS
 # =============================================================================
 trainer:
-  max_epochs: 9
+  max_epochs: 15
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm
