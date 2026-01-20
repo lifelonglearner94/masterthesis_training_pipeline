@@ -38,6 +38,19 @@ model:
   T_rollout: 2   # Rollout prediction steps
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
+  normalize_reps: true  # Apply layer norm after predictor steps (V-JEPA2 paper)
+  loss_exp: 1.0  # Loss exponent: 1.0=L1, 2.0=L2 (paper uses L1)
+
+  # Curriculum learning schedule (null = disabled, use fixed values above)
+  # Example schedule to enable:
+  #   curriculum_schedule:
+  #     - epoch: 0
+  #       T_rollout: 2
+  #       loss_weight_teacher: 1.0
+  #     - epoch: 10
+  #       T_rollout: 4
+  #       loss_weight_teacher: 0.5
+  curriculum_schedule: null
 
   # Optimizer settings
   learning_rate: 1e-4

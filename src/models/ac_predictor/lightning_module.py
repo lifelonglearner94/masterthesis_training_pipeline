@@ -6,12 +6,20 @@
 """Lightning Module wrapper for AC Predictor.
 
 Implements teacher-forcing and rollout losses for training the action-conditioned
-vision transformer predictor.
+vision transformer predictor, matching the V-JEPA2 paper implementation.
 
-Loss formulations:
-- Teacher-Forcing: L_tf = (1/T) Σ ||P_φ((a_t, s_t, z_t)_{t≤k}) - z_{k+1}||_1
-- Rollout: L_rollout = ||P_φ(a_{1:T}, s_1, z_1) - z_{T+1}||_1
-- Combined: L = L_teacher-forcing + L_rollout
+Loss formulations (with configurable loss_exp, default=1.0 for L1):
+- Teacher-Forcing: L_tf = mean(|P_φ(z_{0:T-1}, a, s) - z_{1:T}|^exp) / exp
+  Single forward pass with full context, predicts all frames in parallel.
+- Rollout: L_ar = mean(|z_ar - z_{1:T}|^exp) / exp
+  Autoregressive rollout seeded with ground-truth z_0 + first TF prediction.
+- Combined: L = w_tf * L_tf + w_ar * L_ar
+
+Key features matching original paper:
+- Optional layer normalization after each predictor step (normalize_reps)
+- Configurable loss exponent (loss_exp=1.0 for L1, loss_exp=2.0 for L2)
+- Cumulative action/state context for autoregressive rollout
+- TF-seeded initialization for rollout stability
 """
 
 from typing import Any
@@ -69,6 +77,8 @@ class ACPredictorModule(pl.LightningModule):
         T_rollout: int = 2,
         loss_weight_teacher: float = 1.0,
         loss_weight_rollout: float = 1.0,
+        normalize_reps: bool = True,
+        loss_exp: float = 1.0,
         # Optimizer settings
         learning_rate: float = 4.25e-4,
         weight_decay: float = 0.04,
@@ -77,6 +87,8 @@ class ACPredictorModule(pl.LightningModule):
         max_epochs: int = 100,
         # Iteration-based LR schedule (V-JEPA2 paper)
         use_iteration_scheduler: bool = False,
+        # Curriculum learning schedule for dynamic loss adjustment
+        curriculum_schedule: list[dict] | None = None,
         warmup_iters: int = 4500,
         constant_iters: int = 85500,
         decay_iters: int = 4500,
@@ -131,6 +143,8 @@ class ACPredictorModule(pl.LightningModule):
             )
         self.loss_weight_teacher = loss_weight_teacher
         self.loss_weight_rollout = loss_weight_rollout
+        self.normalize_reps = normalize_reps
+        self.loss_exp = loss_exp
 
         # Optimizer hyperparameters
         self.learning_rate = learning_rate
@@ -150,6 +164,116 @@ class ACPredictorModule(pl.LightningModule):
         self.grid_height = img_size[0] // patch_size
         self.grid_width = img_size[1] // patch_size
         self.patches_per_frame = self.grid_height * self.grid_width
+
+        # Curriculum learning: schedule for dynamic T_rollout and loss_weight_teacher
+        # Format: [{"epoch": 0, "T_rollout": 2, "loss_weight_teacher": 1.0}, ...]
+        self.curriculum_schedule = curriculum_schedule
+        if curriculum_schedule:
+            self._validate_curriculum_schedule(curriculum_schedule)
+
+    def _validate_curriculum_schedule(self, schedule: list[dict]) -> None:
+        """Validate curriculum schedule format and values.
+
+        Args:
+            schedule: List of dicts with keys: epoch, T_rollout (optional),
+                     loss_weight_teacher (optional), loss_weight_rollout (optional)
+
+        Raises:
+            ValueError: If schedule is invalid
+        """
+        if not isinstance(schedule, list) or len(schedule) == 0:
+            raise ValueError("curriculum_schedule must be a non-empty list")
+
+        max_prediction_steps = self.num_timesteps - 1
+
+        for i, phase in enumerate(schedule):
+            if not isinstance(phase, dict):
+                raise ValueError(f"Phase {i} must be a dict, got {type(phase)}")
+            if "epoch" not in phase:
+                raise ValueError(f"Phase {i} must have 'epoch' key")
+            if not isinstance(phase["epoch"], int) or phase["epoch"] < 0:
+                raise ValueError(f"Phase {i} 'epoch' must be a non-negative integer")
+
+            # Validate T_rollout if present
+            if "T_rollout" in phase:
+                if phase["T_rollout"] > max_prediction_steps:
+                    raise ValueError(
+                        f"Phase {i}: T_rollout ({phase['T_rollout']}) exceeds "
+                        f"max prediction steps ({max_prediction_steps})"
+                    )
+
+        # Ensure phases are sorted by epoch
+        epochs = [p["epoch"] for p in schedule]
+        if epochs != sorted(epochs):
+            raise ValueError("curriculum_schedule phases must be sorted by epoch")
+
+    def _get_curriculum_params_for_epoch(self, epoch: int) -> dict:
+        """Get curriculum parameters for the given epoch.
+
+        Finds the most recent phase whose epoch is <= current epoch.
+
+        Args:
+            epoch: Current training epoch
+
+        Returns:
+            Dict with T_rollout, loss_weight_teacher, loss_weight_rollout
+        """
+        if not self.curriculum_schedule:
+            return {}
+
+        # Find the applicable phase (last one where epoch <= current)
+        applicable_phase = None
+        for phase in self.curriculum_schedule:
+            if phase["epoch"] <= epoch:
+                applicable_phase = phase
+            else:
+                break
+
+        if applicable_phase is None:
+            return {}
+
+        # Extract params (excluding 'epoch' key)
+        return {k: v for k, v in applicable_phase.items() if k != "epoch"}
+
+    def on_train_epoch_start(self) -> None:
+        """Update curriculum parameters at the start of each epoch."""
+        if not self.curriculum_schedule:
+            return
+
+        epoch = self.current_epoch
+        params = self._get_curriculum_params_for_epoch(epoch)
+
+        if not params:
+            return
+
+        # Track if anything changed for logging
+        changes = []
+
+        if "T_rollout" in params and params["T_rollout"] != self.T_rollout:
+            old_val = self.T_rollout
+            self.T_rollout = params["T_rollout"]
+            changes.append(f"T_rollout: {old_val} → {self.T_rollout}")
+
+        if "loss_weight_teacher" in params and params["loss_weight_teacher"] != self.loss_weight_teacher:
+            old_val = self.loss_weight_teacher
+            self.loss_weight_teacher = params["loss_weight_teacher"]
+            changes.append(f"loss_weight_teacher: {old_val} → {self.loss_weight_teacher}")
+
+        if "loss_weight_rollout" in params and params["loss_weight_rollout"] != self.loss_weight_rollout:
+            old_val = self.loss_weight_rollout
+            self.loss_weight_rollout = params["loss_weight_rollout"]
+            changes.append(f"loss_weight_rollout: {old_val} → {self.loss_weight_rollout}")
+
+        # Log changes
+        if changes:
+            import logging
+            log = logging.getLogger(__name__)
+            log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
+
+        # Log current curriculum state for tracking
+        self.log("curriculum/T_rollout", float(self.T_rollout), sync_dist=True)
+        self.log("curriculum/loss_weight_teacher", self.loss_weight_teacher, sync_dist=True)
+        self.log("curriculum/loss_weight_rollout", self.loss_weight_rollout, sync_dist=True)
 
     def forward(
         self,
@@ -171,6 +295,50 @@ class ACPredictorModule(pl.LightningModule):
         """
         return self.model(features, actions, states, extrinsics)
 
+    def _step_predictor(
+        self,
+        z: Tensor,
+        actions: Tensor,
+        states: Tensor,
+        extrinsics: Tensor | None = None,
+    ) -> Tensor:
+        """Single predictor step with optional layer normalization.
+
+        Args:
+            z: Input features [B, T*N, D]
+            actions: Actions [B, T, action_dim]
+            states: States [B, T, action_dim]
+            extrinsics: Optional extrinsics [B, T, action_dim-1]
+
+        Returns:
+            Predicted features [B, T*N, D], optionally normalized
+        """
+        z_pred = self.model(z, actions, states, extrinsics)
+        if self.normalize_reps:
+            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),))
+        return z_pred
+
+    def _compute_loss(
+        self,
+        pred: Tensor,
+        target: Tensor,
+    ) -> Tensor:
+        """Compute loss with configurable exponent.
+
+        loss = mean(|pred - target|^loss_exp) / loss_exp
+
+        When loss_exp=1.0, this is equivalent to L1 loss.
+        When loss_exp=2.0, this is equivalent to 0.5 * L2 loss.
+
+        Args:
+            pred: Predicted features
+            target: Target features
+
+        Returns:
+            Scalar loss tensor
+        """
+        return torch.mean(torch.abs(pred - target) ** self.loss_exp) / self.loss_exp
+
     def _compute_teacher_forcing_loss(
         self,
         features: Tensor,
@@ -178,12 +346,14 @@ class ACPredictorModule(pl.LightningModule):
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> Tensor:
-        """Compute teacher-forcing loss.
+        """Compute teacher-forcing loss (single forward pass, matching V-JEPA2 paper).
 
-        L_teacher-forcing = (1/T) Σ_{k=1}^{T} ||P_φ((a_t, s_t, z_t)_{t≤k}) - z_{k+1}||_1
+        The predictor receives all context frames (0 to T-1) and predicts frames 1 to T
+        in a single forward pass. Loss compares predictions against ground-truth targets.
 
-        The predictor receives context up to frame k and predicts the next frame.
-        Loss is averaged over T prediction steps.
+        This matches the original paper's implementation:
+            z_tf = predictor(z[:, :-tokens_per_frame], actions, states, extrinsics)
+            loss = mean(|z_tf - h[:, tokens_per_frame:]|^loss_exp) / loss_exp
 
         Args:
             features: [B, T+1, N, D] - Features for T+1 frames (T inputs + 1 target)
@@ -197,29 +367,31 @@ class ACPredictorModule(pl.LightningModule):
         B, T_plus_1, N, D = features.shape
         T = min(T_plus_1 - 1, self.T_teacher)
 
-        total_loss = 0.0
+        # Context: all frames except the last one (frames 0 to T-1)
+        # Shape: [B, T*N, D]
+        context_features = features[:, :T, :, :].reshape(B, T * N, D)
 
-        for k in range(1, T + 1):
-            # Context: frames 0 to k-1 (k frames total)
-            context_features = features[:, :k, :, :].reshape(B, k * N, D)
-            context_actions = actions[:, :k, :]
-            context_states = states[:, :k, :]
-            context_extrinsics = extrinsics[:, :k, :] if extrinsics is not None else None
+        # Apply layer norm to input if enabled (matching paper)
+        if self.normalize_reps:
+            context_features = F.layer_norm(context_features, (context_features.size(-1),))
 
-            # Predict
-            pred = self.model(context_features, context_actions, context_states, context_extrinsics)
+        # Actions/states for T steps
+        context_actions = actions[:, :T, :]
+        context_states = states[:, :T, :]
+        context_extrinsics = extrinsics[:, :T, :] if extrinsics is not None else None
 
-            # Target: frame k (the next frame after context)
-            # pred has shape [B, k*N, D], we want the last frame's prediction
-            pred_last_frame = pred[:, -N:, :]  # [B, N, D]
-            target = features[:, k, :, :]  # [B, N, D]
+        # Single forward pass - predicts all T frames
+        z_tf = self._step_predictor(
+            context_features, context_actions, context_states, context_extrinsics
+        )
 
-            # L1 loss
-            loss_k = F.l1_loss(pred_last_frame, target)
-            total_loss = total_loss + loss_k
+        # Target: frames 1 to T (shifted by one from context)
+        # Shape: [B, T*N, D]
+        target = features[:, 1 : T + 1, :, :].reshape(B, T * N, D)
+        if self.normalize_reps:
+            target = F.layer_norm(target, (target.size(-1),))
 
-        # Average over T steps
-        return total_loss / T
+        return self._compute_loss(z_tf, target)
 
     def _compute_rollout_loss(
         self,
@@ -228,12 +400,18 @@ class ACPredictorModule(pl.LightningModule):
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> Tensor:
-        """Compute rollout loss.
+        """Compute rollout loss (matching V-JEPA2 paper).
 
-        L_rollout = ||P_φ(a_{1:T}, s_1, z_1) - z_{T+1}||_1
+        Autoregressive rollout seeded with ground-truth frame 0 and first teacher-forcing
+        prediction. Uses cumulative action/state context at each step.
 
-        Recurrently apply the predictor for T_rollout steps, using predicted
-        features as input for subsequent steps.
+        Paper implementation:
+            # Seed with z_0 (ground-truth) + z_tf[:, :tokens_per_frame] (first TF prediction)
+            z = cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
+            for n in range(1, auto_steps):
+                z_nxt = predictor(z, actions[:, :n+1], states[:, :n+1], ...)[:, -tokens_per_frame:]
+                z = cat([z, z_nxt], dim=1)
+            loss = mean(|z[:, tokens_per_frame:] - h[:, tokens_per_frame:T+1]|^loss_exp) / loss_exp
 
         Args:
             features: [B, T+1, N, D] - Features for T+1 frames
@@ -247,25 +425,47 @@ class ACPredictorModule(pl.LightningModule):
         B, T_plus_1, N, D = features.shape
         T = min(T_plus_1 - 1, self.T_rollout)
 
-        # Start with first frame
-        current_features = features[:, 0:1, :, :].reshape(B, N, D)
+        # Normalize ground-truth features if enabled
+        h = features
+        if self.normalize_reps:
+            h = F.layer_norm(features.reshape(B, -1, D), (D,)).reshape(B, T_plus_1, N, D)
 
-        for t in range(T):
-            # Get action/state for this step
-            action_t = actions[:, t : t + 1, :]
-            state_t = states[:, t : t + 1, :]
-            extrinsics_t = extrinsics[:, t : t + 1, :] if extrinsics is not None else None
+        # Step 1: Get first teacher-forcing prediction to seed the rollout
+        # Context: frame 0, predict frame 1
+        z_0 = h[:, 0:1, :, :].reshape(B, N, D)  # [B, N, D]
+        first_action = actions[:, 0:1, :]
+        first_state = states[:, 0:1, :]
+        first_extrinsic = extrinsics[:, 0:1, :] if extrinsics is not None else None
 
-            # Predict next frame
-            pred = self.model(current_features, action_t, state_t, extrinsics_t)
+        z_tf_first = self._step_predictor(z_0, first_action, first_state, first_extrinsic)
+        # z_tf_first: [B, N, D] - prediction of frame 1
 
-            # Use prediction as next input (autoregressive rollout)
-            current_features = pred
+        # Step 2: Seed autoregressive rollout with z_0 (ground-truth) + z_tf_first
+        # z now represents frames 0 and 1 (predicted)
+        z_ar = torch.cat([z_0, z_tf_first], dim=1)  # [B, 2*N, D]
 
-        # Compare final prediction with target
-        target = features[:, T, :, :].reshape(B, N, D)
+        # Step 3: Autoregressive rollout for remaining steps
+        for n in range(1, T):
+            # Cumulative actions/states up to step n+1
+            ar_actions = actions[:, : n + 1, :]
+            ar_states = states[:, : n + 1, :]
+            ar_extrinsics = extrinsics[:, : n + 1, :] if extrinsics is not None else None
 
-        return F.l1_loss(current_features, target)
+            # Predict next frame using full context
+            z_nxt = self._step_predictor(z_ar, ar_actions, ar_states, ar_extrinsics)
+            # Extract only the last frame prediction
+            z_nxt = z_nxt[:, -N:, :]  # [B, N, D]
+
+            # Append to autoregressive context
+            z_ar = torch.cat([z_ar, z_nxt], dim=1)  # [B, (n+2)*N, D]
+
+        # Step 4: Compare all autoregressive predictions (frames 1 to T) with targets
+        # z_ar[:, N:] contains predictions for frames 1, 2, ..., T
+        # Target: h[:, 1:T+1] contains ground-truth frames 1, 2, ..., T
+        z_ar_pred = z_ar[:, N:]  # [B, T*N, D]
+        target = h[:, 1 : T + 1, :, :].reshape(B, T * N, D)  # [B, T*N, D]
+
+        return self._compute_loss(z_ar_pred, target)
 
     def _shared_step(self, batch: dict[str, Tensor], stage: str) -> Tensor:
         """Shared step for training and validation.

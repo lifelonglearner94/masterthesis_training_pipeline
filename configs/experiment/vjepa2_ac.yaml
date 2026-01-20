@@ -46,7 +46,7 @@ data:
 
 model:
   # --- Memory settings ---
-  T_teacher: 5                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
+  T_teacher: 7                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
   T_rollout: 2
   use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
 
@@ -66,6 +66,28 @@ model:
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
 
+  # --- Curriculum Learning Schedule ---
+  # Dynamically adjusts T_rollout and loss_weight_teacher during training.
+  # Each phase activates at the specified epoch and remains active until the next phase.
+  # Parameters not specified in a phase retain their previous values.
+  #
+  # Recommended progression (from meine_eigene_Loss_Logik.md):
+  #   Phase 1: Stabilization - high teacher weight, low rollout
+  #   Phase 2: Transition - increase rollout, reduce teacher
+  #   Phase 3: Rollout-dominant - model learns long-horizon dynamics
+  #
+  # Set to null to disable curriculum learning and use fixed values above.
+  curriculum_schedule:
+    - epoch: 0
+      T_rollout: 2
+      loss_weight_teacher: 1.0
+    - epoch: 5
+      T_rollout: 4
+      loss_weight_teacher: 0.7
+    - epoch: 7
+      T_rollout: 6
+      loss_weight_teacher: 0.3
+
   # --- Optimizer (V-JEPA2 paper settings) ---
   learning_rate: 4.25e-4           # Peak LR
   weight_decay: 0.04
@@ -73,9 +95,9 @@ model:
 
   # --- LR schedule (iteration-based, V-JEPA2 paper) ---
   use_iteration_scheduler: true
-  warmup_iters: 450
-  constant_iters: 8550
-  decay_iters: 450
+  warmup_iters: 280
+  constant_iters: 2240
+  decay_iters: 280
   warmup_start_lr: 7.5e-5
 
 # =============================================================================
