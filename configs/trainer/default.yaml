@@ -9,7 +9,7 @@ max_epochs: 10
 # Hardware settings
 accelerator: auto
 devices: auto
-precision: 16
+precision: 32
 
 # Determinism
 deterministic: ${deterministic}
