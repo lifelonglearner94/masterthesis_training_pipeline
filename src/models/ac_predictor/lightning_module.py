@@ -181,13 +181,17 @@ class ACPredictorModule(pl.LightningModule):
         Raises:
             ValueError: If schedule is invalid
         """
-        if not isinstance(schedule, list) or len(schedule) == 0:
+        # Support both Python lists and OmegaConf ListConfig
+        from collections.abc import Sequence
+        if not isinstance(schedule, Sequence) or isinstance(schedule, str) or len(schedule) == 0:
             raise ValueError("curriculum_schedule must be a non-empty list")
 
         max_prediction_steps = self.num_timesteps - 1
 
+        # Support both Python dicts and OmegaConf DictConfig
+        from collections.abc import Mapping
         for i, phase in enumerate(schedule):
-            if not isinstance(phase, dict):
+            if not isinstance(phase, Mapping):
                 raise ValueError(f"Phase {i} must be a dict, got {type(phase)}")
             if "epoch" not in phase:
                 raise ValueError(f"Phase {i} must have 'epoch' key")
