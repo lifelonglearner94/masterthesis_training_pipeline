@@ -36,5 +36,5 @@ hydra:
     # Search space definition
     params:
       data.batch_size: choice(16, 32, 64, 128)
-      trainer.learning_rate: interval(1e-5, 1e-3)
+      model.learning_rate: interval(1e-5, 1e-3)
       # Add more hyperparameters as needed

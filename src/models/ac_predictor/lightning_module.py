@@ -24,7 +24,7 @@ Key features matching original paper:
 
 from typing import Any
 
-import pytorch_lightning as pl
+import lightning as L
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -32,7 +32,7 @@ from torch import Tensor
 from src.models.ac_predictor.ac_predictor import vit_ac_predictor
 
 
-class ACPredictorModule(pl.LightningModule):
+class ACPredictorModule(L.LightningModule):
     """PyTorch Lightning module for Action-Conditioned Vision Transformer Predictor.
 
     This module wraps the VisionTransformerPredictorAC and implements:
@@ -146,6 +146,13 @@ class ACPredictorModule(pl.LightningModule):
         self.loss_weight_teacher = loss_weight_teacher
         self.loss_weight_rollout = loss_weight_rollout
         self.normalize_reps = normalize_reps
+
+        # Validate loss_exp to prevent division by zero
+        if loss_exp <= 0:
+            raise ValueError(
+                f"loss_exp must be positive (got {loss_exp}). "
+                "Use loss_exp=1.0 for L1 loss, loss_exp=2.0 for L2 loss."
+            )
         self.loss_exp = loss_exp
 
         # Optimizer hyperparameters
@@ -321,7 +328,7 @@ class ACPredictorModule(pl.LightningModule):
         """
         z_pred = self.model(z, actions, states, extrinsics)
         if self.normalize_reps:
-            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),))
+            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=1e-6)
         return z_pred
 
     def _compute_loss(
@@ -379,7 +386,7 @@ class ACPredictorModule(pl.LightningModule):
 
         # Apply layer norm to input if enabled (matching paper)
         if self.normalize_reps:
-            context_features = F.layer_norm(context_features, (context_features.size(-1),))
+            context_features = F.layer_norm(context_features, (context_features.size(-1),), eps=1e-6)
 
         # Actions/states for T steps
         context_actions = actions[:, :T, :]
@@ -395,7 +402,7 @@ class ACPredictorModule(pl.LightningModule):
         # Shape: [B, T*N, D]
         target = features[:, 1 : T + 1, :, :].reshape(B, T * N, D)
         if self.normalize_reps:
-            target = F.layer_norm(target, (target.size(-1),))
+            target = F.layer_norm(target, (target.size(-1),), eps=1e-6)
 
         return self._compute_loss(z_tf, target)
 
@@ -432,7 +439,7 @@ class ACPredictorModule(pl.LightningModule):
         # Normalize ground-truth features if enabled
         h = features
         if self.normalize_reps:
-            h = F.layer_norm(features.reshape(B, -1, D), (D,)).reshape(B, T_plus_1, N, D)
+            h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(B, T_plus_1, N, D)
 
         # Step 1: Initialize with C ground-truth context frames
         # z_ar contains frames 0, 1, ..., C-1

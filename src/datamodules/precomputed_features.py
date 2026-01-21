@@ -37,8 +37,8 @@ Directory structure:
 from pathlib import Path
 from typing import Any
 
+import lightning as L
 import numpy as np
-import pytorch_lightning as pl
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
@@ -204,7 +204,7 @@ class PrecomputedFeaturesDataset(Dataset):
         if self.use_extrinsics:
             extrinsics_path = episode_dir / "actions_states" / "extrinsics.npy"
             if extrinsics_path.exists():
-                extrinsics = np.load(extrinsics_path)[:T]
+                extrinsics = np.load(extrinsics_path)[:T_actions]
                 result["extrinsics"] = torch.from_numpy(extrinsics).float()
 
         return result
@@ -259,7 +259,7 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     return result
 
 
-class PrecomputedFeaturesDataModule(pl.LightningDataModule):
+class PrecomputedFeaturesDataModule(L.LightningDataModule):
     """Lightning DataModule for pre-computed V-JEPA2 encoder features."""
 
     def __init__(

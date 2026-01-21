@@ -2,10 +2,10 @@
 
 from typing import Any, Dict, Optional
 
-import pytorch_lightning as pl
+import lightning as L
 import torch
-from pytorch_lightning import Callback, LightningModule, Trainer
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from lightning import Callback, LightningModule, Trainer
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 
 try:
     import wandb
