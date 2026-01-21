@@ -729,10 +729,10 @@ dependencies = [
     { name = "hydra-colorlog" },
     { name = "hydra-core" },
     { name = "hydra-optuna-sweeper" },
+    { name = "lightning" },
     { name = "numpy" },
     { name = "pyrootutils" },
     { name = "python-dotenv" },
-    { name = "pytorch-lightning" },
     { name = "rich" },
     { name = "timm" },
     { name = "torch" },
@@ -751,12 +751,12 @@ requires-dist = [
     { name = "hydra-colorlog", specifier = ">=1.2.0" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "hydra-optuna-sweeper", specifier = ">=1.2.0" },
+    { name = "lightning", specifier = ">=2.2.0" },
     { name = "numpy", specifier = "<2.0.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
     { name = "pyrootutils", specifier = ">=1.0.4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "pytorch-lightning", specifier = ">=2.2.0" },
     { name = "rich", specifier = ">=13.7.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
     { name = "timm", specifier = ">=0.9.0" },
@@ -891,6 +891,26 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
+]
+
+[[package]]
+name = "lightning"
+version = "2.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fsspec", extra = ["http"] },
+    { name = "lightning-utilities" },
+    { name = "packaging" },
+    { name = "pytorch-lightning" },
+    { name = "pyyaml" },
+    { name = "torch" },
+    { name = "torchmetrics" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/d5/892ea38816925b3511493e87b0b32494122bf8a20e66f4f2cd2667f95625/lightning-2.6.0.tar.gz", hash = "sha256:881841716b59c1837ae0c562c2e64fea9bcf49ef9de3867bd1f868557ec23d04", size = 656539, upload-time = "2025-11-28T09:34:25.069Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/e9/36b340c7ec01dad6f034481e98fc9fc0133307beb05c714c0542af98bbde/lightning-2.6.0-py3-none-any.whl", hash = "sha256:f1a13a48909960a3454518486f113fae4fadb2db0e28e9c50d8d38d46c9dc3d6", size = 845956, upload-time = "2025-11-28T09:34:23.273Z" },
 ]
 
 [[package]]

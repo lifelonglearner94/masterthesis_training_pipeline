@@ -295,6 +295,7 @@ class TestPrecomputedFeaturesDataModule:
             patches_per_frame=256,
             batch_size=2,
             val_split=0.2,
+            clip_end=10,  # Required when using val_split
         )
 
         datamodule.setup(stage="fit")

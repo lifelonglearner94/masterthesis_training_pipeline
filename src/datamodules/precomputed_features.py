@@ -276,6 +276,7 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool | None = None,
+        persistent_workers: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the DataModule.
@@ -298,6 +299,8 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
             num_workers: Number of worker processes for data loading
             pin_memory: Whether to pin memory for faster GPU transfer.
                        If None, auto-detects based on CUDA availability.
+            persistent_workers: Whether to keep worker processes alive between epochs.
+                       Speeds up dataloader initialization. Requires num_workers > 0.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -315,6 +318,8 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         # Auto-detect pin_memory if not specified (only beneficial for CUDA)
         self.pin_memory = pin_memory if pin_memory is not None else should_pin_memory()
+        # persistent_workers requires num_workers > 0
+        self.persistent_workers = persistent_workers and num_workers > 0
 
         self.train_dataset: PrecomputedFeaturesDataset | None = None
         self.val_dataset: PrecomputedFeaturesDataset | None = None
@@ -403,6 +408,7 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
             collate_fn=collate_fn,
         )
 
@@ -420,6 +426,7 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
             collate_fn=collate_fn,
         )
 
@@ -433,5 +440,6 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
             collate_fn=collate_fn,
         )

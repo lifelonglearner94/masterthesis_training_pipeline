@@ -16,6 +16,12 @@ Gold standard research repository comparing HOPE and Vision Transformers (ViT).
 make install
 # or directly with uv
 uv sync
+
+### Testing
+
+uv sync --extra dev
+
+uv run pytest tests/
 ```
 
 ### Training

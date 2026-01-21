@@ -218,9 +218,9 @@ class TestNumericalStability:
 
         assert not torch.isnan(result).any(), "Result should not contain NaN"
         assert not torch.isinf(result).any(), "Result should not contain Inf"
-        # Check values are within truncation bounds
-        assert result.min() >= -2.0 * 0.02 - 1e-6
-        assert result.max() <= 2.0 * 0.02 + 1e-6
+        # Check values are within truncation bounds (default a=-2.0, b=2.0 absolute)
+        assert result.min() >= -2.0 - 1e-6
+        assert result.max() <= 2.0 + 1e-6
 
     def test_layer_norm_with_small_variance(self):
         """Test that layer_norm with explicit epsilon handles small variance."""
