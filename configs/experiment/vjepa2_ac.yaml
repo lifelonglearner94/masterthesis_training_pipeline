@@ -47,7 +47,8 @@ data:
 model:
   # --- Memory settings ---
   T_teacher: 7                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
-  T_rollout: 2
+  T_rollout: 5                     # Fixed: predict 5 timesteps autoregressively
+  context_frames: 3                # Fixed: use 3 ground-truth context frames
   use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
 
   # --- Model architecture (keep defaults from ac_predictor.yaml) ---
@@ -67,25 +68,23 @@ model:
   loss_weight_rollout: 1.0
 
   # --- Curriculum Learning Schedule ---
-  # Dynamically adjusts T_rollout and loss_weight_teacher during training.
+  # Dynamically adjusts loss_weight_teacher during training.
+  # T_rollout and context_frames are now FIXED (3 context → 5 predictions).
   # Each phase activates at the specified epoch and remains active until the next phase.
   # Parameters not specified in a phase retain their previous values.
   #
   # Recommended progression (from meine_eigene_Loss_Logik.md):
-  #   Phase 1: Stabilization - high teacher weight, low rollout
-  #   Phase 2: Transition - increase rollout, reduce teacher
+  #   Phase 1: Stabilization - high teacher weight
+  #   Phase 2: Transition - reduce teacher weight
   #   Phase 3: Rollout-dominant - model learns long-horizon dynamics
   #
   # Set to null to disable curriculum learning and use fixed values above.
   curriculum_schedule:
     - epoch: 0
-      T_rollout: 2
       loss_weight_teacher: 1.0
     - epoch: 5
-      T_rollout: 4
       loss_weight_teacher: 0.7
     - epoch: 7
-      T_rollout: 6
       loss_weight_teacher: 0.3
 
   # --- Optimizer (V-JEPA2 paper settings) ---

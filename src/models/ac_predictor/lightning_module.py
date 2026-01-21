@@ -75,6 +75,7 @@ class ACPredictorModule(pl.LightningModule):
         # Loss settings
         T_teacher: int = 7,
         T_rollout: int = 2,
+        context_frames: int = 1,  # Number of ground-truth context frames for rollout
         loss_weight_teacher: float = 1.0,
         loss_weight_rollout: float = 1.0,
         normalize_reps: bool = True,
@@ -124,6 +125,7 @@ class ACPredictorModule(pl.LightningModule):
         # Loss hyperparameters
         self.T_teacher = T_teacher
         self.T_rollout = T_rollout
+        self.context_frames = context_frames
 
         # Validate T_teacher and T_rollout against available timesteps
         max_prediction_steps = num_timesteps - 1  # Need at least 1 context + 1 target
@@ -404,18 +406,15 @@ class ACPredictorModule(pl.LightningModule):
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> Tensor:
-        """Compute rollout loss (matching V-JEPA2 paper).
+        """Compute rollout loss with fixed context frames.
 
-        Autoregressive rollout seeded with ground-truth frame 0 and first teacher-forcing
-        prediction. Uses cumulative action/state context at each step.
+        Autoregressive rollout seeded with `context_frames` ground-truth frames,
+        then predicts `T_rollout` steps autoregressively.
 
-        Paper implementation:
-            # Seed with z_0 (ground-truth) + z_tf[:, :tokens_per_frame] (first TF prediction)
-            z = cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
-            for n in range(1, auto_steps):
-                z_nxt = predictor(z, actions[:, :n+1], states[:, :n+1], ...)[:, -tokens_per_frame:]
-                z = cat([z, z_nxt], dim=1)
-            loss = mean(|z[:, tokens_per_frame:] - h[:, tokens_per_frame:T+1]|^loss_exp) / loss_exp
+        Example with context_frames=3, T_rollout=5:
+            - Context: z_0, z_1, z_2 (ground-truth)
+            - Predict: z_3, z_4, z_5, z_6, z_7 (autoregressive)
+            - Loss computed on predictions vs ground-truth frames 3-7
 
         Args:
             features: [B, T+1, N, D] - Features for T+1 frames
@@ -427,33 +426,27 @@ class ACPredictorModule(pl.LightningModule):
             Scalar loss tensor
         """
         B, T_plus_1, N, D = features.shape
-        T = min(T_plus_1 - 1, self.T_rollout)
+        C = self.context_frames  # Number of ground-truth context frames
+        T_pred = min(T_plus_1 - C, self.T_rollout)  # Number of steps to predict
 
         # Normalize ground-truth features if enabled
         h = features
         if self.normalize_reps:
             h = F.layer_norm(features.reshape(B, -1, D), (D,)).reshape(B, T_plus_1, N, D)
 
-        # Step 1: Get first teacher-forcing prediction to seed the rollout
-        # Context: frame 0, predict frame 1
-        z_0 = h[:, 0:1, :, :].reshape(B, N, D)  # [B, N, D]
-        first_action = actions[:, 0:1, :]
-        first_state = states[:, 0:1, :]
-        first_extrinsic = extrinsics[:, 0:1, :] if extrinsics is not None else None
+        # Step 1: Initialize with C ground-truth context frames
+        # z_ar contains frames 0, 1, ..., C-1
+        z_ar = h[:, :C, :, :].reshape(B, C * N, D)  # [B, C*N, D]
 
-        z_tf_first = self._step_predictor(z_0, first_action, first_state, first_extrinsic)
-        # z_tf_first: [B, N, D] - prediction of frame 1
-
-        # Step 2: Seed autoregressive rollout with z_0 (ground-truth) + z_tf_first
-        # z now represents frames 0 and 1 (predicted)
-        z_ar = torch.cat([z_0, z_tf_first], dim=1)  # [B, 2*N, D]
-
-        # Step 3: Autoregressive rollout for remaining steps
-        for n in range(1, T):
-            # Cumulative actions/states up to step n+1
-            ar_actions = actions[:, : n + 1, :]
-            ar_states = states[:, : n + 1, :]
-            ar_extrinsics = extrinsics[:, : n + 1, :] if extrinsics is not None else None
+        # Step 2: Autoregressive rollout for T_pred steps
+        # First prediction is frame C, using actions/states 0 to C-1
+        for step in range(T_pred):
+            # Current prediction target is frame (C + step)
+            # Use actions/states from 0 to (C + step - 1)
+            num_action_steps = C + step
+            ar_actions = actions[:, :num_action_steps, :]
+            ar_states = states[:, :num_action_steps, :]
+            ar_extrinsics = extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
 
             # Predict next frame using full context
             z_nxt = self._step_predictor(z_ar, ar_actions, ar_states, ar_extrinsics)
@@ -461,13 +454,13 @@ class ACPredictorModule(pl.LightningModule):
             z_nxt = z_nxt[:, -N:, :]  # [B, N, D]
 
             # Append to autoregressive context
-            z_ar = torch.cat([z_ar, z_nxt], dim=1)  # [B, (n+2)*N, D]
+            z_ar = torch.cat([z_ar, z_nxt], dim=1)  # [B, (C+step+1)*N, D]
 
-        # Step 4: Compare all autoregressive predictions (frames 1 to T) with targets
-        # z_ar[:, N:] contains predictions for frames 1, 2, ..., T
-        # Target: h[:, 1:T+1] contains ground-truth frames 1, 2, ..., T
-        z_ar_pred = z_ar[:, N:]  # [B, T*N, D]
-        target = h[:, 1 : T + 1, :, :].reshape(B, T * N, D)  # [B, T*N, D]
+        # Step 3: Compare autoregressive predictions with targets
+        # z_ar[:, C*N:] contains predictions for frames C, C+1, ..., C+T_pred-1
+        # Target: h[:, C:C+T_pred] contains ground-truth for same frames
+        z_ar_pred = z_ar[:, C * N:]  # [B, T_pred*N, D]
+        target = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)  # [B, T_pred*N, D]
 
         return self._compute_loss(z_ar_pred, target)
 
