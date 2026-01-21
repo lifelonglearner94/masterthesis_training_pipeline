@@ -35,3 +35,4 @@ use_extrinsics: false
 batch_size: 32
 num_workers: 4
 pin_memory: true
+persistent_workers: false  # Keep workers alive between epochs (disable on MPS to save memory)
