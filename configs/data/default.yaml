@@ -1,7 +1,7 @@
 # Default data configuration
 # Override this for your specific dataset
 
-_target_: pytorch_lightning.LightningDataModule
+_target_: lightning.pytorch.LightningDataModule
 
 # Data paths
 data_dir: ${paths.data_dir}

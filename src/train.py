@@ -9,9 +9,9 @@ load_dotenv()
 
 import hydra
 from omegaconf import DictConfig
-import pytorch_lightning as pl
-from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
-from pytorch_lightning.loggers import Logger
+import lightning as L
+from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.loggers import Logger
 from typing import List, Optional
 
 from src.utils import instantiators
@@ -25,7 +25,7 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     # 1. Gold Standard: Determinism
     if cfg.get("seed"):
-        pl.seed_everything(cfg.seed, workers=True)
+        L.seed_everything(cfg.seed, workers=True)
 
     # 2. Instantiate DataModule
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)

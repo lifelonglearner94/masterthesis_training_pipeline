@@ -5,7 +5,7 @@
 # - Final epoch is always saved via save_last
 # See docs/ac_predictor_training_faq.md for rationale
 model_checkpoint:
-  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
   filename: "checkpoint_e{epoch:04d}"
   monitor: null  # No metric-based selection

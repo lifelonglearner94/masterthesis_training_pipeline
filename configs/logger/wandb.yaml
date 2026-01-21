@@ -1,6 +1,6 @@
 # Weights & Biases logger configuration
 wandb:
-  _target_: pytorch_lightning.loggers.WandbLogger
+  _target_: lightning.pytorch.loggers.WandbLogger
 
   # Project name in W&B (from WANDB_PROJECT env var)
   project: ${oc.env:WANDB_PROJECT,hope-vs-vit-research}

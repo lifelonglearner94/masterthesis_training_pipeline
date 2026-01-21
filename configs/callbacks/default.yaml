@@ -3,7 +3,7 @@ defaults:
   - model_checkpoint
 
 rich_progress:
-  _target_: pytorch_lightning.callbacks.RichProgressBar
+  _target_: lightning.pytorch.callbacks.RichProgressBar
 
 # Early stopping is disabled - training runs for full max_epochs
 # Evaluation is done post-training via linear probing on saved checkpoints
