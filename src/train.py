@@ -7,6 +7,7 @@ root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=Tr
 from dotenv import load_dotenv
 load_dotenv()
 
+import logging
 import hydra
 from omegaconf import DictConfig
 import lightning as L
@@ -18,8 +19,41 @@ from src.utils import instantiators
 from src.utils.logging_utils import log_hyperparameters
 from src.utils.device_utils import log_device_info
 
+
+def setup_verbose_logging(cfg: DictConfig) -> None:
+    """Configure logging level based on config."""
+    # Check if verbose logging is enabled
+    verbose = False
+    if cfg.get("callbacks"):
+        callbacks_cfg = cfg.callbacks
+        if hasattr(callbacks_cfg, "verbose_logging") or "verbose_logging" in callbacks_cfg:
+            verbose = True
+
+    if verbose:
+        # Set root logger to DEBUG for maximum verbosity
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        # Also set specific loggers
+        logging.getLogger("src").setLevel(logging.DEBUG)
+        logging.getLogger("src.models").setLevel(logging.DEBUG)
+        logging.getLogger("src.callbacks").setLevel(logging.DEBUG)
+        logging.getLogger(__name__).info("VERBOSE LOGGING ENABLED - All DEBUG messages will be shown")
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s | %(levelname)s | %(message)s',
+            datefmt='%H:%M:%S'
+        )
+
+
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config.yaml")
 def main(cfg: DictConfig) -> Optional[float]:
+    # Setup logging first
+    setup_verbose_logging(cfg)
+
     # 0. Log hardware info at startup
     log_device_info()
 

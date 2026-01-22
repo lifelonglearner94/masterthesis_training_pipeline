@@ -135,7 +135,7 @@ class PrecomputedFeaturesDataset(Dataset):
     def __len__(self) -> int:
         return len(self.episode_dirs)
 
-    def __getitem__(self, idx: int) -> dict[str, Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, Tensor | str]:
         """Load a single clip.
 
         Handles temporal alignment for V-JEPA2 tublet encoding:
@@ -150,6 +150,7 @@ class PrecomputedFeaturesDataset(Dataset):
                 - actions: [T-1, action_dim] tensor (resampled)
                 - states: [T-1, action_dim] tensor (zeros)
                 - extrinsics (optional): [T-1, action_dim-1] tensor
+                - clip_name: str (name of the clip directory)
         """
         episode_dir = self.episode_dirs[idx]
 
@@ -198,6 +199,7 @@ class PrecomputedFeaturesDataset(Dataset):
             "features": torch.from_numpy(features).float(),
             "actions": torch.from_numpy(actions).float(),
             "states": torch.from_numpy(states).float(),
+            "clip_name": episode_dir.name,
         }
 
         # Optionally load extrinsics
@@ -255,6 +257,8 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     }
     if has_extrinsics:
         result["extrinsics"] = extrinsics
+
+    result["clip_names"] = [item["clip_name"] for item in batch]
 
     return result
 

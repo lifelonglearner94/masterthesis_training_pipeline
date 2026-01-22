@@ -148,10 +148,19 @@ class VisionTransformerPredictorAC(nn.Module):
         Returns:
             Predicted features [B, T*N, D]
         """
+        import logging
+        log = logging.getLogger(__name__)
+
+        log.debug(f"    [AC_PREDICTOR] Input x: {x.shape}")
+        log.debug(f"    [AC_PREDICTOR] Actions: {actions.shape}, States: {states.shape}")
+
         # Map tokens to predictor dimensions
         x = self.predictor_embed(x)
+        log.debug(f"    [AC_PREDICTOR] After predictor_embed: {x.shape}, min={x.min().item():.4f}, max={x.max().item():.4f}")
+
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
+        log.debug(f"    [AC_PREDICTOR] B={B}, N_ctxt={N_ctxt}, D={D}, T={T}")
 
         # Validate input temporal dimension
         expected_patches = self.grid_height * self.grid_width
@@ -170,18 +179,24 @@ class VisionTransformerPredictorAC(nn.Module):
         # Interleave action tokens
         s = self.state_encoder(states).unsqueeze(2)
         a = self.action_encoder(actions).unsqueeze(2)
+        log.debug(f"    [AC_PREDICTOR] State embedding: {s.shape}, Action embedding: {a.shape}")
+
         x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
         if self.use_extrinsics:
             e = self.extrinsics_encoder(extrinsics).unsqueeze(2)
             x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(H*W+3), D]
         else:
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
+        log.debug(f"    [AC_PREDICTOR] After interleaving action tokens: {x.shape}")
 
         cond_tokens = 3 if self.use_extrinsics else 2
         attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        log.debug(f"    [AC_PREDICTOR] Attention mask shape: {attn_mask.shape}")
 
-        # Fwd prop
+        # Fwd prop through transformer blocks
+        log.debug(f"    [AC_PREDICTOR] >>> Processing {len(self.predictor_blocks)} transformer blocks >>>")
         for i, blk in enumerate(self.predictor_blocks):
+            log.debug(f"    [AC_PREDICTOR] Block {i}/{len(self.predictor_blocks)-1}: input shape={x.shape}")
             if self.use_activation_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     blk,
@@ -204,13 +219,19 @@ class VisionTransformerPredictorAC(nn.Module):
                     W=self.grid_width,
                     action_tokens=cond_tokens,
                 )
+            log.debug(f"    [AC_PREDICTOR] Block {i} output: shape={x.shape}, min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.mean().item():.4f}")
+
+        log.debug(f"    [AC_PREDICTOR] <<< Finished transformer blocks <<<")
 
         # Split out action and frame tokens
         x = x.view(B, T, cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
         x = x[:, :, cond_tokens:, :].flatten(1, 2)
+        log.debug(f"    [AC_PREDICTOR] After removing action tokens: {x.shape}")
 
         x = self.predictor_norm(x)
+        log.debug(f"    [AC_PREDICTOR] After predictor_norm: min={x.min().item():.4f}, max={x.max().item():.4f}")
         x = self.predictor_proj(x)
+        log.debug(f"    [AC_PREDICTOR] After predictor_proj (output): {x.shape}, min={x.min().item():.4f}, max={x.max().item():.4f}")
 
         return x
 

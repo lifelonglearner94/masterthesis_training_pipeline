@@ -245,19 +245,33 @@ class ACRoPEAttention(nn.Module):
             k = merge_(k, action_k)
             v = merge_(v, action_v)
 
+        import logging
+        log = logging.getLogger(__name__)
+
         if attn_mask is not None or self.use_sdpa:
+            log.debug(f"      [ACRoPEAttn] scaled_dot_product_attention: Q={q.shape}, K={k.shape}, V={v.shape}")
+            log.debug(f"      [ACRoPEAttn] Q stats: min={q.min().item():.4f}, max={q.max().item():.4f}, mean={q.mean().item():.4f}")
+            log.debug(f"      [ACRoPEAttn] K stats: min={k.min().item():.4f}, max={k.max().item():.4f}, mean={k.mean().item():.4f}")
+            log.debug(f"      [ACRoPEAttn] V stats: min={v.min().item():.4f}, max={v.max().item():.4f}, mean={v.mean().item():.4f}")
             x = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
             )
+            log.debug(f"      [ACRoPEAttn] Output: shape={x.shape}, min={x.min().item():.4f}, max={x.max().item():.4f}")
             attn = None
         else:
+            log.debug(f"      [ACRoPEAttn] Manual attention: Q@K.T matmul: [{q.shape}] @ [{k.shape}]")
             attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, D, D]
+            log.debug(f"      [ACRoPEAttn] Attention scores: shape={attn.shape}, min={attn.min().item():.4f}, max={attn.max().item():.4f}")
             attn = attn.softmax(dim=-1)
+            log.debug(f"      [ACRoPEAttn] After softmax: min={attn.min().item():.4f}, max={attn.max().item():.4f}")
             attn = self.attn_drop(attn)
+            log.debug(f"      [ACRoPEAttn] Attn@V matmul: [{attn.shape}] @ [{v.shape}]")
             x = attn @ v
+            log.debug(f"      [ACRoPEAttn] Output: shape={x.shape}")
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
+        log.debug(f"      [ACRoPEAttn] After projection: shape={x.shape}, min={x.min().item():.4f}, max={x.max().item():.4f}")
         x = self.proj_drop(x)
         return x
 

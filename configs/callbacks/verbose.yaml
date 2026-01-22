@@ -1,0 +1,4 @@
+verbose_logging:
+  _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
+  log_memory: True
+  log_data: True
