@@ -107,11 +107,25 @@ class VerboseLoggingCallback(Callback):
         self.backward_hooks = []
         self.epoch_start_time = time.time()
 
+    def _is_any_logging_enabled(self) -> bool:
+        """Check if any logging option is enabled."""
+        return any([
+            self.log_memory,
+            self.log_data,
+            self.log_forward_pass,
+            self.log_backward_pass,
+            self.log_gradients,
+            self.log_weights,
+        ])
+
     def _should_log_batch(self, batch_idx: int) -> bool:
-        return batch_idx % self.log_every_n_batches == 0
+        return self._is_any_logging_enabled() and batch_idx % self.log_every_n_batches == 0
 
     def _register_hooks(self, model: nn.Module) -> None:
         """Register forward and backward hooks on model layers."""
+        if not self.log_forward_pass and not self.log_backward_pass:
+            return
+
         layer_count = 0
 
         for name, module in model.named_modules():
@@ -130,7 +144,8 @@ class VerboseLoggingCallback(Callback):
 
                 layer_count += 1
 
-        log.info(f"Registered hooks on {layer_count} layers")
+        if layer_count > 0:
+            log.info(f"Registered hooks on {layer_count} layers")
 
     def _remove_hooks(self) -> None:
         """Remove all registered hooks."""
@@ -143,6 +158,9 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_train_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if not self._is_any_logging_enabled():
+            return
+
         log.info("=" * 100)
         log.info("TRAINING STARTED - ULTRA VERBOSE MODE")
         log.info("=" * 100)
@@ -186,22 +204,27 @@ class VerboseLoggingCallback(Callback):
     @rank_zero_only
     def on_train_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         self._remove_hooks()
+        if not self._is_any_logging_enabled():
+            return
+
         log.info("=" * 100)
         log.info("TRAINING ENDED")
         log.info("=" * 100)
 
     @rank_zero_only
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
-        log.info(f"\n{'='*50} EPOCH {trainer.current_epoch} {'='*50}")
         self.epoch_start_time = time.time()
-        self._log_memory_usage("Epoch Start")
+        if not self._is_any_logging_enabled():
+            return
+
+        log.info(f"\n{'='*50} EPOCH {trainer.current_epoch} {'='*50}")
+        if self.log_memory:
+            self._log_memory_usage("Epoch Start")
 
     @rank_zero_only
     def on_train_batch_start(self, trainer: L.Trainer, pl_module: L.LightningModule, batch: Any, batch_idx: int) -> None:
         if not self._should_log_batch(batch_idx):
             return
-
-        log.info(f"\n{'-'*40} BATCH {batch_idx} START {'-'*40}")
 
         if self.log_data and isinstance(batch, dict):
             log.info("--- INPUT DATA ---")
@@ -222,11 +245,12 @@ class VerboseLoggingCallback(Callback):
         if not self._should_log_batch(batch_idx):
             return
 
-        log.info(f"\n--- LOSS COMPUTATION (Batch {batch_idx}) ---")
-        log.info(f"  Loss value: {loss.item():.8f}")
-        log.info(f"  Loss tensor: {TensorStats.stats(loss, 'loss')}")
-        log.info(f"  Loss requires_grad: {loss.requires_grad}")
-        log.info(f"  Loss grad_fn: {loss.grad_fn}")
+        if self.log_gradients or self.log_backward_pass:
+            log.info(f"\n--- LOSS COMPUTATION (Batch {batch_idx}) ---")
+            log.info(f"  Loss value: {loss.item():.8f}")
+            log.info(f"  Loss tensor: {TensorStats.stats(loss, 'loss')}")
+            log.info(f"  Loss requires_grad: {loss.requires_grad}")
+            log.info(f"  Loss grad_fn: {loss.grad_fn}")
 
         if self.log_memory:
             self._log_memory_usage("Before Backward")
@@ -236,8 +260,6 @@ class VerboseLoggingCallback(Callback):
         batch_idx = trainer.global_step
         if not self._should_log_batch(batch_idx):
             return
-
-        log.info(f"\n--- AFTER BACKWARD (Batch {batch_idx}) ---")
 
         if self.log_gradients:
             log.info("--- GRADIENT STATISTICS ---")
@@ -266,10 +288,9 @@ class VerboseLoggingCallback(Callback):
         if not self._should_log_batch(batch_idx):
             return
 
-        log.info(f"\n--- BEFORE OPTIMIZER STEP (Batch {batch_idx}) ---")
-        log.info(f"  Learning rate: {optimizer.param_groups[0]['lr']:.8e}")
-
         if self.log_weights:
+            log.info(f"\n--- BEFORE OPTIMIZER STEP (Batch {batch_idx}) ---")
+            log.info(f"  Learning rate: {optimizer.param_groups[0]['lr']:.8e}")
             log.info("--- WEIGHT STATISTICS (before update) ---")
             param_count = 0
             for name, param in pl_module.named_parameters():
@@ -282,16 +303,6 @@ class VerboseLoggingCallback(Callback):
     def on_train_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:
         if not self._should_log_batch(batch_idx):
             return
-
-        log.info(f"\n--- BATCH {batch_idx} END ---")
-
-        # Log final loss
-        if isinstance(outputs, dict):
-            for key, value in outputs.items():
-                if isinstance(value, torch.Tensor) and value.numel() == 1:
-                    log.info(f"  Output {key}: {value.item():.8f}")
-        elif isinstance(outputs, torch.Tensor):
-            log.info(f"  Loss: {outputs.item():.8f}")
 
         if self.log_weights:
             log.info("--- WEIGHT STATISTICS (after update) ---")
@@ -307,10 +318,15 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if not self._is_any_logging_enabled():
+            return
+
         epoch_time = time.time() - self.epoch_start_time
         log.info(f"\n{'='*50} EPOCH {trainer.current_epoch} END {'='*50}")
         log.info(f"Epoch duration: {epoch_time:.2f} seconds")
-        self._log_memory_usage("Epoch End")
+
+        if self.log_memory:
+            self._log_memory_usage("Epoch End")
 
         # Log final weight statistics
         if self.log_weights:
