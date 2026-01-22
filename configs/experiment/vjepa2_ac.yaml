@@ -24,12 +24,12 @@ defaults:
 callbacks:
   verbose_logging:
     _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
-    log_memory: True
-    log_data: True
-    log_forward_pass: True
-    log_backward_pass: True
-    log_gradients: True
-    log_weights: True
+    log_memory: False
+    log_data: False
+    log_forward_pass: False
+    log_backward_pass: False
+    log_gradients: False
+    log_weights: False
     log_every_n_batches: 16  # Log every single batch
     max_layers_to_log: 30   # Log up to 30 layers with hooks
 
@@ -105,10 +105,11 @@ model:
   betas: [0.9, 0.999]
 
   # --- LR schedule (iteration-based, V-JEPA2 paper) ---
+  # Percentages of total training iterations (must sum to 1.0)
   use_iteration_scheduler: true
-  warmup_iters: 400
-  constant_iters: 3895
-  decay_iters: 400
+  warmup_pct: 0.085       # ~8.5% warmup
+  constant_pct: 0.83      # ~83% constant LR
+  decay_pct: 0.085        # ~8.5% cosine decay
   warmup_start_lr: 7.5e-5
 
 # =============================================================================

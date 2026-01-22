@@ -90,9 +90,10 @@ class ACPredictorModule(L.LightningModule):
         use_iteration_scheduler: bool = False,
         # Curriculum learning schedule for dynamic loss adjustment
         curriculum_schedule: list[dict] | None = None,
-        warmup_iters: int = 4500,
-        constant_iters: int = 85500,
-        decay_iters: int = 4500,
+        # Percentage-based schedule (percentages of total training iterations, must sum to 1.0)
+        warmup_pct: float = 0.085,
+        constant_pct: float = 0.83,
+        decay_pct: float = 0.085,
         warmup_start_lr: float = 7.5e-5,
         **kwargs: Any,
     ) -> None:
@@ -164,9 +165,9 @@ class ACPredictorModule(L.LightningModule):
 
         # Iteration-based LR schedule (V-JEPA2 paper)
         self.use_iteration_scheduler = use_iteration_scheduler
-        self.warmup_iters = warmup_iters
-        self.constant_iters = constant_iters
-        self.decay_iters = decay_iters
+        self.warmup_pct = warmup_pct
+        self.constant_pct = constant_pct
+        self.decay_pct = decay_pct
         self.warmup_start_lr = warmup_start_lr
 
         # Grid size for reshaping
@@ -602,13 +603,42 @@ class ACPredictorModule(L.LightningModule):
 
         if self.use_iteration_scheduler:
             # Iteration-based: Warmup → Constant → Decay (V-JEPA2 paper)
-            # Total iterations = warmup_iters + constant_iters + decay_iters
-            warmup_iters = self.warmup_iters
-            constant_iters = self.constant_iters
-            decay_iters = self.decay_iters
+            # Compute total training iterations from trainer
+            # total_iters = num_batches_per_epoch * max_epochs
+            if self.trainer is not None and self.trainer.estimated_stepping_batches:
+                total_iters = int(self.trainer.estimated_stepping_batches)
+            else:
+                # Fallback: estimate from dataloader if trainer not fully set up
+                import warnings
+                warnings.warn(
+                    "Could not get total iterations from trainer. "
+                    "LR schedule may not work correctly.",
+                    UserWarning
+                )
+                total_iters = 10000  # Fallback default
+
+            # Convert percentages to iteration counts
+            warmup_iters = int(self.warmup_pct * total_iters)
+            constant_iters = int(self.constant_pct * total_iters)
+            decay_iters = int(self.decay_pct * total_iters)
+
+            # Ensure we don't exceed total due to rounding
+            # Adjust constant_iters to account for any rounding differences
+            computed_total = warmup_iters + constant_iters + decay_iters
+            if computed_total != total_iters:
+                constant_iters += (total_iters - computed_total)
+
+            import logging
+            log = logging.getLogger(__name__)
+            log.info(
+                f"[LR Schedule] Total iters: {total_iters}, "
+                f"warmup: {warmup_iters} ({self.warmup_pct*100:.1f}%), "
+                f"constant: {constant_iters} ({self.constant_pct*100:.1f}%), "
+                f"decay: {decay_iters} ({self.decay_pct*100:.1f}%)"
+            )
+
             warmup_end = warmup_iters
             constant_end = warmup_end + constant_iters
-            total_iters = constant_end + decay_iters
 
             # Scale factor for warmup: start_lr / peak_lr
             warmup_start_factor = self.warmup_start_lr / self.learning_rate
