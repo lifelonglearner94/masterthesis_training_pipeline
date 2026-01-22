@@ -22,12 +22,21 @@ from src.utils.device_utils import log_device_info
 
 def setup_verbose_logging(cfg: DictConfig) -> None:
     """Configure logging level based on config."""
-    # Check if verbose logging is enabled
+    # Check if verbose logging is enabled with at least one flag turned on
     verbose = False
     if cfg.get("callbacks"):
         callbacks_cfg = cfg.callbacks
         if hasattr(callbacks_cfg, "verbose_logging") or "verbose_logging" in callbacks_cfg:
-            verbose = True
+            vl_cfg = callbacks_cfg.get("verbose_logging", {})
+            # Only enable verbose logging if at least one flag is True
+            verbose = any([
+                vl_cfg.get("log_memory", False),
+                vl_cfg.get("log_data", False),
+                vl_cfg.get("log_forward_pass", False),
+                vl_cfg.get("log_backward_pass", False),
+                vl_cfg.get("log_gradients", False),
+                vl_cfg.get("log_weights", False),
+            ])
 
     if verbose:
         # Set root logger to DEBUG for maximum verbosity
