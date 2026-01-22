@@ -16,6 +16,7 @@ dependencies = [
     "rich>=13.7.0",
     "numpy<2.0.0",  # Pin to avoid 2.0 conflicts with some DL libraries
     "timm>=0.9.0",  # For drop_path and other vision utilities
+    "psutil"
 ]
 
 [project.optional-dependencies]
