@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import hydra
 import lightning as L
@@ -23,6 +23,7 @@ torch.serialization.add_safe_globals([
     omegaconf.listconfig.ListConfig,
     omegaconf.dictconfig.DictConfig,
     omegaconf.base.ContainerMetadata,
+    Any,  # typing.Any used in checkpoint hyperparameters
 ])
 
 from src.utils import instantiators
