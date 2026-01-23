@@ -8,23 +8,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import hydra
 import lightning as L
-import omegaconf
 import torch
 from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
-
-# Fix for PyTorch 2.6+ security update: allow OmegaConf objects in checkpoints
-torch.serialization.add_safe_globals([
-    omegaconf.listconfig.ListConfig,
-    omegaconf.dictconfig.DictConfig,
-    omegaconf.base.ContainerMetadata,
-    Any,  # typing.Any used in checkpoint hyperparameters
-])
 
 from src.utils import instantiators
 from src.utils.device_utils import log_device_info
@@ -107,11 +98,18 @@ def main(cfg: DictConfig) -> Optional[float]:
     print("🧠 Instantiating model...")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
 
-    # 6. Callbacks & Loggers
+    # 6. Load checkpoint weights manually (avoids PyTorch 2.6 weights_only issues)
+    if ckpt_path:
+        print("📥 Loading checkpoint weights...")
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"])
+        print("   ✅ Weights loaded successfully")
+
+    # 7. Callbacks & Loggers
     callbacks: List[Callback] = instantiators.instantiate_callbacks(cfg.get("callbacks"))
     logger: List[Logger] = instantiators.instantiate_loggers(cfg.get("logger"))
 
-    # 7. Trainer
+    # 8. Trainer
     trainer: Trainer = hydra.utils.instantiate(
         cfg.trainer,
         callbacks=callbacks,
@@ -119,14 +117,11 @@ def main(cfg: DictConfig) -> Optional[float]:
         _convert_="partial"
     )
 
-    # 8. Run test
+    # 9. Run test (no ckpt_path since weights are already loaded)
     print("\n🚀 Starting test evaluation...")
-    if ckpt_path:
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=str(ckpt_path))
-    else:
-        trainer.test(model=model, datamodule=datamodule)
+    trainer.test(model=model, datamodule=datamodule)
 
-    # 9. Return final metric
+    # 10. Return final metric
     final_loss = trainer.callback_metrics.get("test/loss")
     if final_loss is not None:
         print(f"\n📊 Final test loss: {final_loss:.6f}")
