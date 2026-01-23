@@ -8,12 +8,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import hydra
+import torch
+import omegaconf
 from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
 from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
 from pytorch_lightning.loggers import Logger
 from typing import List, Optional
 from pathlib import Path
+
+# Fix for PyTorch 2.6+ security update: allow OmegaConf objects in checkpoints
+torch.serialization.add_safe_globals([
+    omegaconf.listconfig.ListConfig,
+    omegaconf.dictconfig.DictConfig,
+])
 
 from src.utils import instantiators
 from src.utils.device_utils import log_device_info

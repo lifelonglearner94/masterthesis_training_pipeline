@@ -14,7 +14,7 @@ defaults:
 task_name: "train"
 tags: ["dev"]
 train: True
-test: True
+test: False
 
 # Gold Standard Requirement:
 deterministic: True

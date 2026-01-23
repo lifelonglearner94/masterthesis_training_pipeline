@@ -33,4 +33,4 @@ uv run src/train.py experiment=vjepa2_ac data/clips_0_to_5000
 ---
 
 # To fetch the data to my local filesystem (execute in local terminal):
-scp -P 48280 -r root@212.85.84.41:/workspace/outputs/ .
+scp -P 48280 -r root@212.85.84.41:/workspace/masterthesis_training_pipeline/outputs .
