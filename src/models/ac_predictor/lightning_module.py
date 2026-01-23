@@ -32,6 +32,10 @@ from torch import Tensor
 from src.models.ac_predictor.ac_predictor import vit_ac_predictor
 
 
+# Type alias for test results
+TestResultsDict = dict[str, Any]
+
+
 class ACPredictorModule(L.LightningModule):
     """PyTorch Lightning module for Action-Conditioned Vision Transformer Predictor.
 
@@ -180,6 +184,9 @@ class ACPredictorModule(L.LightningModule):
         self.curriculum_schedule = curriculum_schedule
         if curriculum_schedule:
             self._validate_curriculum_schedule(curriculum_schedule)
+
+        # Storage for test results (populated during test_step, aggregated in on_test_epoch_end)
+        self._test_results: list[TestResultsDict] = []
 
     def _validate_curriculum_schedule(self, schedule: list[dict]) -> None:
         """Validate curriculum schedule format and values.
@@ -516,6 +523,87 @@ class ACPredictorModule(L.LightningModule):
 
         return self._compute_loss(z_ar_pred, target)
 
+    def _compute_rollout_loss_per_timestep(
+        self,
+        features: Tensor,
+        actions: Tensor,
+        states: Tensor,
+        extrinsics: Tensor | None = None,
+    ) -> tuple[Tensor, list[Tensor], list[Tensor]]:
+        """Compute rollout loss with per-timestep breakdown for detailed analysis.
+
+        Same as _compute_rollout_loss, but returns per-timestep losses for analysis.
+
+        Args:
+            features: [B, T+1, N, D] - Features for T+1 frames
+            actions: [B, T, action_dim] - Actions for T steps
+            states: [B, T, action_dim] - States for T steps
+            extrinsics: [B, T, action_dim-1] - Optional extrinsics
+
+        Returns:
+            Tuple of:
+                - total_loss: Scalar loss tensor (average over all timesteps)
+                - per_timestep_losses: List of [B] tensors, one per predicted timestep
+                - per_sample_losses: List of [B] tensors with per-sample total rollout loss
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        B, T_plus_1, N, D = features.shape
+        C = self.context_frames  # Number of ground-truth context frames
+        T_pred = min(T_plus_1 - C, self.T_rollout)  # Number of steps to predict
+
+        # Normalize ground-truth features if enabled
+        h = features
+        if self.normalize_reps:
+            h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(B, T_plus_1, N, D)
+
+        # Initialize with C ground-truth context frames
+        z_ar = h[:, :C, :, :].reshape(B, C * N, D)  # [B, C*N, D]
+
+        # Store per-timestep predictions
+        predictions_per_step: list[Tensor] = []
+
+        # Autoregressive rollout for T_pred steps
+        for step in range(T_pred):
+            num_action_steps = C + step
+            ar_actions = actions[:, :num_action_steps, :]
+            ar_states = states[:, :num_action_steps, :]
+            ar_extrinsics = extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
+
+            # Predict next frame
+            z_nxt = self._step_predictor(z_ar, ar_actions, ar_states, ar_extrinsics)
+            z_nxt = z_nxt[:, -N:, :]  # [B, N, D] - last frame only
+
+            predictions_per_step.append(z_nxt)
+
+            # Append to autoregressive context
+            z_ar = torch.cat([z_ar, z_nxt], dim=1)
+
+        # Compute per-timestep losses
+        per_timestep_losses: list[Tensor] = []
+        per_sample_total_losses = torch.zeros(B, device=features.device)
+
+        for step, pred in enumerate(predictions_per_step):
+            # Target for this step: frame C + step
+            target_frame = h[:, C + step, :, :]  # [B, N, D]
+
+            # Per-sample loss for this timestep
+            diff = torch.abs(pred - target_frame)  # [B, N, D]
+            diff_exp = diff ** self.loss_exp
+            per_sample_loss = diff_exp.mean(dim=(1, 2)) / self.loss_exp  # [B]
+
+            per_timestep_losses.append(per_sample_loss)
+            per_sample_total_losses += per_sample_loss
+
+        # Average per-sample losses across timesteps
+        per_sample_total_losses = per_sample_total_losses / T_pred
+
+        # Total loss (scalar)
+        total_loss = per_sample_total_losses.mean()
+
+        return total_loss, per_timestep_losses, [per_sample_total_losses]
+
     def _shared_step(self, batch: dict[str, Tensor], stage: str) -> Tensor:
         """Shared step for training and validation.
 
@@ -581,8 +669,186 @@ class ACPredictorModule(L.LightningModule):
         return self._shared_step(batch, "val")
 
     def test_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
-        """Test step."""
-        return self._shared_step(batch, "test")
+        """Test step with detailed per-clip and per-timestep analysis.
+
+        Computes rollout losses with per-timestep breakdown and stores results
+        for aggregation in on_test_epoch_end.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        features = batch["features"]
+        actions = batch["actions"]
+        states = batch["states"]
+        extrinsics = batch.get("extrinsics", None)
+        clip_names = batch.get("clip_names", [f"clip_{batch_idx}_{i}" for i in range(features.shape[0])])
+
+        # Reshape features if needed: [B, (T+1)*N, D] -> [B, T+1, N, D]
+        if features.dim() == 3:
+            B, total_tokens, D = features.shape
+            T_plus_1 = total_tokens // self.patches_per_frame
+            features = features.reshape(B, T_plus_1, self.patches_per_frame, D)
+        else:
+            B = features.shape[0]
+
+        # Compute teacher forcing loss (for comparison)
+        loss_teacher = self._compute_teacher_forcing_loss(features, actions, states, extrinsics)
+
+        # Compute rollout loss with per-timestep breakdown
+        loss_rollout, per_timestep_losses, per_sample_losses = self._compute_rollout_loss_per_timestep(
+            features, actions, states, extrinsics
+        )
+
+        # Combined loss
+        loss = self.loss_weight_teacher * loss_teacher + self.loss_weight_rollout * loss_rollout
+
+        # Log aggregate metrics
+        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
+        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss", loss, prog_bar=True, sync_dist=True)
+
+        # Log per-timestep losses
+        for step, step_loss in enumerate(per_timestep_losses):
+            predicted_frame = self.context_frames + step  # e.g., 3, 4, 5, 6
+            self.log(f"test/loss_step_{predicted_frame}", step_loss.mean(), sync_dist=True)
+
+        # Store per-clip results for aggregation
+        per_sample_rollout_losses = per_sample_losses[0]  # [B]
+        for i in range(B):
+            clip_result: TestResultsDict = {
+                "clip_name": clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}",
+                "loss_rollout": per_sample_rollout_losses[i].item(),
+                "loss_teacher": loss_teacher.item(),  # Note: this is batch-level for teacher
+                "per_timestep_losses": {
+                    f"step_{self.context_frames + s}": per_timestep_losses[s][i].item()
+                    for s in range(len(per_timestep_losses))
+                },
+            }
+            self._test_results.append(clip_result)
+
+        return loss
+
+    def on_test_epoch_start(self) -> None:
+        """Clear test results at the start of test epoch."""
+        self._test_results = []
+
+    def on_test_epoch_end(self) -> None:
+        """Aggregate test results and output summary.
+
+        Prints summary statistics and optionally exports detailed results to JSON.
+        """
+        import json
+        import logging
+        from pathlib import Path
+
+        log = logging.getLogger(__name__)
+
+        if not self._test_results:
+            log.warning("No test results to aggregate")
+            return
+
+        # Compute aggregate statistics
+        num_clips = len(self._test_results)
+        rollout_losses = [r["loss_rollout"] for r in self._test_results]
+
+        mean_loss = sum(rollout_losses) / num_clips
+        sorted_losses = sorted(rollout_losses)
+        median_loss = sorted_losses[num_clips // 2]
+        min_loss = min(rollout_losses)
+        max_loss = max(rollout_losses)
+        std_loss = (sum((x - mean_loss) ** 2 for x in rollout_losses) / num_clips) ** 0.5
+
+        # Compute per-timestep statistics
+        num_timesteps = len(self._test_results[0]["per_timestep_losses"])
+        per_timestep_stats = {}
+        for step_key in self._test_results[0]["per_timestep_losses"].keys():
+            step_losses = [r["per_timestep_losses"][step_key] for r in self._test_results]
+            per_timestep_stats[step_key] = {
+                "mean": sum(step_losses) / num_clips,
+                "min": min(step_losses),
+                "max": max(step_losses),
+            }
+
+        # Find worst-performing clips
+        worst_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"], reverse=True)[:10]
+        best_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"])[:5]
+
+        # Print summary to console
+        print("\n" + "=" * 70)
+        print("                    TEST RESULTS SUMMARY")
+        print("=" * 70)
+        print(f"\n📊 AGGREGATE STATISTICS (over {num_clips} clips)")
+        print("-" * 50)
+        print(f"  Rollout Loss (L1):")
+        print(f"    Mean:   {mean_loss:.6f}")
+        print(f"    Median: {median_loss:.6f}")
+        print(f"    Std:    {std_loss:.6f}")
+        print(f"    Min:    {min_loss:.6f}")
+        print(f"    Max:    {max_loss:.6f}")
+
+        print(f"\n📈 PER-TIMESTEP BREAKDOWN (Context: {self.context_frames} frames)")
+        print("-" * 50)
+        print(f"  {'Frame':<10} {'Mean Loss':<12} {'Min':<12} {'Max':<12}")
+        print(f"  {'-'*10} {'-'*12} {'-'*12} {'-'*12}")
+        for step_key, stats in per_timestep_stats.items():
+            frame_num = step_key.replace("step_", "z_")
+            print(f"  {frame_num:<10} {stats['mean']:<12.6f} {stats['min']:<12.6f} {stats['max']:<12.6f}")
+
+        print(f"\n🔴 WORST-PERFORMING CLIPS (top 10)")
+        print("-" * 50)
+        for i, clip in enumerate(worst_clips, 1):
+            print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
+
+        print(f"\n🟢 BEST-PERFORMING CLIPS (top 5)")
+        print("-" * 50)
+        for i, clip in enumerate(best_clips, 1):
+            print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
+
+        print("\n" + "=" * 70)
+
+        # Export to JSON if configured
+        # Check trainer for config or use default
+        export_results = True
+        output_dir = None
+
+        if self.trainer and hasattr(self.trainer, "log_dir") and self.trainer.log_dir:
+            output_dir = Path(self.trainer.log_dir)
+        else:
+            # Use current directory as fallback
+            output_dir = Path(".")
+
+        if export_results:
+            results_file = output_dir / "test_results.json"
+            export_data = {
+                "summary": {
+                    "num_clips": num_clips,
+                    "context_frames": self.context_frames,
+                    "T_rollout": self.T_rollout,
+                    "rollout_loss": {
+                        "mean": mean_loss,
+                        "median": median_loss,
+                        "std": std_loss,
+                        "min": min_loss,
+                        "max": max_loss,
+                    },
+                    "per_timestep": per_timestep_stats,
+                },
+                "worst_clips": worst_clips,
+                "best_clips": best_clips,
+                "all_clips": self._test_results,
+            }
+
+            try:
+                results_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(results_file, "w") as f:
+                    json.dump(export_data, f, indent=2)
+                print(f"\n💾 Detailed results exported to: {results_file}")
+            except Exception as e:
+                log.warning(f"Failed to export results to JSON: {e}")
+
+        # Log final metrics
+        self.log("test/final_mean_loss_rollout", mean_loss, sync_dist=True)
+        self.log("test/final_median_loss_rollout", median_loss, sync_dist=True)
 
     def configure_optimizers(self) -> dict:
         """Configure optimizer and learning rate scheduler.

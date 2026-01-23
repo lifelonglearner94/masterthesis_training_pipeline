@@ -1,0 +1,94 @@
+# @package _global_
+# =============================================================================
+# V-JEPA2 AC Predictor - TEST CONFIGURATION
+# =============================================================================
+# Use as: uv run src/eval.py experiment=test_ac_predictor ckpt_path=/path/to/checkpoint.ckpt
+#
+# This config is for evaluating a trained model on held-out test clips.
+# Test clips: 15000-15999 (1000 clips total)
+#
+# TEMPORAL DIMENSIONS:
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Context frames: 3 (ground-truth z₀, z₁, z₂)
+#   - Prediction steps: 4 (autoregressive z₃, z₄, z₅, z₆)
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: null  # Disable W&B for testing by default
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "test_ac_predictor"
+tags: ["vjepa2", "ac_predictor", "test", "evaluation"]
+seed: 42
+train: False
+test: True
+
+# =============================================================================
+# DATA: Test clip range
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+  # Test clips: 15000-15999 (exclusive end)
+  clip_start: 15000
+  clip_end: 16000
+  val_split: 0.0  # No validation split for testing
+
+# =============================================================================
+# MODEL: Must match training configuration
+# =============================================================================
+model:
+  # --- Rollout configuration for testing ---
+  T_rollout: 4                     # Predict 4 timesteps autoregressively (z₃→z₆)
+  context_frames: 3                # Use 3 ground-truth context frames (z₀, z₁, z₂)
+  T_teacher: 7                     # Teacher forcing for comparison
+  use_activation_checkpointing: true
+
+  # --- Model architecture (must match trained model) ---
+  action_embed_dim: 2              # 2D actions for this dataset
+
+  # --- Loss weights (for test metrics) ---
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # --- Curriculum disabled for testing ---
+  curriculum_schedule: null
+
+# =============================================================================
+# TRAINER: Test mode settings
+# =============================================================================
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: 16-mixed
+  # Disable training-related features
+  max_epochs: 0
+  enable_checkpointing: false
+  enable_progress_bar: true
+
+# =============================================================================
+# CHECKPOINT PATH (override on command line)
+# =============================================================================
+# Example: uv run src/eval.py experiment=test_ac_predictor ckpt_path=outputs/2026-01-21/14-15-04/checkpoints/last.ckpt
+ckpt_path: null
+
+# =============================================================================
+# TEST OUTPUT SETTINGS
+# =============================================================================
+test_output:
+  # Export detailed per-clip results to JSON
+  export_results: true
+  # Output directory for test results (default: same as checkpoint dir)
+  output_dir: null
+  # Include per-timestep loss breakdown
+  per_timestep_breakdown: true
+  # Number of worst-performing clips to report
+  num_worst_clips: 10

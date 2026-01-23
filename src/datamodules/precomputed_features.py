@@ -258,7 +258,9 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     if has_extrinsics:
         result["extrinsics"] = extrinsics
 
-    result["clip_names"] = [item["clip_name"] for item in batch]
+    # Include clip_names if available in batch items
+    if "clip_name" in batch[0]:
+        result["clip_names"] = [item["clip_name"] for item in batch]
 
     return result
 
