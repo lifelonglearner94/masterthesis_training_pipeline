@@ -18,7 +18,7 @@ defaults:
   - override /data: precomputed_features
   - override /model: ac_predictor
   - override /trainer: default
-  - override /callbacks: default
+  - override /callbacks: null  # Disable default callbacks (no checkpointing needed for testing)
   - override /logger: null  # Disable W&B for testing by default
 
 # =============================================================================
@@ -29,6 +29,13 @@ tags: ["vjepa2", "ac_predictor", "test", "evaluation"]
 seed: 42
 train: False
 test: True
+
+# =============================================================================
+# CALLBACKS: Minimal callbacks for testing (progress bar only)
+# =============================================================================
+callbacks:
+  rich_progress:
+    _target_: lightning.pytorch.callbacks.RichProgressBar
 
 # =============================================================================
 # DATA: Test clip range
