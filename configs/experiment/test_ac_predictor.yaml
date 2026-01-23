@@ -2,7 +2,7 @@
 # =============================================================================
 # V-JEPA2 AC Predictor - TEST CONFIGURATION
 # =============================================================================
-# Use as: uv run src/eval.py experiment=test_ac_predictor ckpt_path=/path/to/checkpoint.ckpt
+# Use as: uv run src/eval.py experiment=test_ac_predictor paths.data_dir=/path/to/your/clips ckpt_path=/path/to/checkpoint.ckpt
 #
 # This config is for evaluating a trained model on held-out test clips.
 # Test clips: 15000-15999 (1000 clips total)
@@ -34,8 +34,8 @@ test: True
 # DATA: Test clip range
 # =============================================================================
 data:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 32
+  num_workers: 4
   pin_memory: true
   # Test clips: 15000-15999 (exclusive end)
   clip_start: 15000
@@ -68,7 +68,7 @@ model:
 trainer:
   accelerator: auto
   devices: 1
-  precision: 16-mixed
+  precision: 32
   # Disable training-related features
   max_epochs: 0
   enable_checkpointing: false
