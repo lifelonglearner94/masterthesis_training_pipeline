@@ -7,20 +7,22 @@ root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=Tr
 from dotenv import load_dotenv
 load_dotenv()
 
-import hydra
-import torch
-import omegaconf
-from omegaconf import DictConfig, OmegaConf
-import pytorch_lightning as pl
-from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
-from pytorch_lightning.loggers import Logger
-from typing import List, Optional
 from pathlib import Path
+from typing import List, Optional
+
+import hydra
+import lightning as L
+import omegaconf
+import torch
+from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.loggers import Logger
+from omegaconf import DictConfig
 
 # Fix for PyTorch 2.6+ security update: allow OmegaConf objects in checkpoints
 torch.serialization.add_safe_globals([
     omegaconf.listconfig.ListConfig,
     omegaconf.dictconfig.DictConfig,
+    omegaconf.base.ContainerMetadata,
 ])
 
 from src.utils import instantiators
@@ -77,7 +79,7 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     # 1. Gold Standard: Determinism
     if cfg.get("seed"):
-        pl.seed_everything(cfg.seed, workers=True)
+        L.seed_everything(cfg.seed, workers=True)
 
     # 2. Print test configuration
     print_test_config(cfg)
