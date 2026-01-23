@@ -10,4 +10,4 @@ devices: auto
 
 # Use full precision for maximum compatibility
 # Note: MPS has limited fp16 support, CPU doesn't benefit from mixed precision
-precision: 32
+precision: 16-mixed

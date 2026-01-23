@@ -32,7 +32,7 @@ patches_per_frame: 256  # Patches per frame for ViT-L (16x16 patches)
 use_extrinsics: false
 
 # DataLoader settings
-batch_size: 32
-num_workers: 4
+batch_size: 64
+num_workers: 8
 pin_memory: true
-persistent_workers: false  # Keep workers alive between epochs (disable on MPS to save memory)
+persistent_workers: true  # Keep workers alive between epochs (disable on MPS to save memory)

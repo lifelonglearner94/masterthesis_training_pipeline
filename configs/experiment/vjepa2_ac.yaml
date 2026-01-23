@@ -52,14 +52,14 @@ test: True
 #   4. use_activation_checkpointing: true (trades speed for ~50% less memory)
 
 data:
-  batch_size: 4                   # ⚠️ REDUCED from 32 (saves ~4x memory)
-  num_workers: 4                   # ⚠️ REDUCED from 4 (each worker duplicates data)
+  batch_size: 64                   # ⚠️ REDUCED from 32 (saves ~4x memory)
+  num_workers: 8                   # ⚠️ REDUCED from 4 (each worker duplicates data)
   pin_memory: true
 
 model:
   # --- Memory settings ---
   T_teacher: 7                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
-  T_rollout: 3                     # Fixed: predict 5 timesteps autoregressively <- changed to 3 just because of lack of memory VRAM
+  T_rollout: 4                     # Fixed: predict 5 timesteps autoregressively <- changed to 4 just because of lack of memory VRAM
   context_frames: 3                # Fixed: use 3 ground-truth context frames
   use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
 
