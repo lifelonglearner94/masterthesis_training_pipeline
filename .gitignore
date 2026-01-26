@@ -121,3 +121,6 @@ Thumbs.db
 temp/
 
 .env
+
+data/clip_00000/
+data/clip_15101/
