@@ -59,9 +59,9 @@ data:
 model:
   # --- Memory settings ---
   T_teacher: 7                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
-  T_rollout: 6                     # Fixed: predict 5 timesteps autoregressively <- changed to 4 just because of lack of memory VRAM
+  T_rollout: 7                     # Fixed: predict 7 timesteps autoregressively
   context_frames: 1                # Fixed: use 1 ground-truth context frame (z₀)
-  use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
+  use_activation_checkpointing: false  # ⚠️ ENABLED (trades compute for ~50% memory)
 
   # --- Model architecture (keep defaults from ac_predictor.yaml) ---
   # Uncomment to override:
@@ -81,7 +81,7 @@ model:
 
   # --- Curriculum Learning Schedule ---
   # Dynamically adjusts loss_weight_teacher during training.
-  # T_rollout and context_frames are now FIXED (3 context → 5 predictions).
+  # T_rollout and context_frames are now FIXED (1 context → 7 predictions).
   # Each phase activates at the specified epoch and remains active until the next phase.
   # Parameters not specified in a phase retain their previous values.
   #
@@ -94,9 +94,9 @@ model:
   curriculum_schedule:
     - epoch: 0
       loss_weight_teacher: 1.0
-    - epoch: 5
-      loss_weight_teacher: 0.7
     - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
       loss_weight_teacher: 0.3
 
   # --- Optimizer (V-JEPA2 paper settings) ---
@@ -116,6 +116,6 @@ model:
 # TRAINER SETTINGS
 # =============================================================================
 trainer:
-  max_epochs: 17
+  max_epochs: 30
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm

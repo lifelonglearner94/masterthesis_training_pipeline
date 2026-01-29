@@ -54,10 +54,10 @@ data:
 # =============================================================================
 model:
   # --- Rollout configuration for testing ---
-  T_rollout: 6                     # Predict 6 timesteps autoregressively (z₁→z₆)
+  T_rollout: 7                     # Predict 7 timesteps autoregressively (z₁→z₇)
   context_frames: 1                # Use 1 ground-truth context frame (z₀)
   T_teacher: 7                     # Teacher forcing for comparison
-  use_activation_checkpointing: true
+  use_activation_checkpointing: false
 
   # --- Model architecture (must match trained model) ---
   action_embed_dim: 2              # 2D actions for this dataset
