@@ -18,8 +18,8 @@ clip_prefix: "clip_"  # Prefix for clip directories
 # Filter clips by their numeric ID (e.g., clip_00042 -> 42)
 # clip_start: inclusive, clip_end: exclusive
 # Example: clip_start=0, clip_end=5000 selects clips 0-4999
-clip_start: 0  # Start of clip range (inclusive), null = no lower bound
-clip_end: 5000    # End of clip range (exclusive), null = no upper bound
+clip_start: 17000  # Start of clip range (inclusive), null = no lower bound
+clip_end: 22000    # End of clip range (exclusive), null = no upper bound
 
 # Validation split (percentage-based)
 # The last N% of clips (by ID) are used for validation.

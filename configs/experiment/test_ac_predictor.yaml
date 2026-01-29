@@ -19,7 +19,7 @@ defaults:
   - override /model: ac_predictor
   - override /trainer: default
   - override /callbacks: null  # Disable default callbacks (no checkpointing needed for testing)
-  - override /logger: null  # Disable W&B for testing by default
+  - override /logger: wandb  # Enable W&B for testing by default
 
 # =============================================================================
 # EXPERIMENT METADATA
@@ -45,8 +45,8 @@ data:
   num_workers: 4
   pin_memory: true
   # Test clips: 15000-15999 (exclusive end)
-  clip_start: 15000
-  clip_end: 16000
+  clip_start: 22000
+  clip_end: 23000
   val_split: 0.0  # No validation split for testing
 
 # =============================================================================
@@ -54,8 +54,8 @@ data:
 # =============================================================================
 model:
   # --- Rollout configuration for testing ---
-  T_rollout: 4                     # Predict 4 timesteps autoregressively (z₃→z₆)
-  context_frames: 3                # Use 3 ground-truth context frames (z₀, z₁, z₂)
+  T_rollout: 6                     # Predict 6 timesteps autoregressively (z₁→z₆)
+  context_frames: 1                # Use 1 ground-truth context frame (z₀)
   T_teacher: 7                     # Teacher forcing for comparison
   use_activation_checkpointing: true
 
@@ -63,7 +63,7 @@ model:
   action_embed_dim: 2              # 2D actions for this dataset
 
   # --- Loss weights (for test metrics) ---
-  loss_weight_teacher: 1.0
+  loss_weight_teacher: 0
   loss_weight_rollout: 1.0
 
   # --- Curriculum disabled for testing ---

@@ -40,7 +40,7 @@ task_name: "vjepa2_ac_predictor"
 tags: ["vjepa2", "ac_predictor", "robotics"]
 seed: 42
 train: True
-test: True
+test: False
 
 # =============================================================================
 # ⚠️  MEMORY-CRITICAL SETTINGS (tune these for your 32GB RAM)
@@ -59,8 +59,8 @@ data:
 model:
   # --- Memory settings ---
   T_teacher: 7                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
-  T_rollout: 4                     # Fixed: predict 5 timesteps autoregressively <- changed to 4 just because of lack of memory VRAM
-  context_frames: 3                # Fixed: use 3 ground-truth context frames
+  T_rollout: 6                     # Fixed: predict 5 timesteps autoregressively <- changed to 4 just because of lack of memory VRAM
+  context_frames: 1                # Fixed: use 1 ground-truth context frame (z₀)
   use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
 
   # --- Model architecture (keep defaults from ac_predictor.yaml) ---
@@ -116,6 +116,6 @@ model:
 # TRAINER SETTINGS
 # =============================================================================
 trainer:
-  max_epochs: 15
+  max_epochs: 17
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm
