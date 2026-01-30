@@ -91,6 +91,20 @@ uv run src/train.py model=ac_predictor data=precomputed_features paths.data_dir=
 # With GPU and custom batch size
 uv run src/train.py model=ac_predictor data=precomputed_features trainer=gpu data.batch_size=16 paths.data_dir=/path/to/your/clips
 ```
+
+### Baseline ConvLSTM Model
+
+A simpler ConvLSTM baseline for comparison with the ViT AC Predictor. Uses identical training protocol, loss functions, and curriculum schedule for scientific comparability.
+
+```bash
+# Train baseline ConvLSTM (scientifically comparable to vjepa2_ac)
+uv run src/train.py experiment=baseline_convlstm paths.data_dir=/path/to/your/clips
+```
+
+| Model | Parameters | Architecture |
+|-------|------------|--------------|
+| **ViT AC Predictor** (`vjepa2_ac`) | ~43M | 24-layer Transformer with RoPE |
+| **ConvLSTM Baseline** (`baseline_convlstm`) | ~5M | ConvLSTM with residual learning |
 # Use clips 0-4999 (5000 clips)
 data:
   clip_start: 0

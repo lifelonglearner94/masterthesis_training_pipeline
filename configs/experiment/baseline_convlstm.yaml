@@ -1,0 +1,106 @@
+# @package _global_
+# =============================================================================
+# Baseline ConvLSTM Experiment - SCIENTIFICALLY COMPARABLE TO vjepa2_ac.yaml
+# =============================================================================
+# Use as: uv run src/train.py experiment=baseline_convlstm paths.data_dir=/path/to/clips
+#
+# This experiment is designed to be a fair baseline comparison to vjepa2_ac.yaml.
+# It uses the SAME:
+#   - Data pipeline (precomputed V-JEPA2 features)
+#   - Loss functions (L1 teacher-forcing + rollout)
+#   - Curriculum schedule (progressive teacher weight reduction)
+#   - Training settings (batch size, optimizer, LR schedule)
+#   - Evaluation protocol (T_rollout=7, context_frames=1)
+#
+# The ONLY difference is the model architecture:
+#   - vjepa2_ac.yaml: 24-layer ViT with RoPE attention (~43M params)
+#   - baseline_convlstm.yaml: ConvLSTM with residual learning (~5-10M params)
+#
+# TEMPORAL DIMENSIONS (same as vjepa2_ac.yaml):
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Available prediction steps: 7 (num_timesteps - 1)
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: baseline_convlstm
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+callbacks:
+  verbose_logging:
+    _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
+    log_memory: False
+    log_data: False
+    log_forward_pass: False
+    log_backward_pass: False
+    log_gradients: False
+    log_weights: False
+    log_every_n_batches: 16
+    max_layers_to_log: 30
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "baseline_convlstm"
+tags: ["baseline", "convlstm", "robotics", "comparison"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# ⚠️  MEMORY-CRITICAL SETTINGS (same as vjepa2_ac.yaml for fair comparison)
+# =============================================================================
+data:
+  batch_size: 64                   # Same as vjepa2_ac.yaml
+  num_workers: 8                   # Same as vjepa2_ac.yaml
+  pin_memory: true
+
+model:
+  # --- Model architecture (baseline-specific) ---
+  input_dim: 1024                  # V-JEPA2 feature dimension
+  hidden_dim: 256                  # ConvLSTM hidden dimension
+  action_dim: 2                    # 2D actions for this dataset
+  spatial_size: 16                 # 16×16 spatial grid
+  kernel_size: 3                   # ConvLSTM kernel size
+
+  # --- Loss settings (SAME as vjepa2_ac.yaml) ---
+  T_teacher: 7                     # Teacher-forcing prediction steps
+  T_rollout: 7                     # Autoregressive prediction steps
+  context_frames: 1                # Ground-truth context frame (z₀)
+
+  # --- Loss weights (SAME as vjepa2_ac.yaml) ---
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # --- Curriculum Learning Schedule (SAME as vjepa2_ac.yaml) ---
+  # Progressively reduces teacher-forcing weight, shifting focus to rollout
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
+      loss_weight_teacher: 0.3
+
+  # --- Optimizer (SAME as vjepa2_ac.yaml, V-JEPA2 paper settings) ---
+  learning_rate: 4.25e-4           # Peak LR
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # --- LR schedule (SAME as vjepa2_ac.yaml) ---
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+# =============================================================================
+# TRAINER SETTINGS (SAME as vjepa2_ac.yaml)
+# =============================================================================
+trainer:
+  max_epochs: 30
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
