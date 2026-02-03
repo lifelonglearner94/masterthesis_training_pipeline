@@ -199,26 +199,49 @@ class TTAMixin:
 
         When Lightning runs test_step in inference_mode, model parameters become
         "inference tensors" that cannot be used for backward passes. This method
-        clones all parameters to create regular tensors. Only LayerNorm parameters
-        are made trainable for TTA.
-
-        This is necessary because intermediate activations computed with inference
-        tensors also become inference tensors and cannot be saved for backward.
+        saves and reloads the model state dict to create fresh non-inference tensors.
+        Only LayerNorm parameters are made trainable for TTA.
         """
-        with torch.inference_mode(False):
-            for name, module in self.model.named_modules():
-                # Clone all parameters in this module (not recursively - just this module's own params)
-                for param_name, param in list(module._parameters.items()):
-                    if param is not None:
-                        new_param = param.data.clone()
-                        # Only LayerNorm parameters should be trainable
-                        requires_grad = isinstance(module, nn.LayerNorm)
-                        module._parameters[param_name] = nn.Parameter(new_param, requires_grad=requires_grad)
+        # Save current state dict
+        state_dict = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-                # Also clone buffers (like attn_mask, position embeddings, etc.)
-                for buffer_name, buffer in list(module._buffers.items()):
-                    if buffer is not None:
-                        module._buffers[buffer_name] = buffer.clone()
+        # Exit inference mode completely by using the internal API
+        # This is necessary because nested inference_mode(False) doesn't fully work
+        inference_mode_was_enabled = torch.is_inference_mode_enabled()
+
+        if inference_mode_was_enabled:
+            # Temporarily disable inference mode at the C++ level
+            torch._C._set_grad_enabled(True)
+
+        try:
+            # Reload state dict - this creates fresh non-inference tensors
+            self.model.load_state_dict(state_dict, strict=True)
+
+            # Clone any non-parameter/buffer tensors (like attn_mask if it's a regular attribute)
+            for name, module in self.model.named_modules():
+                for attr_name in list(dir(module)):
+                    if attr_name.startswith('_'):
+                        continue
+                    try:
+                        attr = getattr(module, attr_name)
+                        if isinstance(attr, torch.Tensor) and not isinstance(attr, nn.Parameter):
+                            # Check if it's not a buffer (buffers are handled by load_state_dict)
+                            if attr_name not in module._buffers:
+                                setattr(module, attr_name, attr.clone())
+                    except (AttributeError, RuntimeError):
+                        pass
+
+            # Now set requires_grad appropriately
+            self.model.requires_grad_(False)
+            for module in self.model.modules():
+                if isinstance(module, nn.LayerNorm):
+                    for param in module.parameters():
+                        param.requires_grad = True
+        finally:
+            if inference_mode_was_enabled:
+                # Re-enable inference mode if it was enabled before
+                # (Note: we stay in grad-enabled mode for TTA)
+                pass
 
     def _tta_create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer for TTA."""
@@ -416,13 +439,12 @@ class TTAMixin:
         use_mps_fallback = self._tta_is_mps_device()
         original_device = None
 
-        # Escape inference mode and create clean copies of inputs
-        with torch.inference_mode(False):
-            # Clone inputs to create normal (non-inference) tensors
-            features_for_tta = features.detach().clone().requires_grad_(False)
-            actions_for_tta = actions.detach().clone().requires_grad_(False)
-            states_for_tta = states.detach().clone().requires_grad_(False)
-            extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
+        # Clone inputs - must be done after _tta_make_model_params_non_inference
+        # which enables grad mode internally
+        features_for_tta = features.detach().clone().requires_grad_(False)
+        actions_for_tta = actions.detach().clone().requires_grad_(False)
+        states_for_tta = states.detach().clone().requires_grad_(False)
+        extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
 
         if use_mps_fallback:
             import logging
@@ -443,14 +465,14 @@ class TTAMixin:
                 # Set LayerNorms to train mode and enable gradients for adaptation
                 prev_ln_states = self._tta_set_ln_train_mode(True)
                 try:
-                    with torch.inference_mode(False):
-                        with torch.set_grad_enabled(True):
-                            predictions, targets = self._tta_full_rollout(
-                                features_for_tta, actions_for_tta, states_for_tta, extrinsics_for_tta, detach=False
-                            )
+                    # Grad mode was enabled in _tta_make_model_params_non_inference
+                    # Just do the forward pass and backward directly
+                    predictions, targets = self._tta_full_rollout(
+                        features_for_tta, actions_for_tta, states_for_tta, extrinsics_for_tta, detach=False
+                    )
 
-                        # Perform TTA update using full rollout loss
-                        self._tta_adapt(predictions, targets)
+                    # Perform TTA update using full rollout loss
+                    self._tta_adapt(predictions, targets)
                 finally:
                     # Restore LayerNorm training states
                     self._tta_restore_ln_train_mode(prev_ln_states)
@@ -520,12 +542,12 @@ class TTAMixin:
         self._tta_optimizer = self._tta_create_optimizer()
 
         # Escape inference mode and create clean copies of inputs for TTA
-        # This is critical: tensors created in inference_mode cannot be used for autograd
-        with torch.inference_mode(False):
-            features_for_tta = features.detach().clone().requires_grad_(False)
-            actions_for_tta = actions.detach().clone().requires_grad_(False)
-            states_for_tta = states.detach().clone().requires_grad_(False)
-            extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
+        # Clone inputs - must be done after _tta_make_model_params_non_inference
+        # which enables grad mode internally
+        features_for_tta = features.detach().clone().requires_grad_(False)
+        actions_for_tta = actions.detach().clone().requires_grad_(False)
+        states_for_tta = states.detach().clone().requires_grad_(False)
+        extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
 
         # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
         use_mps_fallback = self._tta_is_mps_device()
@@ -571,23 +593,19 @@ class TTAMixin:
                 )
 
                 # Look-back adaptation (skip first step - no previous prediction)
-                # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
-                # inference_mode during testing, which cannot be overridden by set_grad_enabled
+                # Grad mode was enabled in _tta_make_model_params_non_inference
                 if prev_pred is not None and step > 0:
                     prev_target = h[:, target_idx - 1, :, :]  # Ground-truth for prev prediction
-                    with torch.inference_mode(False):
-                        self._tta_adapt(prev_pred, prev_target)
+                    self._tta_adapt(prev_pred, prev_target)
 
                 # Forward pass with gradients enabled for next adaptation
                 # Set LayerNorms to train mode for gradient flow
                 prev_ln_states = self._tta_set_ln_train_mode(True)
                 try:
-                    with torch.inference_mode(False):
-                        with torch.set_grad_enabled(True):
-                            z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                                z_ar, step_actions, step_states, step_extrinsics
-                            )
-                            z_pred = z_pred_full[:, -N:, :]  # Last frame only
+                    z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
+                        z_ar, step_actions, step_states, step_extrinsics
+                    )
+                    z_pred = z_pred_full[:, -N:, :]  # Last frame only
                 finally:
                     self._tta_restore_ln_train_mode(prev_ln_states)
 
@@ -601,8 +619,7 @@ class TTAMixin:
             # Final adaptation with last ground-truth
             if prev_pred is not None and T_pred > 0:
                 final_target = h[:, C + T_pred - 1, :, :]
-                with torch.inference_mode(False):
-                    self._tta_adapt(prev_pred, final_target)
+                self._tta_adapt(prev_pred, final_target)
 
             # Stack predictions and targets
             predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
