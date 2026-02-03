@@ -375,22 +375,34 @@ class TTAMixin:
 
         # TTA adaptation loop
         # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
-        # inference_mode during testing, which cannot be overridden by set_grad_enabled
+        # inference_mode during testing, which cannot be overridden by set_grad_enabled.
+        # We must clone inputs OUTSIDE of the original inference context to create
+        # "normal" tensors that can be used with autograd.
 
         # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
         use_mps_fallback = self._tta_is_mps_device()
         original_device = None
+
+        # First, escape inference mode and create clean copies of inputs
+        # This is critical: tensors created in inference_mode cannot be used for autograd
+        with torch.inference_mode(False):
+            # Clone inputs to create normal (non-inference) tensors
+            features_for_tta = features.detach().clone().requires_grad_(False)
+            actions_for_tta = actions.detach().clone().requires_grad_(False)
+            states_for_tta = states.detach().clone().requires_grad_(False)
+            extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
+
         if use_mps_fallback:
             import logging
             log = logging.getLogger(__name__)
             log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
             original_device = next(self.model.parameters()).device
             self.model.to("cpu")
-            features = features.to("cpu")
-            actions = actions.to("cpu")
-            states = states.to("cpu")
-            if extrinsics is not None:
-                extrinsics = extrinsics.to("cpu")
+            features_for_tta = features_for_tta.to("cpu")
+            actions_for_tta = actions_for_tta.to("cpu")
+            states_for_tta = states_for_tta.to("cpu")
+            if extrinsics_for_tta is not None:
+                extrinsics_for_tta = extrinsics_for_tta.to("cpu")
             # Recreate optimizer with CPU parameters
             self._tta_optimizer = self._tta_create_optimizer()
 
@@ -401,14 +413,8 @@ class TTAMixin:
                 try:
                     with torch.inference_mode(False):
                         with torch.set_grad_enabled(True):
-                            # Clone inputs to detach from Lightning's inference context
-                            features_clone = features.clone()
-                            actions_clone = actions.clone()
-                            states_clone = states.clone()
-                            extrinsics_clone = extrinsics.clone() if extrinsics is not None else None
-
                             predictions, targets = self._tta_full_rollout(
-                                features_clone, actions_clone, states_clone, extrinsics_clone, detach=False
+                                features_for_tta, actions_for_tta, states_for_tta, extrinsics_for_tta, detach=False
                             )
 
                         # Perform TTA update using full rollout loss
@@ -474,74 +480,100 @@ class TTAMixin:
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
 
-        # Normalize features if enabled
-        h = features
-        if self.normalize_reps:
-            h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(
-                B, T_plus_1, N, D
-            )
+        # Escape inference mode and create clean copies of inputs for TTA
+        # This is critical: tensors created in inference_mode cannot be used for autograd
+        with torch.inference_mode(False):
+            features_for_tta = features.detach().clone().requires_grad_(False)
+            actions_for_tta = actions.detach().clone().requires_grad_(False)
+            states_for_tta = states.detach().clone().requires_grad_(False)
+            extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
 
-        # Initialize context
-        z_ar = h[:, :C, :, :].reshape(B, C * N, D)
+        # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
+        use_mps_fallback = self._tta_is_mps_device()
+        original_device = None
+        if use_mps_fallback:
+            import logging
+            log = logging.getLogger(__name__)
+            log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
+            original_device = next(self.model.parameters()).device
+            self.model.to("cpu")
+            features_for_tta = features_for_tta.to("cpu")
+            actions_for_tta = actions_for_tta.to("cpu")
+            states_for_tta = states_for_tta.to("cpu")
+            if extrinsics_for_tta is not None:
+                extrinsics_for_tta = extrinsics_for_tta.to("cpu")
+            # Recreate optimizer with CPU parameters
+            self._tta_optimizer = self._tta_create_optimizer()
 
-        # Store predictions
-        predictions_list: list[Tensor] = []
-        prev_pred: Tensor | None = None
+        try:
+            # Normalize features if enabled
+            h = features_for_tta
+            if self.normalize_reps:
+                h = F.layer_norm(features_for_tta.reshape(B, -1, D), (D,), eps=1e-6).reshape(
+                    B, T_plus_1, N, D
+                )
 
-        # Sequential processing with TTA
-        for step in range(T_pred):
-            target_idx = C + step
-            num_action_steps = C + step
+            # Initialize context
+            z_ar = h[:, :C, :, :].reshape(B, C * N, D)
 
-            step_actions = actions[:, :num_action_steps, :]
-            step_states = states[:, :num_action_steps, :]
-            step_extrinsics = (
-                extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
-            )
+            # Store predictions
+            predictions_list: list[Tensor] = []
+            prev_pred: Tensor | None = None
 
-            # Look-back adaptation (skip first step - no previous prediction)
-            # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
-            # inference_mode during testing, which cannot be overridden by set_grad_enabled
-            if prev_pred is not None and step > 0:
-                prev_target = h[:, target_idx - 1, :, :].clone()  # Ground-truth for prev prediction
+            # Sequential processing with TTA
+            for step in range(T_pred):
+                target_idx = C + step
+                num_action_steps = C + step
+
+                step_actions = actions_for_tta[:, :num_action_steps, :]
+                step_states = states_for_tta[:, :num_action_steps, :]
+                step_extrinsics = (
+                    extrinsics_for_tta[:, :num_action_steps, :] if extrinsics_for_tta is not None else None
+                )
+
+                # Look-back adaptation (skip first step - no previous prediction)
+                # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
+                # inference_mode during testing, which cannot be overridden by set_grad_enabled
+                if prev_pred is not None and step > 0:
+                    prev_target = h[:, target_idx - 1, :, :]  # Ground-truth for prev prediction
+                    with torch.inference_mode(False):
+                        self._tta_adapt(prev_pred, prev_target)
+
+                # Forward pass with gradients enabled for next adaptation
+                # Set LayerNorms to train mode for gradient flow
+                prev_ln_states = self._tta_set_ln_train_mode(True)
+                try:
+                    with torch.inference_mode(False):
+                        with torch.set_grad_enabled(True):
+                            z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
+                                z_ar, step_actions, step_states, step_extrinsics
+                            )
+                            z_pred = z_pred_full[:, -N:, :]  # Last frame only
+                finally:
+                    self._tta_restore_ln_train_mode(prev_ln_states)
+
+                # Store for next adaptation
+                prev_pred = z_pred
+                predictions_list.append(z_pred.detach())
+
+                # Update context (autoregressive)
+                z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
+
+            # Final adaptation with last ground-truth
+            if prev_pred is not None and T_pred > 0:
+                final_target = h[:, C + T_pred - 1, :, :]
                 with torch.inference_mode(False):
-                    self._tta_adapt(prev_pred.clone(), prev_target)
+                    self._tta_adapt(prev_pred, final_target)
 
-            # Forward pass with gradients enabled for next adaptation
-            # Set LayerNorms to train mode for gradient flow
-            prev_ln_states = self._tta_set_ln_train_mode(True)
-            try:
-                with torch.inference_mode(False):
-                    with torch.set_grad_enabled(True):
-                        # Clone inputs to detach from Lightning's inference context
-                        z_ar_clone = z_ar.clone()
-                        step_actions_clone = step_actions.clone()
-                        step_states_clone = step_states.clone()
-                        step_extrinsics_clone = step_extrinsics.clone() if step_extrinsics is not None else None
-
-                        z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                            z_ar_clone, step_actions_clone, step_states_clone, step_extrinsics_clone
-                        )
-                        z_pred = z_pred_full[:, -N:, :]  # Last frame only
-            finally:
-                self._tta_restore_ln_train_mode(prev_ln_states)
-
-            # Store for next adaptation
-            prev_pred = z_pred
-            predictions_list.append(z_pred.detach())
-
-            # Update context (autoregressive)
-            z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
-
-        # Final adaptation with last ground-truth
-        if prev_pred is not None and T_pred > 0:
-            final_target = h[:, C + T_pred - 1, :, :].clone()
-            with torch.inference_mode(False):
-                self._tta_adapt(prev_pred.clone(), final_target)
-
-        # Stack predictions and targets
-        predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
-        targets = h[:, C:C + T_pred, :, :].reshape(B, T_pred * N, D)
+            # Stack predictions and targets
+            predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
+            targets = h[:, C:C + T_pred, :, :].reshape(B, T_pred * N, D)
+        finally:
+            # Move back to MPS if we used the fallback
+            if use_mps_fallback and original_device is not None:
+                self.model.to(original_device)
+                # Recreate optimizer with MPS parameters
+                self._tta_optimizer = self._tta_create_optimizer()
 
         # Compute statistics
         stats = self._tta_get_clip_stats()
