@@ -153,6 +153,33 @@ class TTAMixin:
                 if bias_key in state:
                     module.bias.data.copy_(state[bias_key])
 
+    def _tta_set_ln_train_mode(self, training: bool) -> dict[str, bool]:
+        """Set LayerNorm modules to train/eval mode.
+
+        Args:
+            training: Whether to set train mode (True) or eval mode (False)
+
+        Returns:
+            Dict mapping module names to their previous training state
+        """
+        prev_states = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                prev_states[name] = module.training
+                module.train(training)
+        return prev_states
+
+    def _tta_restore_ln_train_mode(self, states: dict[str, bool]) -> None:
+        """Restore LayerNorm modules to their previous training state.
+
+        Args:
+            states: Dict mapping module names to their training state
+        """
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                if name in states:
+                    module.train(states[name])
+
     def _tta_create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer for TTA."""
         ln_params = self._tta_get_ln_params()
@@ -334,14 +361,19 @@ class TTAMixin:
 
         # TTA adaptation loop
         for adapt_step in range(num_adaptation_steps):
-            # Forward pass with gradients enabled
-            with torch.set_grad_enabled(True):
-                predictions, targets = self._tta_full_rollout(
-                    features, actions, states, extrinsics, detach=False
-                )
+            # Set LayerNorms to train mode and enable gradients for adaptation
+            prev_ln_states = self._tta_set_ln_train_mode(True)
+            try:
+                with torch.set_grad_enabled(True):
+                    predictions, targets = self._tta_full_rollout(
+                        features, actions, states, extrinsics, detach=False
+                    )
 
-            # Perform TTA update using full rollout loss
-            self._tta_adapt(predictions, targets)
+                # Perform TTA update using full rollout loss
+                self._tta_adapt(predictions, targets)
+            finally:
+                # Restore LayerNorm training states
+                self._tta_restore_ln_train_mode(prev_ln_states)
 
         # Final evaluation with adapted model (no gradients)
         with torch.no_grad():
@@ -425,11 +457,16 @@ class TTAMixin:
                 self._tta_adapt(prev_pred, prev_target)
 
             # Forward pass with gradients enabled for next adaptation
-            with torch.set_grad_enabled(True):
-                z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                    z_ar, step_actions, step_states, step_extrinsics
-                )
-                z_pred = z_pred_full[:, -N:, :]  # Last frame only
+            # Set LayerNorms to train mode for gradient flow
+            prev_ln_states = self._tta_set_ln_train_mode(True)
+            try:
+                with torch.set_grad_enabled(True):
+                    z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
+                        z_ar, step_actions, step_states, step_extrinsics
+                    )
+                    z_pred = z_pred_full[:, -N:, :]  # Last frame only
+            finally:
+                self._tta_restore_ln_train_mode(prev_ln_states)
 
             # Store for next adaptation
             prev_pred = z_pred
