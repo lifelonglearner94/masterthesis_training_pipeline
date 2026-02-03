@@ -194,6 +194,26 @@ class TTAMixin:
             pass
         return False
 
+    def _tta_make_ln_params_non_inference(self) -> None:
+        """Clone LayerNorm parameters to escape PyTorch Lightning's inference mode.
+
+        When Lightning runs test_step in inference_mode, model parameters become
+        "inference tensors" that cannot be used for backward passes. This method
+        clones the LayerNorm weight and bias to create regular tensors that can
+        participate in autograd.
+        """
+        with torch.inference_mode(False):
+            for module in self.model.modules():
+                if isinstance(module, nn.LayerNorm):
+                    # Clone weight and bias to create non-inference tensors
+                    # We need to use nn.Parameter to maintain the parameter status
+                    if module.weight is not None:
+                        new_weight = module.weight.data.clone()
+                        module.weight = nn.Parameter(new_weight, requires_grad=True)
+                    if module.bias is not None:
+                        new_bias = module.bias.data.clone()
+                        module.bias = nn.Parameter(new_bias, requires_grad=True)
+
     def _tta_create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer for TTA."""
         ln_params = self._tta_get_ln_params()
@@ -376,15 +396,21 @@ class TTAMixin:
         # TTA adaptation loop
         # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
         # inference_mode during testing, which cannot be overridden by set_grad_enabled.
-        # We must clone inputs OUTSIDE of the original inference context to create
-        # "normal" tensors that can be used with autograd.
+        # We must clone inputs AND LayerNorm parameters to create "normal" tensors
+        # that can be used with autograd.
+
+        # Clone LayerNorm parameters to escape inference mode
+        # This is critical: model parameters loaded in inference_mode cannot be used for backward
+        self._tta_make_ln_params_non_inference()
+
+        # Recreate optimizer with the new (non-inference) parameters
+        self._tta_optimizer = self._tta_create_optimizer()
 
         # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
         use_mps_fallback = self._tta_is_mps_device()
         original_device = None
 
-        # First, escape inference mode and create clean copies of inputs
-        # This is critical: tensors created in inference_mode cannot be used for autograd
+        # Escape inference mode and create clean copies of inputs
         with torch.inference_mode(False):
             # Clone inputs to create normal (non-inference) tensors
             features_for_tta = features.detach().clone().requires_grad_(False)
@@ -479,6 +505,13 @@ class TTAMixin:
         # Reset for new clip
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
+
+        # Clone LayerNorm parameters to escape inference mode
+        # This is critical: model parameters loaded in inference_mode cannot be used for backward
+        self._tta_make_ln_params_non_inference()
+
+        # Recreate optimizer with the new (non-inference) parameters
+        self._tta_optimizer = self._tta_create_optimizer()
 
         # Escape inference mode and create clean copies of inputs for TTA
         # This is critical: tensors created in inference_mode cannot be used for autograd
