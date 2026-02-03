@@ -194,25 +194,31 @@ class TTAMixin:
             pass
         return False
 
-    def _tta_make_ln_params_non_inference(self) -> None:
-        """Clone LayerNorm parameters to escape PyTorch Lightning's inference mode.
+    def _tta_make_model_params_non_inference(self) -> None:
+        """Clone ALL model parameters to escape PyTorch Lightning's inference mode.
 
         When Lightning runs test_step in inference_mode, model parameters become
         "inference tensors" that cannot be used for backward passes. This method
-        clones the LayerNorm weight and bias to create regular tensors that can
-        participate in autograd.
+        clones all parameters to create regular tensors. Only LayerNorm parameters
+        are made trainable for TTA.
+
+        This is necessary because intermediate activations computed with inference
+        tensors also become inference tensors and cannot be saved for backward.
         """
         with torch.inference_mode(False):
-            for module in self.model.modules():
-                if isinstance(module, nn.LayerNorm):
-                    # Clone weight and bias to create non-inference tensors
-                    # We need to use nn.Parameter to maintain the parameter status
-                    if module.weight is not None:
-                        new_weight = module.weight.data.clone()
-                        module.weight = nn.Parameter(new_weight, requires_grad=True)
-                    if module.bias is not None:
-                        new_bias = module.bias.data.clone()
-                        module.bias = nn.Parameter(new_bias, requires_grad=True)
+            for name, module in self.model.named_modules():
+                # Clone all parameters in this module (not recursively - just this module's own params)
+                for param_name, param in list(module._parameters.items()):
+                    if param is not None:
+                        new_param = param.data.clone()
+                        # Only LayerNorm parameters should be trainable
+                        requires_grad = isinstance(module, nn.LayerNorm)
+                        module._parameters[param_name] = nn.Parameter(new_param, requires_grad=requires_grad)
+
+                # Also clone buffers (like attn_mask, position embeddings, etc.)
+                for buffer_name, buffer in list(module._buffers.items()):
+                    if buffer is not None:
+                        module._buffers[buffer_name] = buffer.clone()
 
     def _tta_create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer for TTA."""
@@ -396,12 +402,12 @@ class TTAMixin:
         # TTA adaptation loop
         # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
         # inference_mode during testing, which cannot be overridden by set_grad_enabled.
-        # We must clone inputs AND LayerNorm parameters to create "normal" tensors
+        # We must clone ALL model parameters to create "normal" tensors
         # that can be used with autograd.
 
-        # Clone LayerNorm parameters to escape inference mode
+        # Clone ALL model parameters and buffers to escape inference mode
         # This is critical: model parameters loaded in inference_mode cannot be used for backward
-        self._tta_make_ln_params_non_inference()
+        self._tta_make_model_params_non_inference()
 
         # Recreate optimizer with the new (non-inference) parameters
         self._tta_optimizer = self._tta_create_optimizer()
@@ -506,9 +512,9 @@ class TTAMixin:
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
 
-        # Clone LayerNorm parameters to escape inference mode
+        # Clone ALL model parameters and buffers to escape inference mode
         # This is critical: model parameters loaded in inference_mode cannot be used for backward
-        self._tta_make_ln_params_non_inference()
+        self._tta_make_model_params_non_inference()
 
         # Recreate optimizer with the new (non-inference) parameters
         self._tta_optimizer = self._tta_create_optimizer()
