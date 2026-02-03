@@ -413,7 +413,17 @@ class TTAMixin:
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
 
-        # Store pre-adaptation loss for comparison
+        # Always initialize clip stats structure (even if not resetting parameters)
+        self._tta_clip_stats = {
+            "adaptation_losses": [],
+            "num_adaptations": 0,
+        }
+
+        # Store original device for MPS workaround
+        original_device = features.device
+        use_cpu_for_tta = str(original_device).startswith('mps')
+
+        # Store pre-adaptation loss for comparison (outside inference_mode(False))
         with torch.no_grad():
             pre_adapt_pred, targets = self._tta_full_rollout(
                 features, actions, states, extrinsics, detach=True
@@ -423,67 +433,52 @@ class TTAMixin:
         self._tta_clip_stats["pre_adapt_loss"] = pre_adapt_loss
 
         # TTA adaptation loop
-        # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
-        # inference_mode during testing, which cannot be overridden by set_grad_enabled.
-        # We must clone ALL model parameters to create "normal" tensors
-        # that can be used with autograd.
+        # NOTE: PyTorch Lightning uses inference_mode during testing, which creates
+        # "inference tensors" that cannot be used for backward passes.
+        # We MUST use torch.inference_mode(False) to escape this and enable gradients.
+        # Everything that needs gradients must happen INSIDE this context.
+        with torch.inference_mode(False):
+            # Determine target device for TTA (CPU if on MPS to avoid NaN gradients)
+            target_device = 'cpu' if use_cpu_for_tta else original_device
 
-        # Clone ALL model parameters and buffers to escape inference mode
-        # This is critical: model parameters loaded in inference_mode cannot be used for backward
-        self._tta_make_model_params_non_inference()
+            # Clone inputs INSIDE inference_mode(False) context to create non-inference tensors
+            features_for_tta = features.detach().clone().to(target_device)
+            actions_for_tta = actions.detach().clone().to(target_device)
+            states_for_tta = states.detach().clone().to(target_device)
+            extrinsics_for_tta = extrinsics.detach().clone().to(target_device) if extrinsics is not None else None
 
-        # Recreate optimizer with the new (non-inference) parameters
-        self._tta_optimizer = self._tta_create_optimizer()
-
-        # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
-        use_mps_fallback = self._tta_is_mps_device()
-        original_device = None
-
-        # Clone inputs - must be done after _tta_make_model_params_non_inference
-        # which enables grad mode internally
-        features_for_tta = features.detach().clone().requires_grad_(False)
-        actions_for_tta = actions.detach().clone().requires_grad_(False)
-        states_for_tta = states.detach().clone().requires_grad_(False)
-        extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
-
-        if use_mps_fallback:
-            import logging
-            log = logging.getLogger(__name__)
-            log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
-            original_device = next(self.model.parameters()).device
-            self.model.to("cpu")
-            features_for_tta = features_for_tta.to("cpu")
-            actions_for_tta = actions_for_tta.to("cpu")
-            states_for_tta = states_for_tta.to("cpu")
-            if extrinsics_for_tta is not None:
-                extrinsics_for_tta = extrinsics_for_tta.to("cpu")
-            # Recreate optimizer with CPU parameters
-            self._tta_optimizer = self._tta_create_optimizer()
-
-        try:
-            for adapt_step in range(num_adaptation_steps):
-                # Set LayerNorms to train mode and enable gradients for adaptation
-                prev_ln_states = self._tta_set_ln_train_mode(True)
-                try:
-                    # Grad mode was enabled in _tta_make_model_params_non_inference
-                    # Just do the forward pass and backward directly
-                    predictions, targets = self._tta_full_rollout(
-                        features_for_tta, actions_for_tta, states_for_tta, extrinsics_for_tta, detach=False
-                    )
-
-                    # Perform TTA update using full rollout loss
-                    self._tta_adapt(predictions, targets)
-                finally:
-                    # Restore LayerNorm training states
-                    self._tta_restore_ln_train_mode(prev_ln_states)
-        finally:
-            # Move back to MPS if we used the fallback
-            if use_mps_fallback and original_device is not None:
-                self.model.to(original_device)
-                # Recreate optimizer with MPS parameters
+            # Move model to CPU if using MPS workaround
+            if use_cpu_for_tta:
+                import logging
+                log = logging.getLogger(__name__)
+                log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
+                self.model.to('cpu')
+                # Recreate optimizer with CPU parameters
                 self._tta_optimizer = self._tta_create_optimizer()
 
-        # Final evaluation with adapted model (no gradients)
+            try:
+                for adapt_step in range(num_adaptation_steps):
+                    # Set LayerNorms to train mode for adaptation
+                    prev_ln_states = self._tta_set_ln_train_mode(True)
+                    try:
+                        # Forward pass (no detach - we need gradients)
+                        predictions, targets_tta = self._tta_full_rollout(
+                            features_for_tta, actions_for_tta, states_for_tta, extrinsics_for_tta, detach=False
+                        )
+
+                        # Perform TTA update using full rollout loss
+                        self._tta_adapt(predictions, targets_tta)
+                    finally:
+                        # Restore LayerNorm training states
+                        self._tta_restore_ln_train_mode(prev_ln_states)
+            finally:
+                # Move model back to original device if we used CPU workaround
+                if use_cpu_for_tta:
+                    self.model.to(original_device)
+                    # Recreate optimizer with original device parameters
+                    self._tta_optimizer = self._tta_create_optimizer()
+
+        # Final evaluation with adapted model (outside inference_mode(False), no gradients needed)
         with torch.no_grad():
             final_predictions, targets = self._tta_full_rollout(
                 features, actions, states, extrinsics, detach=True
