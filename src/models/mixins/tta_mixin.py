@@ -360,17 +360,20 @@ class TTAMixin:
         self._tta_clip_stats["pre_adapt_loss"] = pre_adapt_loss
 
         # TTA adaptation loop
+        # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
+        # inference_mode during testing, which cannot be overridden by set_grad_enabled
         for adapt_step in range(num_adaptation_steps):
             # Set LayerNorms to train mode and enable gradients for adaptation
             prev_ln_states = self._tta_set_ln_train_mode(True)
             try:
-                with torch.set_grad_enabled(True):
-                    predictions, targets = self._tta_full_rollout(
-                        features, actions, states, extrinsics, detach=False
-                    )
+                with torch.inference_mode(False):
+                    with torch.set_grad_enabled(True):
+                        predictions, targets = self._tta_full_rollout(
+                            features, actions, states, extrinsics, detach=False
+                        )
 
-                # Perform TTA update using full rollout loss
-                self._tta_adapt(predictions, targets)
+                    # Perform TTA update using full rollout loss
+                    self._tta_adapt(predictions, targets)
             finally:
                 # Restore LayerNorm training states
                 self._tta_restore_ln_train_mode(prev_ln_states)
@@ -452,19 +455,23 @@ class TTAMixin:
             )
 
             # Look-back adaptation (skip first step - no previous prediction)
+            # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
+            # inference_mode during testing, which cannot be overridden by set_grad_enabled
             if prev_pred is not None and step > 0:
                 prev_target = h[:, target_idx - 1, :, :]  # Ground-truth for prev prediction
-                self._tta_adapt(prev_pred, prev_target)
+                with torch.inference_mode(False):
+                    self._tta_adapt(prev_pred, prev_target)
 
             # Forward pass with gradients enabled for next adaptation
             # Set LayerNorms to train mode for gradient flow
             prev_ln_states = self._tta_set_ln_train_mode(True)
             try:
-                with torch.set_grad_enabled(True):
-                    z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                        z_ar, step_actions, step_states, step_extrinsics
-                    )
-                    z_pred = z_pred_full[:, -N:, :]  # Last frame only
+                with torch.inference_mode(False):
+                    with torch.set_grad_enabled(True):
+                        z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
+                            z_ar, step_actions, step_states, step_extrinsics
+                        )
+                        z_pred = z_pred_full[:, -N:, :]  # Last frame only
             finally:
                 self._tta_restore_ln_train_mode(prev_ln_states)
 
@@ -478,7 +485,8 @@ class TTAMixin:
         # Final adaptation with last ground-truth
         if prev_pred is not None and T_pred > 0:
             final_target = h[:, C + T_pred - 1, :, :]
-            self._tta_adapt(prev_pred, final_target)
+            with torch.inference_mode(False):
+                self._tta_adapt(prev_pred, final_target)
 
         # Stack predictions and targets
         predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
