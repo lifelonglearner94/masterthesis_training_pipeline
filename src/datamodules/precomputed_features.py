@@ -283,6 +283,7 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool | None = None,
         persistent_workers: bool = True,
+        shuffle_test: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the DataModule.
@@ -307,6 +308,8 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
                        If None, auto-detects based on CUDA availability.
             persistent_workers: Whether to keep worker processes alive between epochs.
                        Speeds up dataloader initialization. Requires num_workers > 0.
+            shuffle_test: Whether to shuffle the test dataloader. Default False.
+                       Set to False for TTA to ensure deterministic clip ordering.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -326,6 +329,8 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         self.pin_memory = pin_memory if pin_memory is not None else should_pin_memory()
         # persistent_workers requires num_workers > 0
         self.persistent_workers = persistent_workers and num_workers > 0
+        # shuffle_test for TTA compatibility
+        self.shuffle_test = shuffle_test
 
         self.train_dataset: PrecomputedFeaturesDataset | None = None
         self.val_dataset: PrecomputedFeaturesDataset | None = None
@@ -437,13 +442,17 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader:
-        """Create test DataLoader."""
+        """Create test DataLoader.
+
+        Uses shuffle_test parameter to control shuffling (default: False).
+        For TTA, shuffle should be disabled to ensure deterministic ordering.
+        """
         if self.test_dataset is None:
             raise RuntimeError("Test dataset not initialized. Call setup() first.")
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
+            shuffle=self.shuffle_test,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,

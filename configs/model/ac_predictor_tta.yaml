@@ -1,0 +1,94 @@
+# @package _global_
+
+# AC Predictor Model Configuration WITH TTA
+# Action-Conditioned Vision Transformer Predictor from V-JEPA2
+# This config extends the base ac_predictor with TTA settings
+#
+# IMPORTANT: num_timesteps refers to ENCODED timesteps from precomputed features,
+# NOT original video frames. For V-JEPA2 with tubelet_size=2:
+#   num_timesteps = original_frames // 2 (e.g., 16 frames -> 8 timesteps)
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.ac_predictor.ACPredictorModule
+
+  # Model architecture (same as base ac_predictor)
+  img_size: [256, 256]
+  patch_size: 16
+  num_timesteps: 8  # Encoded timesteps (16 original frames / tubelet_size=2)
+  embed_dim: 1024
+  predictor_embed_dim: 384
+  depth: 24
+  num_heads: 16
+  mlp_ratio: 4.0
+  action_embed_dim: 7  # 7D: position (3), orientation (3), gripper (1)
+  use_rope: true
+  is_frame_causal: true
+  use_activation_checkpointing: false
+  use_extrinsics: false
+
+  # Dropout / regularization
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # Loss settings (max T_teacher = num_timesteps - 1 = 7)
+  T_teacher: 7  # Teacher-forcing prediction steps
+  T_rollout: 7  # Rollout prediction steps (autoregressive)
+  context_frames: 1  # Number of ground-truth context frames for rollout
+  loss_weight_teacher: 0.0  # Disable teacher forcing during TTA testing
+  loss_weight_rollout: 1.0
+  normalize_reps: true  # Apply layer norm after predictor steps (V-JEPA2 paper)
+  loss_exp: 1.0  # Loss exponent: 1.0=L1, 2.0=L2 (paper uses L1)
+
+  # Curriculum learning disabled for testing
+  curriculum_schedule: null
+
+  # Optimizer settings (not used in test mode, but required for model init)
+  learning_rate: 1e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  warmup_epochs: 10
+  max_epochs: ${trainer.max_epochs}
+
+  # =============================================================================
+  # TEST TIME ADAPTATION (TTA) SETTINGS
+  # =============================================================================
+  # TTA adapts only LayerNorm parameters online during testing
+  # Uses full rollout loss as self-supervised signal
+
+  # Enable TTA for online adaptation
+  tta_enabled: true
+
+  # TTA MODE: How adaptation is performed
+  # - "full_rollout" (RECOMMENDED): Predict full sequence z₁→z₇, compute loss, adapt, then evaluate
+  # - "sequential": Step-by-step look-back adaptation (original TENT-style)
+  tta_mode: "full_rollout"
+
+  # Number of TTA update iterations per clip
+  # 1 = single adaptation pass (recommended for stability)
+  # Higher values may improve adaptation but risk overfitting to single sample
+  tta_num_adaptation_steps: 1
+
+  # Learning rate for TTA updates
+  # Conservative to prevent catastrophic forgetting
+  # Typical range: 1e-5 to 1e-3
+  tta_lr: 1e-4
+
+  # Gradient clipping norm for stability
+  # CRITICAL: Prevents gradient explosions and model collapse
+  tta_grad_clip: 1.0
+
+  # Per-clip reset mode
+  # true: Reset LayerNorm to checkpoint values after each clip (recommended)
+  # false: Accumulate adaptations across all clips (experimental)
+  tta_reset_per_clip: true
+
+  # Adaptation horizon (deprecated in full_rollout mode)
+  tta_adaptation_horizon: 1
+
+  # Optimizer type for TTA
+  tta_optimizer_type: "adam"  # "adam" or "adamw"
+  tta_optimizer_betas: [0.9, 0.999]

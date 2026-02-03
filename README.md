@@ -138,9 +138,11 @@ data_dir/
 
 ### Testing
 
-```bash
-make test
-```
+#### TTA Full rollout mode (recommended)
+uv run src/eval.py experiment=test_ac_predictor_tta \
+    model.tta_mode=full_rollout \
+    model.tta_num_adaptation_steps=1 \
+    ckpt_path=/path/to/checkpoint.ckpt
 
 ## 📁 Project Structure
 
@@ -171,34 +173,6 @@ make test
 
 This project uses [Hydra](https://hydra.cc/) for configuration management. The main config file is `configs/config.yaml`.
 
-### Running Experiments
-
-```bash
-# Override single parameters
-uv run src/train.py trainer.max_epochs=100
-
-# Use predefined experiments
-uv run src/train.py experiment=example
-
-# Multi-run with different seeds
-uv run src/train.py --multirun seed=42,123,456
-```
-
-### Hyperparameter Search
-
-```bash
-uv run src/train.py --multirun hparams_search=optuna
-```
-
-## 🐳 Docker
-
-```bash
-# Build image
-docker build -t hope-vit-research .
-
-# Run training
-docker run --gpus all hope-vit-research python src/train.py
-```
 
 ## 📊 Logging
 
@@ -208,7 +182,3 @@ Experiments are logged to [Weights & Biases](https://wandb.ai/). Set your API ke
 cp .env.example .env
 # Edit .env with your WANDB_API_KEY
 ```
-
-## 📝 License
-
-MIT

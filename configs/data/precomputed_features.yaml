@@ -36,3 +36,4 @@ batch_size: 64
 num_workers: 8
 pin_memory: true
 persistent_workers: true  # Keep workers alive between epochs (disable on MPS to save memory)
+shuffle_test: false  # Shuffle test dataloader (default: false, set false for TTA)

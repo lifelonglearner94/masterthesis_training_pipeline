@@ -10,9 +10,12 @@ Action-Conditioned Vision Transformer Predictor from V-JEPA2.
 
 from src.models.ac_predictor.ac_predictor import VisionTransformerPredictorAC, vit_ac_predictor
 from src.models.ac_predictor.lightning_module import ACPredictorModule
+from src.models.ac_predictor.tta_wrapper import RolloutTTAAgent, SequentialTTAProcessor
 
 __all__ = [
     "VisionTransformerPredictorAC",
     "vit_ac_predictor",
     "ACPredictorModule",
+    "RolloutTTAAgent",
+    "SequentialTTAProcessor",
 ]

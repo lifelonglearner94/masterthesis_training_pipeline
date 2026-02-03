@@ -1,0 +1,146 @@
+# @package _global_
+# =============================================================================
+# V-JEPA2 AC Predictor - TEST WITH TTA CONFIGURATION
+# =============================================================================
+# Use as: uv run src/eval.py experiment=test_ac_predictor_tta paths.data_dir=/path/to/your/clips ckpt_path=/path/to/checkpoint.ckpt
+#
+# This config is for evaluating a trained model with TEST TIME ADAPTATION (TTA).
+# TTA adapts LayerNorm parameters online using single-step rollout loss.
+#
+# Test clips: 22000-22999 (1000 clips total)
+#
+# TTA MECHANISM:
+#   - Freeze all model weights except LayerNorm parameters
+#   - Use "look-back" scheme: predict z_{t+1}, wait for GT, adapt, predict z_{t+2}
+#   - L1 loss as self-supervised signal
+#   - Per-clip reset restores original weights between clips
+#
+# TEMPORAL DIMENSIONS:
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Context frames: 1 (ground-truth z₀)
+#   - Prediction steps: 7 (autoregressive z₁→z₇)
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: null  # Disable default callbacks (no checkpointing needed for testing)
+  - override /logger: wandb  # Enable W&B for testing by default
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "test_ac_predictor_tta"
+tags: ["vjepa2", "ac_predictor", "test", "evaluation", "tta", "test_time_adaptation"]
+seed: 42
+train: False
+test: True
+
+# =============================================================================
+# CALLBACKS: Minimal callbacks for testing (progress bar only)
+# =============================================================================
+callbacks:
+  rich_progress:
+    _target_: lightning.pytorch.callbacks.RichProgressBar
+
+# =============================================================================
+# DATA: Test clip range with shuffle disabled for TTA
+# =============================================================================
+data:
+  batch_size: 1  # Process clips individually for per-clip TTA
+  num_workers: 4
+  pin_memory: true
+  # Test clips: 22000-22999 (exclusive end)
+  clip_start: 22000
+  clip_end: 23000
+  val_split: 0.0  # No validation split for testing
+  shuffle_test: false  # CRITICAL: Disable shuffle for sequential TTA processing
+
+# =============================================================================
+# MODEL: TTA-enabled configuration
+# =============================================================================
+model:
+  # --- Rollout configuration for testing ---
+  T_rollout: 7                     # Predict 7 timesteps autoregressively (z₁→z₇)
+  context_frames: 1                # Use 1 ground-truth context frame (z₀)
+  T_teacher: 7                     # Teacher forcing for comparison
+  use_activation_checkpointing: false
+
+  # --- Model architecture (must match trained model) ---
+  action_embed_dim: 2              # 2D actions for this dataset
+
+  # --- Loss weights (for test metrics) ---
+  loss_weight_teacher: 0
+  loss_weight_rollout: 1.0
+
+  # --- Curriculum disabled for testing ---
+  curriculum_schedule: null
+
+  # =============================================================================
+  # TEST TIME ADAPTATION (TTA) SETTINGS
+  # =============================================================================
+  # Enable TTA for online adaptation during testing
+  tta_enabled: true
+
+  # TTA MODE: How adaptation is performed
+  # - "full_rollout" (RECOMMENDED): Predict full sequence z₁→z₇, compute loss, adapt, then evaluate
+  # - "sequential": Step-by-step look-back adaptation (original TENT-style)
+  tta_mode: "full_rollout"
+
+  # Number of TTA update iterations per clip
+  # 1 = single adaptation pass (recommended for stability)
+  # Higher values may improve adaptation but risk overfitting
+  tta_num_adaptation_steps: 1
+
+  # TTA learning rate (conservative to prevent catastrophic forgetting)
+  # Range: 1e-5 to 1e-3, recommended: 1e-4
+  tta_lr: 1e-4
+
+  # Gradient clipping norm (CRITICAL for stability)
+  # Prevents catastrophic collapse from gradient spikes
+  tta_grad_clip: 1.0
+
+  # Per-clip reset: restore original LayerNorm weights after each clip
+  # true = each clip gets fresh adaptation (recommended)
+  # false = accumulate adaptations across clips (experimental)
+  tta_reset_per_clip: true
+
+  # Adaptation horizon (deprecated in full_rollout mode, uses T_rollout instead)
+  tta_adaptation_horizon: 1
+
+  # Optimizer settings for TTA
+  tta_optimizer_type: "adam"  # "adam" or "adamw"
+  tta_optimizer_betas: [0.9, 0.999]
+
+# =============================================================================
+# TRAINER: Test mode settings
+# =============================================================================
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: 32
+  # Disable training-related features
+  max_epochs: 0
+  enable_checkpointing: false
+  enable_progress_bar: true
+
+# =============================================================================
+# CHECKPOINT PATH (override on command line)
+# =============================================================================
+# Example: uv run src/eval.py experiment=test_ac_predictor_tta ckpt_path=outputs/2026-01-21/14-15-04/checkpoints/last.ckpt
+ckpt_path: null
+
+# =============================================================================
+# TEST OUTPUT SETTINGS
+# =============================================================================
+test_output:
+  # Export detailed per-clip results to JSON (includes TTA stats)
+  export_results: true
+  # Output directory for test results (default: same as checkpoint dir)
+  output_dir: null
+  # Include per-timestep loss breakdown
+  per_timestep_breakdown: true
+  # Number of worst-performing clips to report
+  num_worst_clips: 10

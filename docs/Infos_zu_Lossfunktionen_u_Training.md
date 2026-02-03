@@ -54,18 +54,24 @@ Das bedeutet: Berechne den absoluten Unterschied (L1-Norm) zwischen dem *vorherg
 
 #### B. Rollout Loss (Gleichung 3 & Abb. 6 Rechts)
 
-* **Konzept:** Hier muss das Modell "alleine laufen". Um den Zeitschritt  vorherzusagen, muss es seine *eigene Vorhersage* von  als Input nutzen.
-* **Der Text:** *"...denote the final predicted state representation obtained by autoregressively running V-JEPA..."*
-Autoregressiv heißt: Der Output von heute ist der Input von morgen.
-* **Gleichung (3):**
+Goal: The authors compute a two-step rollout loss to improve the model's ability to perform autoregressive rollouts during inference (predicting future states step-by-step).
+Model Context: The method involves running V-JEPA 2-AC autoregressively.
+Definitions:
+$P_\phi(\hat{a}_{1:T}; s_k, z_k)$ represents the final predicted state representation (in dimensions $\mathbb{R}^{H \times W \times D}$).
+It takes an action sequence $(\hat{a}_i)_{i \in [T]}$ starting from an initial state $(s_k, z_k)$.
+Parameters:
+While $T=15$ is mentioned earlier in the text, for the specific computation of the rollout loss, they use $T = 2$ in practice.
+This configuration ensures they only differentiate the predictor through one recurrent step.
+Rollout Loss Formula
+The exact formula for the rollout loss, denoted as equation (3) in the text, is:
 
+$$\mathcal{L}_{\text{rollout}}(\phi) := \|P_\phi(a_{1:T}, s_1, z_1) - z_{T+1}\|_1$$
+Where:
+$\mathcal{L}_{\text{rollout}}(\phi)$ is the loss function.
+$P_\phi(a_{1:T}, s_1, z_1)$ is the predicted state after $T$ steps given the action sequence $a_{1:T}$ and starting state $s_1, z_1$.
+$z_{T+1}$ is the actual target state at step $T+1$.
+$\|\cdot\|_1$ denotes the L1 norm (Manhattan distance).
 
-
-Hier wird geschaut, ob das Modell nach mehreren Schritten "Blindflug" (nur auf eigenen Vorhersagen basierend) immer noch dort landet, wo die Realität () ist.
-* **In Abbildung 6 (Rechts):**
-* Schau dir die **diagonalen lila Pfeile** an.
-* Die Vorhersage  (oben) wird *nach unten* gezogen und wird zum Input für den nächsten Schritt. Es wird nicht mehr das echte graue  benutzt!
-* Das zwingt das Modell, stabil zu bleiben und Fehler nicht aufzuschaukeln (Error Accumulation).
 
 
 * **Praxis-Detail:** Im Text steht *"In practice we use T=2"*. Das heißt, sie machen diesen "Blindflug" im Training nur über 2 Schritte, um Rechenleistung zu sparen, obwohl die Grafik es für 4 Schritte () illustriert.

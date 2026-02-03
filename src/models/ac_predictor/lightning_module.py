@@ -30,22 +30,23 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.models.ac_predictor.ac_predictor import vit_ac_predictor
-from src.models.mixins import ACPredictorLossMixin
+from src.models.mixins import ACPredictorLossMixin, TTAMixin
 
 
 # Type alias for test results
 TestResultsDict = dict[str, Any]
 
 
-class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
+class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     """PyTorch Lightning module for Action-Conditioned Vision Transformer Predictor.
 
     This module wraps the VisionTransformerPredictorAC and implements:
     - Teacher-forcing loss: predicts next latent from context, averaged over T steps
     - Rollout loss: enforces consistency over multiple recurrent prediction steps
+    - Test Time Adaptation (TTA): online adaptation using rollout prediction error
 
     Inherits loss computation methods from ACPredictorLossMixin for code reuse
-    with baseline models.
+    with baseline models. TTAMixin provides TTA capabilities for test-time adaptation.
 
     Expected batch format:
         - features: [B, T+1, N, D] - Pre-computed V-JEPA2 encoder features for T+1 timesteps
@@ -56,6 +57,11 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
         - T is the number of encoded timesteps (e.g., 8 for 16 original frames with tubelet_size=2)
         - N is the number of patches per frame (H*W)
         - D is the embedding dimension
+
+    TTA Mode (enabled via tta_enabled=True):
+        - Adapts LayerNorm parameters online during testing
+        - Uses single-step rollout loss as self-supervised signal
+        - Per-clip reset restores original weights between clips
 
     Note: num_timesteps refers to the ENCODED temporal dimension of precomputed features,
     NOT the original video frame count.
@@ -103,10 +109,33 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
         constant_pct: float = 0.83,
         decay_pct: float = 0.085,
         warmup_start_lr: float = 7.5e-5,
+        # Test Time Adaptation (TTA) settings
+        tta_enabled: bool = False,
+        tta_lr: float = 1e-4,
+        tta_grad_clip: float = 1.0,
+        tta_reset_per_clip: bool = True,
+        tta_adaptation_horizon: int = 1,
+        tta_optimizer_type: str = "adam",
+        tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
+        tta_mode: str = "full_rollout",
+        tta_num_adaptation_steps: int = 1,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+
+        # Initialize TTA configuration (from TTAMixin)
+        self._init_tta(
+            tta_enabled=tta_enabled,
+            tta_lr=tta_lr,
+            tta_grad_clip=tta_grad_clip,
+            tta_reset_per_clip=tta_reset_per_clip,
+            tta_adaptation_horizon=tta_adaptation_horizon,
+            tta_optimizer_type=tta_optimizer_type,
+            tta_optimizer_betas=tta_optimizer_betas,
+            tta_mode=tta_mode,
+            tta_num_adaptation_steps=tta_num_adaptation_steps,
+        )
 
         # Store num_timesteps for validation
         self.num_timesteps = num_timesteps
@@ -363,6 +392,9 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
 
         Computes rollout losses with per-timestep breakdown and stores results
         for aggregation in on_test_epoch_end.
+
+        If TTA is enabled (tta_enabled=True), performs online adaptation using
+        the look-back scheme before computing final predictions.
         """
         import logging
         log = logging.getLogger(__name__)
@@ -381,6 +413,13 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
         else:
             B = features.shape[0]
 
+        # TTA-enabled test step: process each sample in batch individually for per-clip adaptation
+        if self.tta_enabled:
+            return self._test_step_with_tta(
+                features, actions, states, extrinsics, clip_names, batch_idx
+            )
+
+        # Standard test step (no TTA)
         # Compute teacher forcing loss (for comparison)
         loss_teacher = self._compute_teacher_forcing_loss(features, actions, states, extrinsics)
 
@@ -418,9 +457,118 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
 
         return loss
 
+    def _test_step_with_tta(
+        self,
+        features: Tensor,
+        actions: Tensor,
+        states: Tensor,
+        extrinsics: Tensor | None,
+        clip_names: list[str],
+        batch_idx: int,
+    ) -> Tensor:
+        """Test step with Test Time Adaptation.
+
+        Processes each sample in the batch individually to allow per-clip TTA.
+        Uses the look-back scheme from TTAMixin to adapt LayerNorm parameters.
+
+        Args:
+            features: [B, T+1, N, D] - Full sequence features
+            actions: [B, T, action_dim] - Actions
+            states: [B, T, action_dim] - States
+            extrinsics: [B, T, action_dim-1] - Optional
+            clip_names: List of clip identifiers
+            batch_idx: Batch index for logging
+
+        Returns:
+            Combined loss tensor
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        B, T_plus_1, N, D = features.shape
+        C = self.context_frames
+        T_pred = min(T_plus_1 - C, self.T_rollout)
+
+        all_losses = []
+        all_per_timestep_losses: list[list[float]] = [[] for _ in range(T_pred)]
+
+        # Process each sample individually for per-clip TTA
+        for i in range(B):
+            # Extract single sample
+            sample_features = features[i:i+1]  # [1, T+1, N, D]
+            sample_actions = actions[i:i+1]
+            sample_states = states[i:i+1]
+            sample_extrinsics = extrinsics[i:i+1] if extrinsics is not None else None
+            clip_name = clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}"
+
+            # Process with TTA (from TTAMixin)
+            # Choose TTA mode based on configuration
+            if self.tta_mode == "full_rollout":
+                predictions, targets, tta_stats = self._tta_process_clip_full_rollout(
+                    sample_features, sample_actions, sample_states, sample_extrinsics,
+                    num_adaptation_steps=self.tta_num_adaptation_steps,
+                )
+            else:  # "sequential" mode
+                predictions, targets, tta_stats = self._tta_process_clip_sequential(
+                    sample_features, sample_actions, sample_states, sample_extrinsics
+                )
+
+            # Compute loss for this sample
+            sample_loss = self._compute_loss(predictions, targets)
+            all_losses.append(sample_loss.item())
+
+            # Compute per-timestep losses for analysis
+            per_step_losses = {}
+            for step in range(T_pred):
+                step_pred = predictions[:, step*N:(step+1)*N, :]
+                step_target = targets[:, step*N:(step+1)*N, :]
+                step_loss = self._compute_loss(step_pred, step_target)
+                per_step_losses[f"step_{C + step}"] = step_loss.item()
+                all_per_timestep_losses[step].append(step_loss.item())
+
+            # Store result
+            clip_result: TestResultsDict = {
+                "clip_name": clip_name,
+                "loss_rollout": sample_loss.item(),
+                "loss_teacher": 0.0,  # Not computed in TTA mode
+                "per_timestep_losses": per_step_losses,
+                "tta_stats": tta_stats,
+            }
+            self._test_results.append(clip_result)
+
+        # Compute batch-level metrics
+        loss_rollout = sum(all_losses) / len(all_losses)
+
+        # Log metrics
+        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/tta_enabled", 1.0, sync_dist=True)
+        self.log("test/tta_mode", 1.0 if self.tta_mode == "full_rollout" else 0.0, sync_dist=True)
+
+        # Log per-timestep losses
+        for step in range(T_pred):
+            step_mean = sum(all_per_timestep_losses[step]) / len(all_per_timestep_losses[step])
+            self.log(f"test/loss_step_{C + step}", step_mean, sync_dist=True)
+
+        return torch.tensor(loss_rollout, device=features.device)
+
     def on_test_epoch_start(self) -> None:
-        """Clear test results at the start of test epoch."""
+        """Clear test results and configure TTA at the start of test epoch."""
         self._test_results = []
+
+        # Configure TTA if enabled
+        if self.tta_enabled:
+            self._tta_configure_params()
+            self._tta_original_ln_state = self._tta_save_ln_state()
+            self._tta_all_clip_stats = []
+
+            import logging
+            log = logging.getLogger(__name__)
+            log.info(
+                f"[TTA] Test epoch started with TTA enabled. "
+                f"LR={self.tta_lr}, grad_clip={self.tta_grad_clip}, "
+                f"reset_per_clip={self.tta_reset_per_clip}"
+            )
 
     def on_test_epoch_end(self) -> None:
         """Aggregate test results and output summary.
@@ -494,6 +642,23 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
         for i, clip in enumerate(best_clips, 1):
             print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
 
+        # Print TTA statistics if enabled
+        if self.tta_enabled:
+            tta_epoch_stats = self._tta_get_epoch_stats()
+            print(f"\n🔄 TEST TIME ADAPTATION (TTA) STATISTICS")
+            print("-" * 50)
+            print(f"  TTA Enabled: Yes")
+            print(f"  TTA Mode: {self.tta_mode}")
+            print(f"  Adaptation Steps: {self.tta_num_adaptation_steps}")
+            print(f"  Learning Rate: {self.tta_lr}")
+            print(f"  Gradient Clip: {self.tta_grad_clip}")
+            print(f"  Reset Per Clip: {self.tta_reset_per_clip}")
+            print(f"  Total Clips: {tta_epoch_stats.get('total_clips', 0)}")
+            print(f"  Total Adaptations: {tta_epoch_stats.get('total_adaptations', 0)}")
+            print(f"  Mean Pre-Adapt Loss: {tta_epoch_stats.get('mean_pre_adapt_loss', 0):.6f}")
+            print(f"  Mean Post-Adapt Loss: {tta_epoch_stats.get('mean_post_adapt_loss', 0):.6f}")
+            print(f"  Mean Improvement: {tta_epoch_stats.get('mean_improvement', 0):.6f}")
+
         print("\n" + "=" * 70)
 
         # Export to JSON if configured
@@ -514,6 +679,7 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
                     "num_clips": num_clips,
                     "context_frames": self.context_frames,
                     "T_rollout": self.T_rollout,
+                    "tta_enabled": self.tta_enabled,
                     "rollout_loss": {
                         "mean": mean_loss,
                         "median": median_loss,
@@ -527,6 +693,16 @@ class ACPredictorModule(ACPredictorLossMixin, L.LightningModule):
                 "best_clips": best_clips,
                 "all_clips": self._test_results,
             }
+
+            # Add TTA statistics if enabled
+            if self.tta_enabled:
+                export_data["summary"]["tta_config"] = {
+                    "lr": self.tta_lr,
+                    "grad_clip": self.tta_grad_clip,
+                    "reset_per_clip": self.tta_reset_per_clip,
+                    "adaptation_horizon": self.tta_adaptation_horizon,
+                }
+                export_data["summary"]["tta_stats"] = self._tta_get_epoch_stats()
 
             try:
                 results_file.parent.mkdir(parents=True, exist_ok=True)
