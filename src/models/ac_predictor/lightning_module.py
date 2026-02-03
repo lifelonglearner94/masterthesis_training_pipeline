@@ -536,6 +536,13 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             }
             self._test_results.append(clip_result)
 
+            # Log TTA metrics per-clip for wandb visualization
+            clip_idx = batch_idx * B + i
+            self.log("test/tta_pre_adapt_loss", tta_stats.get("pre_adapt_loss", 0.0), sync_dist=True)
+            self.log("test/tta_post_adapt_loss", tta_stats.get("post_adapt_loss", 0.0), sync_dist=True)
+            self.log("test/tta_improvement", tta_stats.get("improvement", 0.0), sync_dist=True)
+            self.log("test/tta_num_adaptations", float(tta_stats.get("num_adaptations", 0)), sync_dist=True)
+
         # Compute batch-level metrics
         loss_rollout = sum(all_losses) / len(all_losses)
 
@@ -666,6 +673,12 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             print(f"  Mean Pre-Adapt Loss: {tta_epoch_stats.get('mean_pre_adapt_loss', 0):.6f}")
             print(f"  Mean Post-Adapt Loss: {tta_epoch_stats.get('mean_post_adapt_loss', 0):.6f}")
             print(f"  Mean Improvement: {tta_epoch_stats.get('mean_improvement', 0):.6f}")
+
+            # Log TTA epoch-level statistics to wandb
+            self.log("test/tta_epoch_mean_pre_adapt_loss", tta_epoch_stats.get("mean_pre_adapt_loss", 0.0), sync_dist=True)
+            self.log("test/tta_epoch_mean_post_adapt_loss", tta_epoch_stats.get("mean_post_adapt_loss", 0.0), sync_dist=True)
+            self.log("test/tta_epoch_mean_improvement", tta_epoch_stats.get("mean_improvement", 0.0), sync_dist=True)
+            self.log("test/tta_epoch_total_adaptations", float(tta_epoch_stats.get("total_adaptations", 0)), sync_dist=True)
 
         print("\n" + "=" * 70)
 

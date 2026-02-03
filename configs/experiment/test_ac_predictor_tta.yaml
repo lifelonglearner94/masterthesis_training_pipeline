@@ -117,7 +117,7 @@ model:
   tta_adaptation_horizon: 1
 
   # Optimizer settings for TTA
-  tta_optimizer_type: "adam"  # "adam" or "adamw"
+  tta_optimizer_type: "adamw"  # "adam" or "adamw"
   tta_optimizer_betas: [0.9, 0.999]
 
 # =============================================================================
