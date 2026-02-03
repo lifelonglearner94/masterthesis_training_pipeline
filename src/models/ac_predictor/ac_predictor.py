@@ -190,7 +190,8 @@ class VisionTransformerPredictorAC(nn.Module):
         log.debug(f"    [AC_PREDICTOR] After interleaving action tokens: {x.shape}")
 
         cond_tokens = 3 if self.use_extrinsics else 2
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        # Clone attn_mask to prevent inference tensor conflicts during TTA backward pass
+        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True).clone()
         log.debug(f"    [AC_PREDICTOR] Attention mask shape: {attn_mask.shape}")
 
         # Fwd prop through transformer blocks

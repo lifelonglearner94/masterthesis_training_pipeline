@@ -180,6 +180,20 @@ class TTAMixin:
                 if name in states:
                     module.train(states[name])
 
+    def _tta_is_mps_device(self) -> bool:
+        """Check if the model is on an MPS (Apple Metal) device.
+
+        MPS has known bugs with LayerNorm backward that produce NaN gradients,
+        so we need to fall back to CPU during TTA adaptation.
+        """
+        try:
+            # Check first parameter's device
+            for param in self.model.parameters():
+                return param.device.type == "mps"
+        except StopIteration:
+            pass
+        return False
+
     def _tta_create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer for TTA."""
         ln_params = self._tta_get_ln_params()
@@ -362,21 +376,52 @@ class TTAMixin:
         # TTA adaptation loop
         # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
         # inference_mode during testing, which cannot be overridden by set_grad_enabled
-        for adapt_step in range(num_adaptation_steps):
-            # Set LayerNorms to train mode and enable gradients for adaptation
-            prev_ln_states = self._tta_set_ln_train_mode(True)
-            try:
-                with torch.inference_mode(False):
-                    with torch.set_grad_enabled(True):
-                        predictions, targets = self._tta_full_rollout(
-                            features, actions, states, extrinsics, detach=False
-                        )
 
-                    # Perform TTA update using full rollout loss
-                    self._tta_adapt(predictions, targets)
-            finally:
-                # Restore LayerNorm training states
-                self._tta_restore_ln_train_mode(prev_ln_states)
+        # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
+        use_mps_fallback = self._tta_is_mps_device()
+        original_device = None
+        if use_mps_fallback:
+            import logging
+            log = logging.getLogger(__name__)
+            log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
+            original_device = next(self.model.parameters()).device
+            self.model.to("cpu")
+            features = features.to("cpu")
+            actions = actions.to("cpu")
+            states = states.to("cpu")
+            if extrinsics is not None:
+                extrinsics = extrinsics.to("cpu")
+            # Recreate optimizer with CPU parameters
+            self._tta_optimizer = self._tta_create_optimizer()
+
+        try:
+            for adapt_step in range(num_adaptation_steps):
+                # Set LayerNorms to train mode and enable gradients for adaptation
+                prev_ln_states = self._tta_set_ln_train_mode(True)
+                try:
+                    with torch.inference_mode(False):
+                        with torch.set_grad_enabled(True):
+                            # Clone inputs to detach from Lightning's inference context
+                            features_clone = features.clone()
+                            actions_clone = actions.clone()
+                            states_clone = states.clone()
+                            extrinsics_clone = extrinsics.clone() if extrinsics is not None else None
+
+                            predictions, targets = self._tta_full_rollout(
+                                features_clone, actions_clone, states_clone, extrinsics_clone, detach=False
+                            )
+
+                        # Perform TTA update using full rollout loss
+                        self._tta_adapt(predictions, targets)
+                finally:
+                    # Restore LayerNorm training states
+                    self._tta_restore_ln_train_mode(prev_ln_states)
+        finally:
+            # Move back to MPS if we used the fallback
+            if use_mps_fallback and original_device is not None:
+                self.model.to(original_device)
+                # Recreate optimizer with MPS parameters
+                self._tta_optimizer = self._tta_create_optimizer()
 
         # Final evaluation with adapted model (no gradients)
         with torch.no_grad():
@@ -458,9 +503,9 @@ class TTAMixin:
             # NOTE: We need torch.inference_mode(False) because PyTorch Lightning uses
             # inference_mode during testing, which cannot be overridden by set_grad_enabled
             if prev_pred is not None and step > 0:
-                prev_target = h[:, target_idx - 1, :, :]  # Ground-truth for prev prediction
+                prev_target = h[:, target_idx - 1, :, :].clone()  # Ground-truth for prev prediction
                 with torch.inference_mode(False):
-                    self._tta_adapt(prev_pred, prev_target)
+                    self._tta_adapt(prev_pred.clone(), prev_target)
 
             # Forward pass with gradients enabled for next adaptation
             # Set LayerNorms to train mode for gradient flow
@@ -468,8 +513,14 @@ class TTAMixin:
             try:
                 with torch.inference_mode(False):
                     with torch.set_grad_enabled(True):
+                        # Clone inputs to detach from Lightning's inference context
+                        z_ar_clone = z_ar.clone()
+                        step_actions_clone = step_actions.clone()
+                        step_states_clone = step_states.clone()
+                        step_extrinsics_clone = step_extrinsics.clone() if step_extrinsics is not None else None
+
                         z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                            z_ar, step_actions, step_states, step_extrinsics
+                            z_ar_clone, step_actions_clone, step_states_clone, step_extrinsics_clone
                         )
                         z_pred = z_pred_full[:, -N:, :]  # Last frame only
             finally:
@@ -484,9 +535,9 @@ class TTAMixin:
 
         # Final adaptation with last ground-truth
         if prev_pred is not None and T_pred > 0:
-            final_target = h[:, C + T_pred - 1, :, :]
+            final_target = h[:, C + T_pred - 1, :, :].clone()
             with torch.inference_mode(False):
-                self._tta_adapt(prev_pred, final_target)
+                self._tta_adapt(prev_pred.clone(), final_target)
 
         # Stack predictions and targets
         predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
