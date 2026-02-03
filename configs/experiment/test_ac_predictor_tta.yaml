@@ -39,11 +39,17 @@ train: False
 test: True
 
 # =============================================================================
-# CALLBACKS: Minimal callbacks for testing (progress bar only)
+# CALLBACKS: Minimal callbacks for testing (progress bar + last checkpoint)
 # =============================================================================
 callbacks:
   rich_progress:
     _target_: lightning.pytorch.callbacks.RichProgressBar
+  model_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "last"
+    save_last: true
+    save_top_k: 0  # Don't save based on metrics, only save last
 
 # =============================================================================
 # DATA: Test clip range with shuffle disabled for TTA
@@ -123,7 +129,7 @@ trainer:
   precision: 32
   # Disable training-related features
   max_epochs: 0
-  enable_checkpointing: false
+  enable_checkpointing: true
   enable_progress_bar: true
 
 # =============================================================================
