@@ -105,7 +105,7 @@ model:
   # Per-clip reset: restore original LayerNorm weights after each clip
   # true = each clip gets fresh adaptation (recommended)
   # false = accumulate adaptations across clips (experimental)
-  tta_reset_per_clip: true
+  tta_reset_per_clip: false
 
   # Adaptation horizon (deprecated in full_rollout mode, uses T_rollout instead)
   tta_adaptation_horizon: 1
