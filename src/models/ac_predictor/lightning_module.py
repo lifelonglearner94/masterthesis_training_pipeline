@@ -562,6 +562,14 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             self._tta_original_ln_state = self._tta_save_ln_state()
             self._tta_all_clip_stats = []
 
+            # Initialize optimizer once at epoch start
+            # (will be reset per-clip if tta_reset_per_clip=True)
+            self._tta_optimizer = self._tta_create_optimizer()
+            self._tta_clip_stats = {
+                "adaptation_losses": [],
+                "num_adaptations": 0,
+            }
+
             import logging
             log = logging.getLogger(__name__)
             log.info(
