@@ -66,6 +66,7 @@ class TTAMixin:
         tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
         tta_mode: str = "full_rollout",
         tta_num_adaptation_steps: int = 1,
+        tta_adapt_layers: str = "layernorm",  # Which layers to adapt
     ) -> None:
         """Initialize TTA configuration.
 
@@ -83,6 +84,11 @@ class TTAMixin:
                 - "full_rollout": Predict full sequence, compute loss, adapt, then evaluate
                 - "sequential": Step-by-step look-back adaptation (original TENT-style)
             tta_num_adaptation_steps: Number of TTA update iterations per clip (default: 1)
+            tta_adapt_layers: Which layers to adapt during TTA. Options:
+                - "layernorm": Only LayerNorm γ and β (default, ~0.1% params)
+                - "layernorm+attn_proj": LayerNorm + attention output projections (~1-2% params)
+                - "layernorm+bias": LayerNorm + all bias terms (~0.5% params)
+                - "layernorm+mlp_out": LayerNorm + MLP output layers (~3-5% params)
         """
         self.tta_enabled = tta_enabled
         self.tta_lr = tta_lr
@@ -93,6 +99,7 @@ class TTAMixin:
         self.tta_optimizer_betas = tta_optimizer_betas
         self.tta_mode = tta_mode
         self.tta_num_adaptation_steps = tta_num_adaptation_steps
+        self.tta_adapt_layers = tta_adapt_layers
 
         # Internal state (initialized in on_test_start)
         self._tta_optimizer = None
@@ -101,57 +108,92 @@ class TTAMixin:
         self._tta_all_clip_stats: list[dict[str, Any]] = []
 
     def _tta_configure_params(self) -> None:
-        """Configure trainable parameters for TTA (LayerNorm only)."""
+        """Configure trainable parameters for TTA based on tta_adapt_layers setting."""
         if not self.tta_enabled:
             return
 
         # Freeze all parameters
         self.model.requires_grad_(False)
 
-        # Unfreeze LayerNorm parameters
-        num_ln_params = 0
+        num_adapted_params = 0
+        adapted_layer_types = []
+
+        # Always unfreeze LayerNorm parameters
         for module in self.model.modules():
             if isinstance(module, nn.LayerNorm):
                 for param in module.parameters():
                     param.requires_grad = True
-                    num_ln_params += param.numel()
+                    num_adapted_params += param.numel()
+        adapted_layer_types.append("LayerNorm")
+
+        # Additional layers based on tta_adapt_layers setting
+        if "attn_proj" in self.tta_adapt_layers:
+            # Unfreeze attention output projections (attn.proj)
+            for name, module in self.model.named_modules():
+                if name.endswith(".attn.proj") or name.endswith(".attn") and hasattr(module, 'proj'):
+                    # Handle both direct .proj and Attention module with .proj attribute
+                    if hasattr(module, 'proj'):
+                        proj = module.proj
+                    else:
+                        proj = module
+                    if isinstance(proj, nn.Linear):
+                        for param in proj.parameters():
+                            param.requires_grad = True
+                            num_adapted_params += param.numel()
+                # Also check for direct attn.proj naming
+                if ".proj" in name and ".attn" in name and isinstance(module, nn.Linear):
+                    for param in module.parameters():
+                        if not param.requires_grad:  # Avoid double counting
+                            param.requires_grad = True
+                            num_adapted_params += param.numel()
+            adapted_layer_types.append("Attention.proj")
+
+        if "bias" in self.tta_adapt_layers and "attn" not in self.tta_adapt_layers:
+            # Unfreeze all bias terms (excluding already unfrozen)
+            for name, param in self.model.named_parameters():
+                if "bias" in name and not param.requires_grad:
+                    param.requires_grad = True
+                    num_adapted_params += param.numel()
+            adapted_layer_types.append("All biases")
+
+        if "mlp_out" in self.tta_adapt_layers:
+            # Unfreeze MLP output layers (fc2 or fc3 for SwiGLU)
+            for name, module in self.model.named_modules():
+                if name.endswith(".mlp.fc2") or name.endswith(".mlp.fc3"):
+                    if isinstance(module, nn.Linear):
+                        for param in module.parameters():
+                            if not param.requires_grad:
+                                param.requires_grad = True
+                                num_adapted_params += param.numel()
+            adapted_layer_types.append("MLP output")
 
         total_params = sum(p.numel() for p in self.model.parameters())
 
         import logging
         log = logging.getLogger(__name__)
         log.info(
-            f"[TTA] Configured: {num_ln_params:,} / {total_params:,} params trainable "
-            f"({100*num_ln_params/total_params:.2f}%)"
+            f"[TTA] Configured: {num_adapted_params:,} / {total_params:,} params trainable "
+            f"({100*num_adapted_params/total_params:.2f}%) - Layers: {', '.join(adapted_layer_types)}"
         )
 
     def _tta_get_ln_params(self) -> list[nn.Parameter]:
-        """Get list of LayerNorm parameters."""
-        params = []
-        for module in self.model.modules():
-            if isinstance(module, nn.LayerNorm):
-                params.extend(p for p in module.parameters() if p.requires_grad)
-        return params
+        """Get list of all trainable TTA parameters (not just LayerNorm despite the name)."""
+        # Return ALL parameters with requires_grad=True (set by _tta_configure_params)
+        return [p for p in self.model.parameters() if p.requires_grad]
 
     def _tta_save_ln_state(self) -> dict[str, Tensor]:
-        """Save current LayerNorm state."""
+        """Save current state of all adapted parameters."""
         state = {}
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                state[f"{name}.weight"] = module.weight.data.clone()
-                state[f"{name}.bias"] = module.bias.data.clone()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                state[name] = param.data.clone()
         return state
 
     def _tta_restore_ln_state(self, state: dict[str, Tensor]) -> None:
-        """Restore LayerNorm state from saved dict."""
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                weight_key = f"{name}.weight"
-                bias_key = f"{name}.bias"
-                if weight_key in state:
-                    module.weight.data.copy_(state[weight_key])
-                if bias_key in state:
-                    module.bias.data.copy_(state[bias_key])
+        """Restore adapted parameters from saved dict."""
+        for name, param in self.model.named_parameters():
+            if name in state:
+                param.data.copy_(state[name])
 
     def _tta_set_ln_train_mode(self, training: bool) -> dict[str, bool]:
         """Set LayerNorm modules to train/eval mode.

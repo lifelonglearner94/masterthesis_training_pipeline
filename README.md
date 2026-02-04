@@ -139,11 +139,14 @@ data_dir/
 ### Testing
 
 #### TTA Full rollout mode (recommended)
+* only LayerNorm
 uv run src/eval.py experiment=test_ac_predictor_tta \
     paths.data_dir=/path/to/your/clips \
-    model.tta_mode=full_rollout \
-    model.tta_num_adaptation_steps=1 \
     ckpt_path=/path/to/checkpoint.ckpt
+
+* LayerNorm + Attention output projections
+uv run src/eval.py experiment=test_ac_predictor_tta_extended paths.data_dir=/path/to/your/clips ckpt_path=/path/to/checkpoint.ckpt
+
 
 ## 📁 Project Structure
 

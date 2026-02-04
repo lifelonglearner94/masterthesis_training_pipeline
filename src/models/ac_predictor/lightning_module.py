@@ -119,6 +119,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
         tta_mode: str = "full_rollout",
         tta_num_adaptation_steps: int = 1,
+        tta_adapt_layers: str = "layernorm",  # Which layers to adapt
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -135,6 +136,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             tta_optimizer_betas=tta_optimizer_betas,
             tta_mode=tta_mode,
             tta_num_adaptation_steps=tta_num_adaptation_steps,
+            tta_adapt_layers=tta_adapt_layers,
         )
 
         # Store num_timesteps for validation

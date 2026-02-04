@@ -1,0 +1,128 @@
+# @package _global_
+# =============================================================================
+# V-JEPA2 AC Predictor - TTA WITH EXTENDED LAYER ADAPTATION
+# =============================================================================
+# Use as: uv run src/eval.py experiment=test_ac_predictor_tta_extended ckpt_path=/path/to/checkpoint.ckpt
+#
+# This config extends TTA beyond LayerNorm to also adapt attention output projections.
+# This increases trainable parameters from ~0.1% to ~1-2%, allowing more learning capacity
+# while remaining computationally efficient.
+#
+# COMPARISON WITH BASE TTA:
+#   - test_ac_predictor_tta.yaml: LayerNorm only (~0.1% params)
+#   - THIS FILE: LayerNorm + Attention output projections (~1-2% params)
+#
+# SCIENTIFIC RATIONALE:
+#   - Attention output projections (attn.proj) control how attention outputs are combined
+#   - These layers can adapt to different visual patterns without changing the core attention mechanism
+#   - Still much lighter than adapting full MLP layers (~3-5% params) or full fine-tuning
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: null
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "test_ac_predictor_tta_extended"
+tags: ["vjepa2", "ac_predictor", "test", "tta", "extended_adaptation", "attn_proj"]
+seed: 42
+train: False
+test: True
+
+# =============================================================================
+# CALLBACKS
+# =============================================================================
+callbacks:
+  rich_progress:
+    _target_: lightning.pytorch.callbacks.RichProgressBar
+  model_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "last"
+    save_last: true
+    save_top_k: 0
+
+# =============================================================================
+# DATA: Same test range as base TTA
+# =============================================================================
+data:
+  batch_size: 1
+  num_workers: 4
+  pin_memory: true
+  clip_start: 22000
+  clip_end: 23000
+  val_split: 0.0
+  shuffle_test: false
+
+# =============================================================================
+# MODEL: Extended TTA configuration
+# =============================================================================
+model:
+  T_rollout: 7
+  context_frames: 1
+  T_teacher: 7
+  use_activation_checkpointing: false
+  action_embed_dim: 2
+  loss_weight_teacher: 0
+  loss_weight_rollout: 1.0
+  curriculum_schedule: null
+
+  # =============================================================================
+  # TEST TIME ADAPTATION (TTA) SETTINGS - EXTENDED
+  # =============================================================================
+  tta_enabled: true
+  tta_mode: "full_rollout"
+
+  # EXTENDED LAYER ADAPTATION:
+  # "layernorm+attn_proj" adapts both LayerNorm AND attention output projections
+  # This increases capacity from ~0.1% to ~1-2% of parameters
+  # Options: "layernorm", "layernorm+attn_proj", "layernorm+bias", "layernorm+mlp_out"
+  tta_adapt_layers: "layernorm+attn_proj"
+
+  # Adaptation steps: Keep at 5 for good learning
+  tta_num_adaptation_steps: 5
+
+  # Learning rate: Slightly lower than LayerNorm-only due to more parameters
+  # This helps prevent instability from larger updates
+  tta_lr: 2e-4
+
+  # Gradient clipping: Keep at 5.0 for reasonable gradient flow
+  tta_grad_clip: 5.0
+
+  # Cumulative adaptation across clips (no reset)
+  tta_reset_per_clip: false
+
+  tta_adaptation_horizon: 1
+  tta_optimizer_type: "adamw"
+  tta_optimizer_betas: [0.9, 0.999]
+
+# =============================================================================
+# TRAINER
+# =============================================================================
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: 32
+  max_epochs: 0
+  enable_checkpointing: true
+  enable_progress_bar: true
+  log_every_n_steps: 1
+
+# =============================================================================
+# CHECKPOINT PATH
+# =============================================================================
+ckpt_path: null
+
+# =============================================================================
+# TEST OUTPUT SETTINGS
+# =============================================================================
+test_output:
+  export_results: true
+  output_dir: null
+  per_timestep_breakdown: true
+  num_worst_clips: 10

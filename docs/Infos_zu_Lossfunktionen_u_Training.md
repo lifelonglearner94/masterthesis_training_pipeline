@@ -35,42 +35,21 @@ Das Ziel des Prädiktors  ist es, die **nächste** visuelle Repräsentation  vor
 
 Das Modell wird trainiert, indem zwei Fehlerquellen minimiert werden. Das ist der Kern von Gleichung (4): .
 
-#### A. Teacher-Forcing Loss (Gleichung 2 & Abb. 6 Links)
-
-* **Konzept:** Hier wird dem Modell "Händchen gehalten". Um den Zeitschritt  vorherzusagen, darf das Modell den *echten* (Ground Truth) Zustand von  sehen.
-* **Gleichung (2):**
+1. Teacher-Forcing Loss
+This loss function measures the difference between the predicted and actual state representations at each time step:
 
 
+$$\mathcal{L}_{\text{teacher-forcing}}(\phi) := \frac{1}{T} \sum_{k=1}^{T} || \hat{z}_{k+1} - z_{k+1} ||_{1} = \frac{1}{T} \sum_{k=1}^{T} || P_{\phi}((a_{t}, s_{t}, E(x_{t}))_{t \le k}) - E(x_{k+1}) ||_{1}$$
 
-Das bedeutet: Berechne den absoluten Unterschied (L1-Norm) zwischen dem *vorhergesagten* Bild-Feature () und dem *echten* Bild-Feature ().
-* **In Abbildung 6 (Links):**
-* Du siehst unten die echten Bilder ( bis ).
-* Diese werden vom **frozen frame encoder** in die grauen Quadrate ( bis ) umgewandelt.
-* Der **Predictor** (Mitte) nimmt  und sagt  vorher. Er nimmt  und sagt  vorher.
-* **Rote Boxen:** Der Fehler wird berechnet, indem die Vorhersage (lila, oben) direkt mit dem echten Feature (grau, unten, hochgeleitet über die rote Linie L1) verglichen wird.
-* **Warum Teacher Forcing?** Es stabilisiert das Training am Anfang, weil das Modell immer korrekte Eingaben bekommt, auch wenn seine letzte Vorhersage Müll war.
+2. Rollout Loss
+This loss improves the model's ability to perform autoregressive rollouts by comparing the final predicted state after a sequence of actions to the actual future state:
++1
 
 
+$$\mathcal{L}_{\text{rollout}}(\phi) := || P_{\phi}(a_{1:T}, s_{1}, z_{1}) - z_{T+1} ||_{1}$$
 
-#### B. Rollout Loss (Gleichung 3 & Abb. 6 Rechts)
+Note: The overall training objective minimizes the sum of these two losses: $L(\phi) := \mathcal{L}_{\text{teacher-forcing}}(\phi) + \mathcal{L}_{\text{rollout}}(\phi)$.
 
-Goal: The authors compute a two-step rollout loss to improve the model's ability to perform autoregressive rollouts during inference (predicting future states step-by-step).
-Model Context: The method involves running V-JEPA 2-AC autoregressively.
-Definitions:
-$P_\phi(\hat{a}_{1:T}; s_k, z_k)$ represents the final predicted state representation (in dimensions $\mathbb{R}^{H \times W \times D}$).
-It takes an action sequence $(\hat{a}_i)_{i \in [T]}$ starting from an initial state $(s_k, z_k)$.
-Parameters:
-While $T=15$ is mentioned earlier in the text, for the specific computation of the rollout loss, they use $T = 2$ in practice.
-This configuration ensures they only differentiate the predictor through one recurrent step.
-Rollout Loss Formula
-The exact formula for the rollout loss, denoted as equation (3) in the text, is:
-
-$$\mathcal{L}_{\text{rollout}}(\phi) := \|P_\phi(a_{1:T}, s_1, z_1) - z_{T+1}\|_1$$
-Where:
-$\mathcal{L}_{\text{rollout}}(\phi)$ is the loss function.
-$P_\phi(a_{1:T}, s_1, z_1)$ is the predicted state after $T$ steps given the action sequence $a_{1:T}$ and starting state $s_1, z_1$.
-$z_{T+1}$ is the actual target state at step $T+1$.
-$\|\cdot\|_1$ denotes the L1 norm (Manhattan distance).
 
 
 
