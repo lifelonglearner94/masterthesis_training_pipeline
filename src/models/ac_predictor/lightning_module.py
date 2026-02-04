@@ -537,31 +537,52 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             self._test_results.append(clip_result)
 
             # Log TTA metrics per-clip for wandb visualization
+            # Use on_step=True, on_epoch=False to get per-clip logging instead of aggregated
             clip_idx = batch_idx * B + i
-            self.log("test/tta_pre_adapt_loss", tta_stats.get("pre_adapt_loss", 0.0), sync_dist=True)
-            self.log("test/tta_post_adapt_loss", tta_stats.get("post_adapt_loss", 0.0), sync_dist=True)
-            self.log("test/tta_improvement", tta_stats.get("improvement", 0.0), sync_dist=True)
-            self.log("test/tta_num_adaptations", float(tta_stats.get("num_adaptations", 0)), sync_dist=True)
+
+            # Core per-clip metrics (logged every clip)
+            self.log("test/tta_loss_rollout", sample_loss.item(), on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            self.log("test/tta_improvement", tta_stats.get("improvement", 0.0), on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+
+            # Track cumulative statistics for adaptation trend
+            if not hasattr(self, '_tta_cumulative_losses'):
+                self._tta_cumulative_losses = []
+            self._tta_cumulative_losses.append(sample_loss.item())
+
+            # Log rolling average (last 50 clips) to show adaptation trend
+            window_size = min(50, len(self._tta_cumulative_losses))
+            rolling_avg = sum(self._tta_cumulative_losses[-window_size:]) / window_size
+            self.log("test/tta_loss_rolling_50", rolling_avg, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+
+            # Log gradient diagnostics if available
+            if "grad_norm_before_clip" in tta_stats:
+                self.log("test/tta_grad_norm_before", tta_stats["grad_norm_before_clip"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            if "grad_norm_after_clip" in tta_stats:
+                self.log("test/tta_grad_norm_after", tta_stats["grad_norm_after_clip"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            if "param_delta_norm" in tta_stats:
+                self.log("test/tta_param_delta", tta_stats["param_delta_norm"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
 
         # Compute batch-level metrics
         loss_rollout = sum(all_losses) / len(all_losses)
 
-        # Log metrics
-        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
-        self.log("test/loss", loss_rollout, prog_bar=True, sync_dist=True)
-        self.log("test/tta_enabled", 1.0, sync_dist=True)
-        self.log("test/tta_mode", 1.0 if self.tta_mode == "full_rollout" else 0.0, sync_dist=True)
+        # Log metrics - only essential ones, remove tta_enabled/tta_mode noise
+        self.log("test/loss_rollout", loss_rollout, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("test/loss", loss_rollout, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        # Note: Removed test/tta_enabled and test/tta_mode - they are constant values that clutter logs
 
-        # Log per-timestep losses
+        # Log per-timestep losses (epoch-level aggregation is fine for these)
         for step in range(T_pred):
             step_mean = sum(all_per_timestep_losses[step]) / len(all_per_timestep_losses[step])
-            self.log(f"test/loss_step_{C + step}", step_mean, sync_dist=True)
+            self.log(f"test/loss_step_{C + step + 1}", step_mean, on_step=False, on_epoch=True, sync_dist=True)
 
         return torch.tensor(loss_rollout, device=features.device)
 
     def on_test_epoch_start(self) -> None:
         """Clear test results and configure TTA at the start of test epoch."""
         self._test_results = []
+
+        # Reset cumulative tracking for new test epoch
+        self._tta_cumulative_losses = []
 
         # Configure TTA if enabled
         if self.tta_enabled:

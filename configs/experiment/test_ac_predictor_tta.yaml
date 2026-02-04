@@ -96,17 +96,19 @@ model:
   tta_mode: "full_rollout"
 
   # Number of TTA update iterations per clip
-  # 1 = single adaptation pass (recommended for stability)
-  # Higher values may improve adaptation but risk overfitting
-  tta_num_adaptation_steps: 1
+  # INCREASED: 5 iterations allows for meaningful parameter updates
+  # Original: 1 (too conservative for visible improvement)
+  tta_num_adaptation_steps: 5
 
   # TTA learning rate (conservative to prevent catastrophic forgetting)
-  # Range: 1e-5 to 1e-3, recommended: 1e-4
-  tta_lr: 1e-4
+  # INCREASED: 5e-4 for stronger updates while remaining stable
+  # Range: 1e-5 to 1e-3, original: 1e-4
+  tta_lr: 5e-4
 
   # Gradient clipping norm (CRITICAL for stability)
-  # Prevents catastrophic collapse from gradient spikes
-  tta_grad_clip: 1.0
+  # RELAXED: 5.0 allows more gradient flow while preventing collapse
+  # Original: 1.0 (too aggressive, truncating useful gradients)
+  tta_grad_clip: 5.0
 
   # Per-clip reset: restore original LayerNorm weights after each clip
   # true = each clip gets fresh adaptation (recommended)
@@ -131,6 +133,8 @@ trainer:
   max_epochs: 0
   enable_checkpointing: true
   enable_progress_bar: true
+  # Log every clip for per-clip TTA analysis (override default 50)
+  log_every_n_steps: 1
 
 # =============================================================================
 # CHECKPOINT PATH (override on command line)

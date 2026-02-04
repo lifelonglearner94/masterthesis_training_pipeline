@@ -291,22 +291,45 @@ class TTAMixin:
         if self._tta_optimizer is None:
             raise RuntimeError("TTA optimizer not initialized. Call _tta_reset_for_clip first.")
 
+        # Save pre-update parameters for delta computation
+        ln_params = self._tta_get_ln_params()
+        pre_update_params = [p.data.clone() for p in ln_params]
+
         # L1 loss with detached target
         loss = F.l1_loss(pred, target.detach())
 
-        # Backward + clip + step
+        # Backward pass
         self._tta_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self._tta_get_ln_params(),
+
+        # Compute gradient norm BEFORE clipping (diagnostic)
+        grad_norm_before = torch.nn.utils.clip_grad_norm_(
+            ln_params,
+            max_norm=float('inf'),  # Just compute norm, don't clip
+        ).item()
+
+        # Actually clip gradients
+        grad_norm_after = torch.nn.utils.clip_grad_norm_(
+            ln_params,
             max_norm=self.tta_grad_clip,
-        )
+        ).item()
+
+        # Optimizer step
         self._tta_optimizer.step()
 
-        # Track
+        # Compute parameter delta norm (how much parameters changed)
+        param_delta_norm = 0.0
+        for pre_param, param in zip(pre_update_params, ln_params):
+            param_delta_norm += (param.data - pre_param).norm().item() ** 2
+        param_delta_norm = param_delta_norm ** 0.5
+
+        # Track metrics
         loss_val = loss.item()
         self._tta_clip_stats["adaptation_losses"].append(loss_val)
         self._tta_clip_stats["num_adaptations"] += 1
+        self._tta_clip_stats["grad_norm_before_clip"] = grad_norm_before
+        self._tta_clip_stats["grad_norm_after_clip"] = grad_norm_after
+        self._tta_clip_stats["param_delta_norm"] = param_delta_norm
 
         return loss_val
 
