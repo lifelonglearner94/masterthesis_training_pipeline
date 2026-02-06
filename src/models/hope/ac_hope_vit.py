@@ -70,7 +70,8 @@ class ACHOPEViT(nn.Module):
         titan_grad_clip_inner: Gradient clip for inner-loop (DGD) gradients.
         cms_level_specs: List of CMS level specifications.
         cms_use_chunk_scheduling: Whether CMS uses chunk-based scheduling.
-        self_mod_dim: Hidden dimension for the SelfModifier MLP.
+        chunk_size: Chunk size for intra-sequence Titan updates (0 = full sequence).
+        titan_detach_interval: Detach Titan computation graph every N steps (0 = never).
         surprise_threshold: Minimum surprise to trigger memory update.
         drop_rate: Dropout rate.
         drop_path_rate: Stochastic depth rate.
@@ -99,7 +100,8 @@ class ACHOPEViT(nn.Module):
         titan_grad_clip_inner: float = 1.0,
         cms_level_specs: list[dict] | None = None,
         cms_use_chunk_scheduling: bool = False,
-        self_mod_dim: int = 64,
+        chunk_size: int = 0,
+        titan_detach_interval: int = 0,
         surprise_threshold: float = 0.0,
         # Regularization
         drop_rate: float = 0.0,
@@ -166,13 +168,14 @@ class ACHOPEViT(nn.Module):
                     titan_grad_clip_inner=titan_grad_clip_inner,
                     cms_levels=cms_levels,
                     cms_use_chunk_scheduling=cms_use_chunk_scheduling,
-                    self_mod_dim=self_mod_dim,
+                    chunk_size=chunk_size,
                     use_rope=use_rope,
                     grid_size=self.grid_height,
                     surprise_threshold=surprise_threshold,
                     drop_path=dpr[i],
                     drop=drop_rate,
-                )
+                ),
+                titan_detach_interval=titan_detach_interval,
             )
             for i in range(depth)
         ])
@@ -207,7 +210,8 @@ class ACHOPEViT(nn.Module):
             "titan_grad_clip_inner": titan_grad_clip_inner,
             "cms_levels": len(cms_levels),
             "use_rope": use_rope,
-            "self_mod_dim": self_mod_dim,
+            "chunk_size": chunk_size,
+            "titan_detach_interval": titan_detach_interval,
             "surprise_threshold": surprise_threshold,
             "total_params": sum(p.numel() for p in self.parameters()),
         }

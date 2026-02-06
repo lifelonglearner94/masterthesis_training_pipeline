@@ -7,17 +7,22 @@ Phase A — Self-Modifying Titan Layer (replaces standard attention):
        (only Q remains a static projection — Eq. 76)
     2. Optional 3D AC-RoPE injection on Q/K for spatiotemporal anchoring
     3. Memory read:  o_t = M_{memory,t-1}(q_t)
-    4. Memory write: DGD update with surprise gating
+    4. Self-generated targets: v̂_□ = M_{□,t-1}(v_t)  (Eq. 83)
+    5. Memory write: DGD update with surprise gating and per-memory targets
 
 Phase B — Continuum Memory System (replaces standard MLP):
     Multi-frequency MLP cascade (fast → medium → slow)
 
 The block maintains per-sequence memory state that is reset between sequences.
+Chunk-wise processing (Section 8.2) splits tokens into chunks and updates
+memories between chunks, enabling intra-sequence memory evolution.
 
 Design decisions addressing criticism:
     - 3D RoPE is configurable via `use_rope` flag (Criticism §2)
     - All inner-loop diagnostics are logged (Criticism §1)
     - Gradient clipping on inner-loop gradients prevents instability
+    - Per-memory self-generated targets (Eq. 83, Review §4.2)
+    - Chunk-wise sequential updates (Section 8.2, Review §4.5)
 """
 
 from __future__ import annotations
@@ -57,8 +62,10 @@ class HOPEBlockConfig:
     ])
     cms_use_chunk_scheduling: bool = False
 
-    # Self-modifier settings
-    self_mod_dim: int = 64  # Hidden dim for the SelfModifier MLP
+    # Chunk-wise processing (Section 8.2)
+    # Chunk size for intra-sequence memory updates. 0 = no chunking (all tokens at once).
+    # Recommended: tokens_per_frame (e.g. 258 = 256 patches + 2 action tokens).
+    chunk_size: int = 0
 
     # 3D RoPE toggle (Criticism §2: can be disabled for ablation)
     use_rope: bool = True
@@ -72,54 +79,6 @@ class HOPEBlockConfig:
 
     # Dropout
     drop: float = 0.0
-
-
-class SelfModifier(nn.Module):
-    """Generates modulated target values for Titan memory self-modification.
-
-    Takes key + value + error signal and produces modulated targets that
-    the memory should learn to retrieve. This is the "self-referential"
-    part — the model decides *what* to remember.
-
-    Architecture: concat(key, value, error) → 3-layer MLP → target_delta
-    Output: value + target_delta  (residual modulation)
-
-    Args:
-        dim: Token dimension.
-        hidden_dim: Hidden layer dimension.
-    """
-
-    def __init__(self, dim: int, hidden_dim: int = 64) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim * 2 + 1, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim),
-        )
-        # Initialize output near zero for stable initial training
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, key: Tensor, value: Tensor, error_signal: Tensor) -> Tensor:
-        """Compute modulated target for memory writing.
-
-        Args:
-            key:   [B, N, D] keys.
-            value: [B, N, D] values.
-            error_signal: [B] per-sample surprise scalar.
-
-        Returns:
-            [B, N, D] modulated target values.
-        """
-        B, N, D = key.shape
-        # Expand error_signal: [B] → [B, N, 1]
-        err = error_signal.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1)
-        # Concatenate: [B, N, 2*D+1]
-        inp = torch.cat([key, value, err], dim=-1)
-        delta = self.net(inp)  # [B, N, D]
-        return value + delta  # Residual modulation
 
 
 class HOPEBlock(nn.Module):
@@ -140,9 +99,11 @@ class HOPEBlock(nn.Module):
 
     Args:
         config: HOPEBlockConfig with all settings.
+        titan_detach_interval: Detach memory graph every N update steps
+            to bound VRAM. 0 = never detach (full meta-gradient chain).
     """
 
-    def __init__(self, config: HOPEBlockConfig) -> None:
+    def __init__(self, config: HOPEBlockConfig, titan_detach_interval: int = 0) -> None:
         super().__init__()
         self.config = config
         dim = config.dim
@@ -164,15 +125,13 @@ class HOPEBlock(nn.Module):
             num_layers=config.titan_layers,
             activation=config.titan_activation,
             grad_clip_inner=config.titan_grad_clip_inner,
+            detach_interval=titan_detach_interval,
         )
         self.M_k = TitanMemory(mem_cfg)      # Key generation memory
         self.M_v = TitanMemory(mem_cfg)      # Value generation memory
         self.M_eta = TitanMemory(mem_cfg)    # Learning rate generation memory
         self.M_alpha = TitanMemory(mem_cfg)  # Decay factor generation memory
         self.M_memory = TitanMemory(mem_cfg)  # Main retrieval memory
-
-        # Self-modifier for target generation
-        self.self_modifier = SelfModifier(dim, config.self_mod_dim)
 
         # Output projection for Phase A
         self.out_proj = nn.Linear(dim, dim, bias=True)
@@ -249,13 +208,19 @@ class HOPEBlock(nn.Module):
         W: int | None = None,
         action_tokens: int = 0,
     ) -> Tensor:
-        """Phase A: Self-Modifying Titan with optional 3D RoPE.
+        """Phase A: Self-Modifying Titan with optional 3D RoPE and chunking.
 
-        Steps:
-            1. Generate Q (static), K, V, η, α (adaptive from memories)
+        Implements chunk-wise sequential processing (Section 8.2):
+        tokens are split into chunks, memories are updated between chunks,
+        enabling intra-sequence memory evolution.
+
+        Steps per chunk:
+            1. Generate Q (static), K, V, η, α (adaptive from current memory)
             2. Optionally apply 3D RoPE rotation to Q and K
             3. Retrieve from main memory: o_t = M_memory(q_t)
-            4. Compute surprise and update all memories via DGD
+            4. Compute surprise signal
+            5. Generate per-memory self-targets: v̂_□ = M_□(v_t)  (Eq. 83)
+            6. Update all memories via DGD
 
         Args:
             x: [B, N, D] pre-normed input.
@@ -266,44 +231,95 @@ class HOPEBlock(nn.Module):
             [B, N, D] Titan output.
         """
         B, N, D = x.shape
+        chunk_size = self.config.chunk_size
+        tokens_per_frame = (action_tokens + H * W) if H is not None else 0
 
-        # Step 1: Generate adaptive projections
+        # If no chunking or T is unknown, process all tokens at once
+        if chunk_size <= 0 or T is None or chunk_size >= T:
+            return self._titan_forward_chunk(x, T=T, H=H, W=W, action_tokens=action_tokens)
+
+        # ─── Chunk-wise processing along temporal dimension ───
+        # Split into groups of `chunk_size` timesteps. Each chunk has
+        # chunk_T * tokens_per_frame tokens. Memories update between chunks
+        # so chunk 2 reads state modified by chunk 1 (meta-gradient chain).
+        output_chunks = []
+
+        for t_start in range(0, T, chunk_size):
+            t_end = min(t_start + chunk_size, T)
+            chunk_T = t_end - t_start
+
+            # Extract tokens for these timesteps
+            tok_start = t_start * tokens_per_frame
+            tok_end = t_end * tokens_per_frame
+            x_chunk = x[:, tok_start:tok_end, :]  # [B, chunk_T * tpf, D]
+
+            # Process chunk with current memory state
+            out_chunk = self._titan_forward_chunk(
+                x_chunk, T=chunk_T, H=H, W=W, action_tokens=action_tokens,
+            )
+            output_chunks.append(out_chunk)
+
+        # Concatenate all chunk outputs
+        return torch.cat(output_chunks, dim=1)  # [B, N, D]
+
+    def _titan_forward_chunk(
+        self,
+        x: Tensor,
+        T: int | None = None,
+        H: int | None = None,
+        W: int | None = None,
+        action_tokens: int = 0,
+    ) -> Tensor:
+        """Process a single chunk through the Titan memory.
+
+        This is the core computation unit. When chunk_size=0, the entire
+        sequence is processed as one chunk (original behavior). With chunking,
+        this is called per-chunk and memories accumulate between calls.
+
+        Args:
+            x: [B, C, D] chunk of pre-normed input tokens.
+            T, H, W: Full spatiotemporal grid dimensions (for RoPE).
+            action_tokens: Conditioning tokens per frame.
+
+        Returns:
+            [B, C, D] Titan output for this chunk.
+        """
+        B, C, D = x.shape
+
+        # Step 1: Generate adaptive projections using current memory state
         q = self.q_proj(x)          # Static: q_t = x_t W_q  (Eq. 76)
-        k = self.M_k(x)             # Adaptive: k_t = M_{k,t-1}(x_t)  (Eq. 77)
-        v = self.M_v(x)             # Adaptive: v_t = M_{v,t-1}(x_t)  (Eq. 78)
-        eta_raw = self.M_eta(x)     # Adaptive: η_t raw  (Eq. 79)
+        k = self.M_k(x)             # Adaptive: k_t = M_{k,t-1}(x_t)  (Eq. 79)
+        v = self.M_v(x)             # Adaptive: v_t = M_{v,t-1}(x_t)  (Eq. 79)
+        eta_raw = self.M_eta(x)     # Adaptive: η_t raw  (Eq. 80)
         alpha_raw = self.M_alpha(x)  # Adaptive: α_t raw  (Eq. 80)
 
-        # Normalize η and α to reasonable ranges
+        # Normalize η and α to reasonable ranges (per-token, [B, C, 1])
         # η (learning rate): softplus to ensure positive, then scale down
-        eta = F.softplus(eta_raw.mean(dim=-1, keepdim=True)) * 0.01  # [B, N, 1]
+        eta = F.softplus(eta_raw.mean(dim=-1, keepdim=True)) * 0.01  # [B, C, 1]
         # α (decay): sigmoid to [0, 1] range
-        alpha = torch.sigmoid(alpha_raw.mean(dim=-1, keepdim=True))  # [B, N, 1]
+        alpha = torch.sigmoid(alpha_raw.mean(dim=-1, keepdim=True))  # [B, C, 1]
 
         # Step 2: Optional 3D RoPE on Q and K (Criticism §2: configurable)
         if self.config.use_rope and T is not None and H is not None and W is not None:
             q, k = self._apply_rope(q, k, T, H, W, action_tokens)
 
         # Step 3: Retrieve from main memory
-        output = self.M_memory(q)   # o_t = M_{memory,t-1}(q_t)  (Eq. 83)
+        output = self.M_memory(q)   # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
 
-        # Step 4: Compute surprise and update memories
+        # Step 4-6: Compute surprise + per-memory self-targets + DGD update
         if self.training and torch.is_grad_enabled():
             # Retrieval error as surprise signal
-            retrieval_error = v - output  # [B, N, D]
+            retrieval_error = v - output  # [B, C, D]
             surprise = self.M_memory.surprise(retrieval_error)  # [B]
             self._last_surprise = surprise.detach()
-
-            # Generate modulated targets via SelfModifier
-            target_v = self.self_modifier(k, v, surprise)  # [B, N, D]
 
             # Only update if surprise exceeds threshold
             if self.config.surprise_threshold > 0:
                 update_mask = surprise > self.config.surprise_threshold
                 if update_mask.any():
-                    self._update_memories(k, v, target_v, surprise, eta, alpha)
+                    self._update_memories(k, v, surprise, eta, alpha)
             else:
-                self._update_memories(k, v, target_v, surprise, eta, alpha)
+                self._update_memories(k, v, surprise, eta, alpha)
 
         # Project output
         output = self.out_proj(output)
@@ -441,20 +457,24 @@ class HOPEBlock(nn.Module):
         self,
         k: Tensor,
         v: Tensor,
-        target_v: Tensor,
         surprise: Tensor,
         eta: Tensor,
         alpha: Tensor,
     ) -> None:
-        """Update all adaptive memories via DGD (Eq. 86-93).
+        """Update all adaptive memories via DGD with self-generated targets.
 
-        Each memory M_□ is updated independently:
+        Each memory M_□ generates its own target (Eq. 83):
+            v̂_□,t = M_{□,t-1}(v_t)
+
+        Then is updated independently (Eq. 88-93):
             M_□,t = M_□,t-1 (α_t I − η_t k_t k_t^T) − η_t ∇L(M_□; k, v̂_□)
+
+        This is the "self-referential" property: each memory uses its own
+        weights to decide what it should learn.
 
         Args:
             k: [B, N, D] keys.
-            v: [B, N, D] values.
-            target_v: [B, N, D] modulated target values.
+            v: [B, N, D] values (raw, before self-target generation).
             surprise: [B] surprise signal per sample.
             eta: [B, N, 1] adaptive learning rate.
             alpha: [B, N, 1] adaptive decay factor.
@@ -462,9 +482,11 @@ class HOPEBlock(nn.Module):
         memories = [self.M_k, self.M_v, self.M_eta, self.M_alpha, self.M_memory]
 
         for mem in memories:
+            # Each memory generates its OWN target (Eq. 83: v̂_□ = M_□(v))
+            self_target = mem.generate_self_target(v)  # [B, N, D]
             mem.compute_and_apply_update(
                 key=k,
-                value=target_v,
+                value=self_target,
                 error_signal=surprise,
                 lr=eta,
                 alpha=alpha,
@@ -493,6 +515,8 @@ class HOPEBlock(nn.Module):
             ("M_memory", self.M_memory),
             ("M_k", self.M_k),
             ("M_v", self.M_v),
+            ("M_eta", self.M_eta),
+            ("M_alpha", self.M_alpha),
         ]:
             for key, val in mem.get_diagnostics().items():
                 diag[f"{prefix}/{key}"] = val

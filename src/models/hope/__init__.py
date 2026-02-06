@@ -7,7 +7,7 @@ Novel architecture combining V-JEPA2 AC predictor I/O with the HOPE
 from src.models.hope.ac_hope_module import ACHOPEModule
 from src.models.hope.ac_hope_vit import ACHOPEViT, ac_hope_vit
 from src.models.hope.cms import CMS, CMSBlock, LevelSpec
-from src.models.hope.hope_block import HOPEBlock, HOPEBlockConfig, SelfModifier
+from src.models.hope.hope_block import HOPEBlock, HOPEBlockConfig
 from src.models.hope.titan_memory import TitanMemory, TitanMemoryConfig
 
 __all__ = [
@@ -16,7 +16,6 @@ __all__ = [
     "ac_hope_vit",
     "HOPEBlock",
     "HOPEBlockConfig",
-    "SelfModifier",
     "TitanMemory",
     "TitanMemoryConfig",
     "CMS",

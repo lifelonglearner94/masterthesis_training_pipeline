@@ -6,27 +6,28 @@ via Descending-with-Gradient Descent (DGD).
 
 Key equations (from Behrouz 2025, Section 8.1):
     Retrieval:     o_t = M_{t-1}(q_t)
-    Target gen:    v̂_□,t = M_{□,t-1}(v_t)
+    Self-targets:  v̂_□,t = M_{□,t-1}(v_t)          (Eq. 83)
     DGD update:    M_{□,t} = M_{□,t-1}(α_t I − η_t k_t k_t^T)
-                            − η_t (M_{□,t-1} k_t − v̂_□,t) k_t^T
+                            − η_t (M_{□,t-1} k_t − v̂_□,t) k_t^T  (Eq. 93)
 
-Implementation approach — functional forward:
-    During training, the memory uses **plain tensors** (not nn.Parameters) for
-    the active forward computation. This avoids in-place modification of
-    parameters that are part of the outer autograd graph.
-
+Implementation approach — functional forward with meta-learning:
     - nn.Parameters (w1.weight, w2.weight) are the meta-learned initial state,
       updated by the outer optimizer via standard backprop.
-    - Active weights (_active_w1, _active_w2) are detached clones used for the
-      actual forward computation and DGD self-modification within a sequence.
-    - reset_active_weights() copies parameters → active weights (call per seq).
-    - compute_and_apply_update() modifies active weights (not parameters).
+    - Active weights (_active_w1, _active_w2) are derived from the parameters
+      WITHOUT detach, so the outer optimizer can compute meta-gradients
+      (FOMAML-style first-order) through the forward pass.
+    - reset_active_weights() copies parameters → active weights (keeping grad).
+    - compute_and_apply_update() replaces active weights with updated tensors.
     - forward() uses F.linear() with the active weights.
+    - detach_interval bounds memory cost by periodically detaching the graph.
 
 The memory supports:
-    - Gradient-based self-modification via functional forward
+    - Meta-learned initial states via preserved gradient flow (Pillar 3)
+    - Self-generated target values v̂ = M(v) for self-referential learning
+    - Per-token η and α for fine-grained adaptation
     - Surprise-gated updates (only write when retrieval error is high)
     - Gradient norm clipping for inner-loop stability
+    - Periodic graph detachment to bound VRAM usage
     - Diagnostic logging of inner-loop gradient norms, surprise, param norms
 """
 
@@ -53,29 +54,33 @@ class TitanMemoryConfig:
     activation: str = "gelu"
     grad_clip_inner: float = 1.0
     output_norm: bool = True
-    # Detach memory graph every N tokens to bound memory cost (0 = never detach)
+    # Detach memory graph every N update steps to bound memory cost (0 = never)
     detach_interval: int = 0
 
 
 class TitanMemory(nn.Module):
     """MLP-based associative memory with DGD self-modification.
 
-    Structure: x → W1 → σ → W2 → + x  (residual 2-layer MLP)
+    Structure: x → W1 → σ → W2 → + x  (residual 2-layer MLP, Eq. 89)
 
     Uses a **functional forward** pattern for self-modification:
     - nn.Parameters (w1.weight, w2.weight) are the meta-learned initial state.
-    - Active weights (_active_w1, _active_w2) are plain tensors derived from
-      the parameters and updated via DGD during the forward pass.
-    - reset_active_weights() copies from parameters → active weights.
+    - Active weights (_active_w1, _active_w2) are derived from the parameters
+      and updated via DGD during the forward pass.
+    - reset_active_weights() copies from parameters → active weights, keeping
+      the gradient connection for meta-learning (no detach).
     - forward() uses F.linear() with active weights instead of self.w1/w2.
-    - compute_and_apply_update() modifies active weights (not parameters).
+    - compute_and_apply_update() creates new active weight tensors via DGD.
 
-    This design ensures that:
-    1. During inference without reset: falls back to nn.Parameter modules.
-    2. During training: active weights are detached clones, so DGD updates
-       don't trigger in-place modification errors on the autograd graph.
-    3. The outer optimizer updates the meta-learned initial state via standard
-       backprop through the forward() calls that happen BEFORE reset.
+    Meta-learning design (FOMAML-style, first-order):
+    1. reset_active_weights() clones parameters WITHOUT detach.
+    2. forward() uses F.linear(query, active_w) — outer loss depends on
+       active weights which depend on nn.Parameters.
+    3. compute_and_apply_update() computes inner-loop gradients with
+       create_graph=False (first-order), then creates NEW tensors for active
+       weights. The new tensors are functions of the OLD active weights
+       (via alpha * w_old - eta * grad), preserving the meta-gradient chain.
+    4. detach_interval periodically detaches to bound VRAM.
 
     Args:
         config: TitanMemoryConfig with architecture settings.
@@ -120,11 +125,19 @@ class TitanMemory(nn.Module):
         """Reset active weights to meta-learned initial state (from Parameters).
 
         Call this at the start of each sequence to ensure fresh memory state.
-        Creates **detached clones** that can be freely modified by DGD without
-        touching the original nn.Parameters.
+
+        CRITICAL: Does NOT detach — the active weights remain connected to the
+        nn.Parameters so the outer optimizer can compute meta-gradients through
+        the forward pass (FOMAML-style first-order meta-learning).
+
+        The gradient chain is:
+            nn.Parameter → active_weight → F.linear(query, active_weight) → loss
+        so backprop through the loss updates the meta-learned initial state.
         """
-        self._active_w1 = self.w1.weight.detach().clone()
-        self._active_w2 = self.w2.weight.detach().clone()
+        # Clone WITHOUT detach: preserves gradient connection to nn.Parameters
+        # This is the fix for the meta-learning bug (Review §4.1)
+        self._active_w1 = self.w1.weight.clone()
+        self._active_w2 = self.w2.weight.clone()
 
     def clear_active_weights(self) -> None:
         """Clear active weights, reverting to nn.Parameter-based forward."""
@@ -148,7 +161,7 @@ class TitanMemory(nn.Module):
             [B, ..., D] retrieved memory output (with LayerNorm).
         """
         if self._active_w1 is not None and self._active_w2 is not None:
-            # Functional path — uses detached active weight clones
+            # Functional path — uses active weights (connected to Parameters)
             h = F.linear(query, self._active_w1)
             h = self.act(h)
             out = F.linear(h, self._active_w2) + query  # Residual
@@ -157,6 +170,24 @@ class TitanMemory(nn.Module):
             h = self.act(self.w1(query))
             out = self.w2(h) + query  # Residual
         return self.norm(out)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Self-generated target values (Eq. 83)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_self_target(self, v: Tensor) -> Tensor:
+        """Generate self-referential target values: v̂_□,t = M_{□,t-1}(v_t).
+
+        This is the "self-modifying" property (Eq. 83, Behrouz 2025):
+        each memory generates its own target using its own current weights.
+
+        Args:
+            v: [B, N, D] value tokens.
+
+        Returns:
+            [B, N, D] self-generated target values.
+        """
+        return self.forward(v)
 
     # ──────────────────────────────────────────────────────────────────────
     # Surprise signal
@@ -194,25 +225,32 @@ class TitanMemory(nn.Module):
     ) -> None:
         """Compute DGD parameter deltas and apply them to active weights.
 
-        This is the core self-modification step. It:
-        1. Creates temporary grad-enabled copies of active weights.
-        2. Computes the inner loss ||M(key) - value||^2 with surprise gating.
-        3. Computes first-order gradients (create_graph=False).
-        4. Applies the DGD update rule to the active weight tensors.
+        This is the core self-modification step (Eq. 88-93, Behrouz 2025).
 
-        Because active weights are plain tensors (detached from the outer graph),
-        this cannot cause in-place modification errors during outer backward.
+        The update preserves the meta-gradient chain:
+            new_w = alpha * w_old - eta * grad
+        where w_old is connected to nn.Parameters, so backprop through any
+        subsequent forward(query) that uses new_w will flow gradients back
+        to the meta-learned initial state.
 
-        DGD update rule (Eq. 86-93 in Behrouz 2025):
-            delta_W = -eta * grad_W L_inner
-            W_new = alpha * W_old + delta_W   (weight decay via alpha < 1)
+        Inner-loop gradients are computed with create_graph=False (first-order,
+        FOMAML-style). The meta-gradient flows through w_old, NOT through
+        the inner-loop gradient computation itself.
+
+        Per-token η and α are averaged over batch/tokens for the weight update
+        (since weights are shared across tokens), but kept as tensors (not
+        Python floats) to preserve computational graph when needed.
+
+        DGD update rule (Eq. 93 in Behrouz 2025, L2 regression):
+            M_t = M_{t-1} (α_t I − η_t k_t k_t^T) − η_t (M_{t-1} k_t − v̂_t) k_t^T
+            ≈ α * M_{t-1} − η * ∇L_inner   (simplified for nonlinear MLP)
 
         Args:
             key:   [B, N, D]  keys to write.
-            value: [B, N, D]  target values.
+            value: [B, N, D]  self-generated target values v̂_□.
             error_signal: [B]  per-sample gating (surprise).
-            lr:    [B, N, 1] or [B, 1, 1]  adaptive learning rate eta_t.
-            alpha: [B, N, 1] or [B, 1, 1]  adaptive decay alpha_t (default 1.0).
+            lr:    [B, N, 1]  per-token adaptive learning rate η_t.
+            alpha: [B, N, 1]  per-token adaptive decay α_t (default 1.0).
 
         Raises:
             RuntimeError: If active weights have not been initialized via
@@ -224,36 +262,44 @@ class TitanMemory(nn.Module):
                 "before compute_and_apply_update()."
             )
 
-        # Create temporary copies with grad enabled for inner-loop gradient
-        w1_tmp = self._active_w1.detach().requires_grad_(True)
-        w2_tmp = self._active_w2.detach().requires_grad_(True)
+        # ─── Compute inner-loop gradient ───
+        # Create leaf copies for autograd.grad() — these are detached from
+        # the meta-gradient chain (first-order: we don't differentiate through
+        # the gradient computation itself, only through w_old in the update).
+        w1_leaf = self._active_w1.detach().requires_grad_(True)
+        w2_leaf = self._active_w2.detach().requires_grad_(True)
 
-        # Forward through memory with grad-enabled temp weights
-        h = F.linear(key, w1_tmp)
+        # Forward through memory with leaf weights
+        h = F.linear(key, w1_leaf)
         h = self.act(h)
-        retrieved = F.linear(h, w2_tmp) + key  # Residual
+        retrieved = F.linear(h, w2_leaf) + key  # Residual
 
-        # Inner loss: MSE between retrieved and target values
+        # Inner loss: MSE between retrieved and target values (Eq. 93)
         inner_loss = F.mse_loss(
             retrieved, value.detach(), reduction="none"
         )  # [B, N, D]
 
-        # Weight by error_signal (surprise gating)
-        gate = error_signal.detach().unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+        # Weight by error_signal (surprise gating): [B] → [B, 1, 1]
+        gate = error_signal.detach().unsqueeze(-1).unsqueeze(-1)
         inner_loss = (inner_loss * gate).sum()
 
-        # Compute inner-loop gradients (first-order, no Hessian)
+        # First-order inner-loop gradients (FOMAML-style: no Hessian)
         grads = torch.autograd.grad(
             inner_loss,
-            [w1_tmp, w2_tmp],
+            [w1_leaf, w2_leaf],
             create_graph=False,
             allow_unused=True,
         )
 
-        # Extract scalars for the update
-        lr_scalar = lr.detach().mean().item()
-        alpha_scalar = (
-            alpha.detach().mean().item() if alpha is not None else 1.0
+        # ─── Compute per-token η and α for weight update ───
+        # Weights are shared across batch/tokens, so we average η/α to get
+        # a single scalar multiplier. η and α are kept IN the computation
+        # graph (no .detach()) so the outer-loop can train M_eta and M_alpha
+        # through the DGD update: new_w = α * w_old − η * grad.
+        lr_mean = lr.mean()
+        alpha_mean = (
+            alpha.mean() if alpha is not None
+            else torch.ones(1, device=key.device)
         )
 
         inner_grad_norm_sq = 0.0
@@ -266,11 +312,12 @@ class TitanMemory(nn.Module):
                 new_weights.append(w_old)
                 continue
 
+            # Detach grad from inner loop graph (first-order only)
             grad = grad.detach()
             grad_norm = grad.norm().item()
             inner_grad_norm_sq += grad_norm ** 2
 
-            # Clip inner-loop gradients for stability (Criticism S1)
+            # Clip inner-loop gradients for stability
             if (
                 self.config.grad_clip_inner > 0
                 and grad_norm > self.config.grad_clip_inner
@@ -280,12 +327,23 @@ class TitanMemory(nn.Module):
                 )
 
             # DGD update: W_new = alpha * W_old - eta * grad
-            new_w = alpha_scalar * w_old - lr_scalar * grad
+            # w_old is connected to nn.Parameters (meta-gradient flows through)
+            # grad is detached (first-order: no meta-gradient through inner grad)
+            new_w = alpha_mean * w_old - lr_mean * grad
             new_weights.append(new_w)
 
-        # Assign updated active weights (plain tensor reassignment, no in-place)
+        # Assign updated active weights (tensor reassignment, no in-place)
         self._active_w1 = new_weights[0]
         self._active_w2 = new_weights[1]
+
+        # ─── Periodic detach to bound VRAM ───
+        step = self._step_counter.item() + 1
+        if (
+            self.config.detach_interval > 0
+            and step % self.config.detach_interval == 0
+        ):
+            self._active_w1 = self._active_w1.detach().clone()
+            self._active_w2 = self._active_w2.detach().clone()
 
         # Update diagnostics
         self._step_counter += 1

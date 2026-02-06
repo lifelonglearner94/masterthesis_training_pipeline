@@ -60,8 +60,17 @@ model:
       warmup_steps: 0
   cms_use_chunk_scheduling: false  # Enable frequency-based chunk scheduling
 
-  # Self-modifier settings
-  self_mod_dim: 64              # Hidden dim for SelfModifier MLP
+  # Chunk-wise sequential memory updates (Section 8.2)
+  # Number of timesteps per chunk. 0 = no chunking (all timesteps at once).
+  # With chunking, M_eta and M_alpha get outer-loop gradients because
+  # chunk 2 reads memory state modified in chunk 1.
+  # Recommended: 1 (per-timestep updates, maximal gradient flow).
+  chunk_size: 1
+
+  # Detach memory graph every N update steps to bound VRAM (0 = never).
+  # Recommended: 4 for depth-matched, 0 for param-matched.
+  titan_detach_interval: 0
+
   surprise_threshold: 0.0       # Min surprise to trigger memory update (0=always)
 
   # ─── Diagnostics (Criticism §1: log all relevant parameters) ───

@@ -87,7 +87,8 @@ model:
   titan_hidden_multiplier: 2       # ⚠️ Reduced from 4 (384×2=768 hidden)
   use_rope: true                   # 3D RoPE enabled (Criticism §2: toggleable)
   titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
-  self_mod_dim: 64                 # SelfModifier hidden dimension
+  chunk_size: 1                    # 0 = no chunking (all tokens at once)
+  titan_detach_interval: 0         # 0 = never detach (full meta-gradient)
   surprise_threshold: 0.0          # 0 = always update memories
 
   # CMS levels — full multi-timescale hierarchy preserved

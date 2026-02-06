@@ -95,7 +95,8 @@ model:
   titan_hidden_multiplier: 2       # Titan MLP hidden = 384×2 = 768
   use_rope: true                   # 3D RoPE enabled (Criticism §2: toggleable)
   titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
-  self_mod_dim: 64                 # SelfModifier hidden dimension
+  chunk_size: 1                    # 0 = full-sequence Titan update (no chunking)
+  titan_detach_interval: 4         # Detach Titan graph every 4 steps (12-layer VRAM bound)
   surprise_threshold: 0.0          # 0 = always update memories
 
   # CMS levels — full multi-timescale hierarchy
