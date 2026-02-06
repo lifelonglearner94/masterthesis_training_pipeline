@@ -1,0 +1,146 @@
+# @package _global_
+# =============================================================================
+# Experiment 1: AC-HOPE-ViT — Parameter-Matched (~42M vs 43M baseline)
+# =============================================================================
+# Use as: uv run src/train.py experiment=ac_hope_vit_param_matched paths.data_dir=/path/to/clips
+#
+# COMPARISON DESIGN:
+#   Baseline (vjepa2_ac):  depth=24, standard Transformer    → 43.38M params
+#   This experiment:       depth=6,  HOPE (Titan+CMS)        → 42.04M params
+#   Difference: -3.1% (parameter-matched within noise)
+#
+# SCIENTIFIC NOTE:
+#   This is a parameter-controlled comparison. The depth asymmetry (6 vs 24
+#   layers) is an acknowledged limitation — each HOPE block is ~4× heavier
+#   than a standard Transformer block due to 5 Titan memories + 3 CMS MLPs.
+#   See the depth-matched experiment (ac_hope_vit_depth_matched) for the
+#   complementary comparison that controls for depth instead.
+#
+# KEY CHANGES vs full config:
+#   - depth:                  24 → 6   (main parameter lever)
+#   - titan_hidden_multiplier: 4 → 2   (halves Titan MLP: 384×2=768)
+#   - CMS levels:             3 × 4.0  (kept — preserves multi-timescale design)
+#
+# TEMPORAL DIMENSIONS:
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Available prediction steps: 7 (num_timesteps - 1 = 8 - 1)
+#   - T_teacher/T_rollout must be <= 7
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+callbacks:
+  verbose_logging:
+    _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
+    log_memory: False
+    log_data: False
+    log_forward_pass: False
+    log_backward_pass: False
+    log_gradients: False
+    log_weights: False
+    log_every_n_batches: 16
+    max_layers_to_log: 30
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "ac_hope_vit_param_matched"
+tags: ["hope", "titan", "cms", "param_matched", "depth_6", "robotics"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# ⚠️  MEMORY-CRITICAL SETTINGS
+# =============================================================================
+# With depth=6 and titan_hm=2, memory usage is comparable to the baseline.
+# Batch size can be higher than the full 24-layer HOPE config.
+#
+# If you run out of memory, reduce in order:
+#   1. batch_size: 64 → 32 → 16 → 8
+#   2. num_workers: 8 → 4 → 0
+#   3. use_activation_checkpointing: true
+
+data:
+  batch_size: 64                   # Comparable to baseline (6 layers = lighter)
+  num_workers: 8
+  pin_memory: true
+
+model:
+  # --- Temporal / loss settings (identical to vjepa2_ac for comparability) ---
+  T_teacher: 7
+  T_rollout: 7
+  context_frames: 1
+  use_activation_checkpointing: true
+
+  # --- Action dimension (dataset-specific) ---
+  action_embed_dim: 2              # 2D actions for this dataset
+
+  # --- HOPE architecture (scaled for ~42M params) ---
+  depth: 6                         # ⚠️ Reduced from 24 (parameter matching)
+  titan_hidden_multiplier: 2       # ⚠️ Reduced from 4 (384×2=768 hidden)
+  use_rope: true                   # 3D RoPE enabled (Criticism §2: toggleable)
+  titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
+  self_mod_dim: 64                 # SelfModifier hidden dimension
+  surprise_threshold: 0.0          # 0 = always update memories
+
+  # CMS levels — full multi-timescale hierarchy preserved
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 4
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 16
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+
+  # --- Diagnostics (Criticism §1) ---
+  log_hope_diagnostics: true
+
+  # --- Loss weights ---
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # --- Curriculum Learning Schedule (identical to vjepa2_ac) ---
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
+      loss_weight_teacher: 0.3
+
+  # --- Optimizer (V-JEPA2 paper settings, adapted for HOPE) ---
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  titan_lr_scale: 0.5              # Titan LR = 4.25e-4 × 0.5 = 2.125e-4
+  cms_lr_scale: 1.0                # CMS LR = 4.25e-4 × 1.0 = 4.25e-4
+
+  # --- LR schedule (iteration-based, V-JEPA2 paper) ---
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+# =============================================================================
+# TRAINER SETTINGS (identical to vjepa2_ac)
+# =============================================================================
+trainer:
+  max_epochs: 30
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm

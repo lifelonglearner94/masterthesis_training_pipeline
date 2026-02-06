@@ -1,0 +1,95 @@
+# @package _global_
+
+# AC-HOPE-ViT Model Configuration
+# Action-Conditioned HOPE Vision Transformer (Novel Architecture)
+#
+# Combines V-JEPA2 AC predictor I/O pipeline with HOPE backbone:
+#   - Self-Modifying Titan memories (replace attention)
+#   - CMS multi-frequency MLPs (replace FFN)
+#
+# Same input/output format as ac_predictor.yaml:
+#   Input:  [B, T*N, D=1024] + [B, T, action_dim]
+#   Output: [B, T*N, D=1024]
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.hope.ACHOPEModule
+
+  # ─── Model architecture (Stage 1 & 3 — identical to AC predictor) ───
+  img_size: [256, 256]
+  patch_size: 16
+  num_timesteps: 8  # Encoded timesteps (16 original frames / tubelet_size=2)
+  embed_dim: 1024
+  predictor_embed_dim: 384
+  depth: 24
+  num_heads: 16
+  action_embed_dim: 7  # 7D: position (3), orientation (3), gripper (1)
+  is_frame_causal: true
+  use_activation_checkpointing: false
+  use_extrinsics: false
+
+  # ─── HOPE-specific architecture (Stage 2 — novel) ───
+
+  # 3D RoPE toggle (Criticism §2: enable/disable for ablation)
+  use_rope: true
+
+  # Titan memory settings
+  titan_hidden_multiplier: 4    # Titan MLP hidden dim = dim * multiplier
+  titan_layers: 2               # Number of layers in Titan MLP
+  titan_activation: "gelu"      # Activation function in Titan memory
+  titan_grad_clip_inner: 1.0    # Gradient clipping for inner-loop (DGD)
+
+  # CMS multi-frequency MLP levels
+  # Each level has a name, update_period, and hidden_multiplier
+  # update_period=1 means update every token (fastest)
+  # update_period=16 means update every 16th token (slowest)
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 4
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 16
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+  cms_use_chunk_scheduling: false  # Enable frequency-based chunk scheduling
+
+  # Self-modifier settings
+  self_mod_dim: 64              # Hidden dim for SelfModifier MLP
+  surprise_threshold: 0.0       # Min surprise to trigger memory update (0=always)
+
+  # ─── Diagnostics (Criticism §1: log all relevant parameters) ───
+  log_hope_diagnostics: true
+
+  # ─── Regularization ───
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # ─── Loss settings (same as AC predictor for comparability) ───
+  T_teacher: 7                   # Teacher-forcing prediction steps
+  T_rollout: 2                   # Rollout prediction steps
+  context_frames: 1              # Ground-truth context frames for rollout
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+  normalize_reps: true            # Layer norm after predictor steps (V-JEPA2 paper)
+  loss_exp: 1.0                   # 1.0=L1, 2.0=L2
+
+  # Curriculum learning (null = disabled)
+  curriculum_schedule: null
+
+  # ─── Optimizer settings ───
+  learning_rate: 1e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  warmup_epochs: 10
+  max_epochs: ${trainer.max_epochs}
+
+  # Per-group LR scaling (Titan memories get lower LR for stability)
+  titan_lr_scale: 0.5             # Titan params LR = learning_rate * 0.5
+  cms_lr_scale: 1.0               # CMS params LR = learning_rate * 1.0

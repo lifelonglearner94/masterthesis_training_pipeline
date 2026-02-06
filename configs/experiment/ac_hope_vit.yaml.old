@@ -1,0 +1,145 @@
+# @package _global_
+# =============================================================================
+# AC-HOPE-ViT — Adaptive Continuum Vision Transformer (Novel Architecture)
+# =============================================================================
+# Use as: uv run src/train.py experiment=ac_hope_vit paths.data_dir=/path/to/clips
+#
+# This experiment trains the AC-HOPE-ViT model which replaces the standard
+# Transformer backbone (Attention + MLP) with the HOPE architecture:
+#   - Self-Modifying Titan memories (adaptive attention replacement)
+#   - CMS multi-frequency MLPs (multi-timescale FFN replacement)
+#
+# Same data pipeline and loss formulation as vjepa2_ac for scientific comparability.
+#
+# TEMPORAL DIMENSIONS:
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Available prediction steps: 7 (num_timesteps - 1 = 8 - 1)
+#   - T_teacher/T_rollout must be <= 7
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+callbacks:
+  verbose_logging:
+    _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
+    log_memory: False
+    log_data: False
+    log_forward_pass: False
+    log_backward_pass: False
+    log_gradients: False
+    log_weights: False
+    log_every_n_batches: 16
+    max_layers_to_log: 30
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "ac_hope_vit"
+tags: ["hope", "titan", "cms", "ac_predictor", "robotics", "novel_architecture"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# ⚠️  MEMORY-CRITICAL SETTINGS
+# =============================================================================
+# AC-HOPE-ViT uses ~2-3× more memory than the standard AC predictor due to:
+#   1. Titan memory inner-loop gradients (second-order)
+#   2. 5 adaptive memories per HOPE block (M_k, M_v, M_eta, M_alpha, M_memory)
+#   3. CMS multi-frequency MLPs (3 levels × depth)
+#
+# If you run out of memory, reduce in order:
+#   1. batch_size: 32 → 16 → 8 → 4
+#   2. depth (via model override): 24 → 12 → 6
+#   3. titan_hidden_multiplier: 4 → 2
+#   4. cms_level_specs: remove "slow" level
+#   5. use_activation_checkpointing: true
+
+data:
+  batch_size: 32                   # ⚠️ Lower than AC predictor due to memory
+  num_workers: 8
+  pin_memory: true
+
+model:
+  # --- Memory settings ---
+  T_teacher: 7                     # Predict 7 timesteps with teacher forcing
+  T_rollout: 7                     # Predict 7 timesteps autoregressively
+  context_frames: 1                # Use 1 ground-truth context frame (z₀)
+  use_activation_checkpointing: true  # ⚠️ Needed for 24-layer HOPE
+
+  # --- Action dimension (dataset-specific) ---
+  action_embed_dim: 2              # 2D actions for this dataset
+
+  # --- HOPE architecture overrides ---
+  # These can be tuned for ablation studies:
+  use_rope: true                   # Toggle 3D RoPE (Criticism §2)
+  titan_hidden_multiplier: 4       # Titan MLP hidden = dim * 4
+  titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
+  self_mod_dim: 64                 # SelfModifier hidden dimension
+  surprise_threshold: 0.0          # 0 = always update memories
+
+  # CMS levels (can be simplified for faster training):
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 4
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 16
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+
+  # --- Diagnostics (Criticism §1) ---
+  log_hope_diagnostics: true
+
+  # --- Loss weights ---
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # --- Curriculum Learning Schedule ---
+  # Same progression as vjepa2_ac for comparability:
+  #   Phase 1: Stabilization - high teacher weight
+  #   Phase 2: Transition - reduce teacher weight
+  #   Phase 3: Rollout-dominant - long-horizon dynamics
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
+      loss_weight_teacher: 0.3
+
+  # --- Optimizer (V-JEPA2 paper settings, adapted for HOPE) ---
+  learning_rate: 4.25e-4           # Peak LR
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling:
+  # Titan memories get lower LR because they already do inner-loop optimization
+  titan_lr_scale: 0.5              # Titan LR = 4.25e-4 * 0.5 = 2.125e-4
+  cms_lr_scale: 1.0                # CMS LR = 4.25e-4 * 1.0 = 4.25e-4
+
+  # --- LR schedule (iteration-based, V-JEPA2 paper) ---
+  use_iteration_scheduler: true
+  warmup_pct: 0.085       # ~8.5% warmup
+  constant_pct: 0.83      # ~83% constant LR
+  decay_pct: 0.085        # ~8.5% linear decay
+  warmup_start_lr: 7.5e-5
+
+# =============================================================================
+# TRAINER SETTINGS
+# =============================================================================
+trainer:
+  max_epochs: 30
+  gradient_clip_val: 1.01          # Same as vjepa2_ac
+  gradient_clip_algorithm: norm

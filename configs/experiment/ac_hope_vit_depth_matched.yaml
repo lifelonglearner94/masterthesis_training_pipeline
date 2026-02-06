@@ -1,0 +1,154 @@
+# @package _global_
+# =============================================================================
+# Experiment 2: AC-HOPE-ViT — Depth-Matched (12 layers, ~83M)
+# =============================================================================
+# Use as: uv run src/train.py experiment=ac_hope_vit_depth_matched paths.data_dir=/path/to/clips
+#
+# COMPARISON DESIGN:
+#   Baseline (vjepa2_ac):  depth=24, standard Transformer    → 43.38M params
+#   This experiment:       depth=12, HOPE (Titan+CMS)        → 83.29M params
+#   Difference: +92% more params (depth-controlled, not parameter-controlled)
+#
+# SCIENTIFIC RATIONALE:
+#   This is a depth-controlled comparison. Both models have meaningful depth
+#   for sequential feature processing (12 vs 24 layers). The parameter
+#   asymmetry (83M vs 43M) is the acknowledged tradeoff — it's inherent to
+#   the HOPE architecture which uses 5 Titan memories per block.
+#
+#   Together with the parameter-matched experiment (ac_hope_vit_param_matched,
+#   depth=6, 42M), these two experiments bracket the true effect:
+#     - Param-matched (d=6):  controls for capacity, confounds depth
+#     - Depth-matched (d=12): controls for depth, confounds capacity
+#
+#   If HOPE outperforms in BOTH experiments, the evidence is strong.
+#   If only in one, the confound explains the difference.
+#
+# KEY SETTINGS:
+#   - depth: 12                    (half of baseline, but still deep enough)
+#   - titan_hidden_multiplier: 2   (moderate Titan MLP size)
+#   - CMS levels: 3 × 4.0         (full multi-timescale hierarchy)
+#
+# TEMPORAL DIMENSIONS:
+#   - Original video: 16 frames
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Available prediction steps: 7 (num_timesteps - 1 = 8 - 1)
+#   - T_teacher/T_rollout must be <= 7
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+callbacks:
+  verbose_logging:
+    _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
+    log_memory: False
+    log_data: False
+    log_forward_pass: False
+    log_backward_pass: False
+    log_gradients: False
+    log_weights: False
+    log_every_n_batches: 16
+    max_layers_to_log: 30
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "ac_hope_vit_depth_matched"
+tags: ["hope", "titan", "cms", "depth_matched", "depth_12", "robotics"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# ⚠️  MEMORY-CRITICAL SETTINGS
+# =============================================================================
+# With depth=12 and titan_hm=2, this model is ~2× the baseline in parameters
+# and ~2-3× in memory due to Titan inner-loop gradients.
+#
+# If you run out of memory, reduce in order:
+#   1. batch_size: 32 → 16 → 8 → 4
+#   2. num_workers: 8 → 4 → 0
+#   3. cms_level_specs: remove "slow" level
+#   4. use_activation_checkpointing: true (already enabled)
+
+data:
+  batch_size: 32                   # ⚠️ Lower than baseline (12 HOPE blocks)
+  num_workers: 8
+  pin_memory: true
+
+model:
+  # --- Temporal / loss settings (identical to vjepa2_ac for comparability) ---
+  T_teacher: 7
+  T_rollout: 7
+  context_frames: 1
+  use_activation_checkpointing: true  # ⚠️ Needed for 12-layer HOPE
+
+  # --- Action dimension (dataset-specific) ---
+  action_embed_dim: 2              # 2D actions for this dataset
+
+  # --- HOPE architecture (depth-matched) ---
+  depth: 12                        # Depth-matched: meaningful sequential depth
+  titan_hidden_multiplier: 2       # Titan MLP hidden = 384×2 = 768
+  use_rope: true                   # 3D RoPE enabled (Criticism §2: toggleable)
+  titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
+  self_mod_dim: 64                 # SelfModifier hidden dimension
+  surprise_threshold: 0.0          # 0 = always update memories
+
+  # CMS levels — full multi-timescale hierarchy
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 4
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 16
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+
+  # --- Diagnostics (Criticism §1) ---
+  log_hope_diagnostics: true
+
+  # --- Loss weights ---
+  loss_weight_teacher: 1.0
+  loss_weight_rollout: 1.0
+
+  # --- Curriculum Learning Schedule (identical to vjepa2_ac) ---
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
+      loss_weight_teacher: 0.3
+
+  # --- Optimizer (V-JEPA2 paper settings, adapted for HOPE) ---
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  titan_lr_scale: 0.5              # Titan LR = 4.25e-4 × 0.5 = 2.125e-4
+  cms_lr_scale: 1.0                # CMS LR = 4.25e-4 × 1.0 = 4.25e-4
+
+  # --- LR schedule (iteration-based, V-JEPA2 paper) ---
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+# =============================================================================
+# TRAINER SETTINGS (identical to vjepa2_ac)
+# =============================================================================
+trainer:
+  max_epochs: 30
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
