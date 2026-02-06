@@ -562,9 +562,11 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         log.info(f"[AC-HOPE-ViT] Configuration: {config}")
 
         # Log scalar config values to wandb for reproducibility
-        for key, val in config.items():
-            if isinstance(val, (int, float)):
-                self.log(f"config/{key}", float(val))
+        # Note: self.log() is not allowed in on_fit_start, use logger directly
+        if self.logger:
+            for key, val in config.items():
+                if isinstance(val, (int, float)):
+                    self.logger.experiment.log({f"config/{key}": float(val)})
 
     # ─── Test epoch hooks ───
 
