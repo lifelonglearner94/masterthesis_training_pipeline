@@ -10,14 +10,14 @@ Dieser Ablauf beschreibt den "Forward Pass", wie er in den Logs (sowohl beim *Te
 
 #### Schritt 1: Input & Normalisierung
 
-* **Visuelle Features:** Der Input sind extrahierte Feature-Maps (wahrscheinlich von einem DINOv2 oder ähnlichen Encoder).
-* Shape:  (Batch=4, Time=7, Patches=256, Dim=1024).
+* **Visuelle Features:** Der Input sind extrahierte Feature-Maps (aus dem V-JEPA 2 Encoder).
+* Shape:  (Batch=4, Time=8, Patches=256, Dim=1024).
 * Die Features werden abgeflacht zu . Im Log entspricht das `[4, 1792, 1024]` (da ).
 * **LayerNorm:** Eine Normalisierung wird direkt auf die Features angewendet.
 
 
 
-#### Schritt 2: Embedding & Projektion (Encoder)
+#### Schritt 2: Embedding & Projektion
 
 Hier werden alle Inputs auf die interne Dimension des Transformers () gebracht.
 
@@ -74,39 +74,39 @@ Nach den 24 Blöcken muss die Sequenz bereinigt werden, um nur die visuellen Vor
 ```mermaid
 graph TD
     subgraph Inputs
-        IMG[Input Features\n(Batch, Time, 256, 1024)]
-        ACT[Actions\n(Batch, Time, 2)]
-        STATE[States\n(Batch, Time, 2)]
+        IMG["Input Features\n(Batch, Time, 256, 1024)"]
+        ACT["Actions\n(Batch, Time, 2)"]
+        STATE["States\n(Batch, Time, 2)"]
     end
 
     subgraph Encoder_Stage["Encoder Stage (Dim Transformation)"]
         LN_IN[LayerNorm]
-        PROJ_IMG[Linear Projection\n1024 -> 384]
-        PROJ_ACT[Action Encoder\n2 -> 384]
-        PROJ_STATE[State Encoder\n2 -> 384]
+        PROJ_IMG["Linear Projection\n1024 -> 384"]
+        PROJ_ACT["Action Encoder\n2 -> 384"]
+        PROJ_STATE["State Encoder\n2 -> 384"]
     end
 
     subgraph Sequence_Construction["Sequence Construction"]
-        INTERLEAVE[Token Interleaving\nInsert Action/State tokens\ninto sequence per timestep\nSeq Len: 1792 -> 1806]
-        MASK[Attention Mask\n(Causal/Full)]
+        INTERLEAVE["Token Interleaving\nInsert Action/State tokens\ninto sequence per timestep\nSeq Len: 1792 -> 1806"]
+        MASK["Attention Mask\n(Causal/Full)"]
     end
 
     subgraph Vision_Transformer_Backbone
         direction TB
-        BLOCK_0[Transformer Block 0\n(ACRoPEAttn + MLP)]
+        BLOCK_0["Transformer Block 0\n(ACRoPEAttn + MLP)"]
         BLOCK_MID[... Blocks 1-22 ...]
-        BLOCK_23[Transformer Block 23\n(ACRoPEAttn + MLP)]
+        BLOCK_23["Transformer Block 23\n(ACRoPEAttn + MLP)"]
 
-        info1[Details:\n- 24 Layers\n- Dim: 384\n- Heads: 16\n- RoPE Embeddings]
+        info1["Details:\n- 24 Layers\n- Dim: 384\n- Heads: 16\n- RoPE Embeddings"]
     end
 
     subgraph Decoder_Stage["Decoder Stage"]
-        REMOVE[Remove Tokens\nDiscard Action/State tokens\nSeq Len: 1806 -> 1792]
-        LN_OUT[Predictor Norm\nLayerNorm]
-        PROJ_OUT[Output Projection\nLinear 384 -> 1024]
+        REMOVE["Remove Tokens\nDiscard Action/State tokens\nSeq Len: 1806 -> 1792"]
+        LN_OUT["Predictor Norm\nLayerNorm"]
+        PROJ_OUT["Output Projection\nLinear 384 -> 1024"]
     end
 
-    OUT[Predicted Features\n(Batch, Time, 256, 1024)]
+    OUT["Predicted Features\n(Batch, Time, 256, 1024)"]
     LOSS((L1 Loss))
 
     %% Connections
