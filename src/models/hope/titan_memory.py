@@ -267,35 +267,43 @@ class TitanMemory(nn.Module):
             )
 
         # ─── Compute inner-loop gradient ───
-        # Create leaf copies for autograd.grad() — these are detached from
-        # the meta-gradient chain (first-order: we don't differentiate through
-        # the gradient computation itself, only through w_old in the update).
-        w1_leaf = self._active_w1.detach().requires_grad_(True)
-        w2_leaf = self._active_w2.detach().requires_grad_(True)
+        # The inner-loop runs during BOTH training and inference (paper:
+        # "There is no distinction between training and test time.").
+        # We need torch.enable_grad() here because during validation/test
+        # Lightning disables gradients, but the inner-loop still needs to
+        # compute gradients w.r.t. its own leaf weights for the DGD update.
+        # This does NOT affect the outer-loop: create_graph=False ensures
+        # no second-order gradients are computed.
+        with torch.enable_grad():
+            # Create leaf copies for autograd.grad() — these are detached from
+            # the meta-gradient chain (first-order: we don't differentiate through
+            # the gradient computation itself, only through w_old in the update).
+            w1_leaf = self._active_w1.detach().requires_grad_(True)
+            w2_leaf = self._active_w2.detach().requires_grad_(True)
 
-        # Forward through memory with leaf weights
-        h = F.linear(key, w1_leaf)
-        h = self.act(h)
-        retrieved = F.linear(h, w2_leaf) + key  # Residual
+            # Forward through memory with leaf weights
+            h = F.linear(key, w1_leaf)
+            h = self.act(h)
+            retrieved = F.linear(h, w2_leaf) + key  # Residual
 
-        # Inner loss: MSE between retrieved and target values (Eq. 93)
-        # Normalized by element count to decouple gradient magnitude from
-        # sequence/feature dimensions (prevents ~1.8M-scale raw gradients).
-        inner_loss = F.mse_loss(
-            retrieved, value.detach(), reduction="none"
-        )  # [B, N, D]
+            # Inner loss: MSE between retrieved and target values (Eq. 93)
+            # Normalized by element count to decouple gradient magnitude from
+            # sequence/feature dimensions (prevents ~1.8M-scale raw gradients).
+            inner_loss = F.mse_loss(
+                retrieved, value.detach(), reduction="none"
+            )  # [B, N, D]
 
-        # Weight by error_signal (surprise gating): [B] → [B, 1, 1]
-        gate = error_signal.detach().unsqueeze(-1).unsqueeze(-1)
-        inner_loss = (inner_loss * gate).mean()
+            # Weight by error_signal (surprise gating): [B] → [B, 1, 1]
+            gate = error_signal.detach().unsqueeze(-1).unsqueeze(-1)
+            inner_loss = (inner_loss * gate).mean()
 
-        # First-order inner-loop gradients (FOMAML-style: no Hessian)
-        grads = torch.autograd.grad(
-            inner_loss,
-            [w1_leaf, w2_leaf],
-            create_graph=False,
-            allow_unused=True,
-        )
+            # First-order inner-loop gradients (FOMAML-style: no Hessian)
+            grads = torch.autograd.grad(
+                inner_loss,
+                [w1_leaf, w2_leaf],
+                create_graph=False,
+                allow_unused=True,
+            )
 
         # ─── Compute per-feature η and α for weight update ───
         # η and α are [B, N, D] — average over batch and tokens to get
@@ -345,13 +353,22 @@ class TitanMemory(nn.Module):
             #   w2 [D, hidden]: preconditioner scales rows (output dim = D)
             # w_old is connected to nn.Parameters (meta-gradient flows through)
             # grad is detached (first-order: no meta-gradient through inner grad)
+            #
+            # STABILITY: Clamp preconditioner to [0, 1] range. The paper defines
+            # α as a "retention gate" (Eq. 88) and η as a learning rate, so
+            # (α − η·k²) is a decay factor that MUST stay in [0, 1] to prevent
+            # exponential weight growth across sequential chunk updates.
+            # Without clamping, 7 sequential updates can compound to precond^7,
+            # which causes NaN gradients in the backward pass.
             if idx == 0:
                 # w1: [hidden, D] — α/η/k² broadcast along columns (dim D)
                 precond = alpha_feat.unsqueeze(0) - lr_feat.unsqueeze(0) * k_sq.unsqueeze(0)  # [1, D]
+                precond = precond.clamp(0.0, 1.0)
                 new_w = w_old * precond - lr_feat.unsqueeze(0) * grad
             else:
                 # w2: [D, hidden] — α/η/k² broadcast along rows (dim D)
                 precond = alpha_feat.unsqueeze(1) - lr_feat.unsqueeze(1) * k_sq.unsqueeze(1)  # [D, 1]
+                precond = precond.clamp(0.0, 1.0)
                 new_w = w_old * precond - lr_feat.unsqueeze(1) * grad
             new_weights.append(new_w)
 

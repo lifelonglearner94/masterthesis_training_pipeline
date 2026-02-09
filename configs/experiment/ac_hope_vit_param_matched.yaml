@@ -75,9 +75,9 @@ data:
 model:
   # --- Temporal / loss settings (adapted for HOPE bi-level optimization) ---
   T_teacher: 7
-  T_rollout: 2                     # ↓ from 7: memory corruption feedback loop over long rollouts
+  T_rollout: 7                     # ↓ from 7: memory corruption feedback loop over long rollouts
   context_frames: 1
-  use_activation_checkpointing: true
+  use_activation_checkpointing: false   # HOPE DGD updates mutate state during forward — incompatible with checkpoint recomputation
 
   # --- Action dimension (dataset-specific) ---
   action_embed_dim: 2              # 2D actions for this dataset
@@ -88,7 +88,7 @@ model:
   use_rope: true                   # 3D RoPE enabled (Criticism §2: toggleable)
   titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
   chunk_size: 1                    # 0 = safe default; 1 = also trains M_eta/M_alpha (needs ~2-3× VRAM)
-  titan_detach_interval: 4         # Detach every step (MPS/consumer safe); set 0 on datacenter GPU
+  titan_detach_interval: 1         # Detach every step (MPS/consumer safe); set 4+ on datacenter GPU
   surprise_threshold: 0.0          # 0 = always update memories
 
   # CMS levels — full multi-timescale hierarchy preserved
@@ -148,5 +148,6 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 60                   # ↑ from 30 (meta-learning converges slower)
+  precision: 32                    # HOPE inner-loop needs full precision (MPS fp16 support limited)
   gradient_clip_val: 3.0           # ↑ from 1.01 (allow meta-gradient signal through)
   gradient_clip_algorithm: norm
