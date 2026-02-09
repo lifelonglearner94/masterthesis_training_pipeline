@@ -344,6 +344,24 @@ class ACHOPEViT(nn.Module):
         for blk in self.hope_blocks:
             blk.reset_memory_state()
 
+    def get_aux_loss(self) -> Tensor:
+        """Aggregate auxiliary M_k/M_v retrieval-quality loss from all blocks.
+
+        This loss provides gradient flow to M_k and M_v parameters which
+        otherwise receive no gradients under first-order meta-learning
+        (FOMAML). Should be added to the outer loss with a small weight.
+
+        Returns:
+            Scalar tensor with accumulated auxiliary loss.
+        """
+        total = torch.tensor(0.0, device=next(self.parameters()).device)
+        for blk in self.hope_blocks:
+            if blk._aux_loss.device != total.device:
+                total = total + blk._aux_loss.to(total.device)
+            else:
+                total = total + blk._aux_loss
+        return total
+
     def get_all_diagnostics(self) -> dict[str, float]:
         """Aggregate diagnostics from all HOPE blocks (Criticism §1).
 

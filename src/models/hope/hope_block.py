@@ -160,6 +160,9 @@ class HOPEBlock(nn.Module):
         self._last_surprise: Tensor | None = None
         self._last_inner_grad_norm: float = 0.0
 
+        # Auxiliary loss for M_k/M_v gradient flow (accumulated per forward)
+        self._aux_loss: Tensor = torch.tensor(0.0)
+
     def forward(
         self,
         x: Tensor,
@@ -293,11 +296,12 @@ class HOPEBlock(nn.Module):
         eta_raw = self.M_eta(x)     # Adaptive: η_t raw  (Eq. 80)
         alpha_raw = self.M_alpha(x)  # Adaptive: α_t raw  (Eq. 80)
 
-        # Normalize η and α to reasonable ranges (per-token, [B, C, 1])
+        # Normalize η and α to reasonable ranges — per-token, per-feature [B, C, D]
+        # Paper Eq. 88: η_t, α_t ∈ R^d (full-dimensional, per-token)
         # η (learning rate): softplus to ensure positive, then scale down
-        eta = F.softplus(eta_raw.mean(dim=-1, keepdim=True)) * 0.01  # [B, C, 1]
+        eta = F.softplus(eta_raw) * 0.01  # [B, C, D]
         # α (decay): sigmoid to [0, 1] range
-        alpha = torch.sigmoid(alpha_raw.mean(dim=-1, keepdim=True))  # [B, C, 1]
+        alpha = torch.sigmoid(alpha_raw)  # [B, C, D]
 
         # Step 2: Optional 3D RoPE on Q and K (Criticism §2: configurable)
         if self.config.use_rope and T is not None and H is not None and W is not None:
@@ -307,7 +311,10 @@ class HOPEBlock(nn.Module):
         output = self.M_memory(q)   # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
 
         # Step 4-6: Compute surprise + per-memory self-targets + DGD update
-        if self.training and torch.is_grad_enabled():
+        # Paper: "There is no distinction between training and test time."
+        # The inner loop runs during BOTH training and inference so the model
+        # adapts in-context to each sequence (core HOPE advantage).
+        if torch.is_grad_enabled() or not self.training:
             # Retrieval error as surprise signal
             retrieval_error = v - output  # [B, C, D]
             surprise = self.M_memory.surprise(retrieval_error)  # [B]
@@ -472,12 +479,21 @@ class HOPEBlock(nn.Module):
         This is the "self-referential" property: each memory uses its own
         weights to decide what it should learn.
 
+        Auxiliary loss for M_k/M_v gradient flow:
+            Under first-order meta-learning (FOMAML), M_k and M_v outputs
+            are only consumed inside the inner-loop where weights are detached,
+            so no outer-loss gradient reaches M_k/M_v parameters. To fix this,
+            we compute a small auxiliary loss measuring how well the adaptive
+            k,v projections serve the main memory retrieval. This loss is
+            accumulated in self._aux_loss and added to the outer loss by the
+            Lightning module (with a small weight to avoid dominating training).
+
         Args:
-            k: [B, N, D] keys.
-            v: [B, N, D] values (raw, before self-target generation).
+            k: [B, N, D] keys (output of M_k, in computation graph).
+            v: [B, N, D] values (output of M_v, in computation graph).
             surprise: [B] surprise signal per sample.
-            eta: [B, N, 1] adaptive learning rate.
-            alpha: [B, N, 1] adaptive decay factor.
+            eta: [B, N, D] adaptive learning rate.
+            alpha: [B, N, D] adaptive decay factor.
         """
         memories = [self.M_k, self.M_v, self.M_eta, self.M_alpha, self.M_memory]
 
@@ -492,6 +508,20 @@ class HOPEBlock(nn.Module):
                 alpha=alpha,
             )
 
+        # ─── Auxiliary loss for M_k / M_v gradient flow ───
+        # Compute how well the adaptive k from M_k retrieves from M_memory.
+        # This creates a differentiable path: M_k params → k → retrieval → aux_loss
+        # and similarly M_v params → v → target matching → aux_loss.
+        # Both k and v are live tensors (in the computation graph from M_k/M_v
+        # forward passes above), so gradients flow back to M_k/M_v parameters.
+        if self.training and torch.is_grad_enabled():
+            # Retrieve using adaptive keys through the (now updated) memory
+            retrieved_via_k = self.M_memory(k)  # [B, N, D] — differentiable through k
+            # Measure how close retrieved values are to the adaptive v
+            aux = F.mse_loss(retrieved_via_k, v.detach())  # M_k path
+            aux = aux + F.mse_loss(retrieved_via_k.detach(), v)  # M_v path
+            self._aux_loss = self._aux_loss + aux
+
     def reset_memory_state(self) -> None:
         """Reset all memory states to meta-learned initial parameters.
 
@@ -503,6 +533,8 @@ class HOPEBlock(nn.Module):
             mem.reset_active_weights()
             mem.reset_diagnostics()
         self.cms.reset_step_counter()
+        # Reset auxiliary loss accumulator for this sequence
+        self._aux_loss = torch.tensor(0.0, device=next(self.parameters()).device)
 
     def get_diagnostics(self) -> dict[str, float]:
         """Aggregate diagnostics from all sub-components.

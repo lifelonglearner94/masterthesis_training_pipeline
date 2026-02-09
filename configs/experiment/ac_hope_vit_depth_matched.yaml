@@ -142,6 +142,7 @@ model:
   titan_lr_scale: 0.2              # ↓ from 0.5 — Titan LR = 1.5e-4 × 0.2 = 3e-5
   cms_lr_scale: 1.0                # CMS LR = 1.5e-4 × 1.0 = 1.5e-4
   titan_weight_decay: 0.005        # ↓ from 0.04 — avoid double regularization with inner-loop α
+  aux_loss_weight: 0.1             # Weight for M_k/M_v auxiliary retrieval-quality loss
 
   # --- LR schedule (longer warmup for meta-learning stabilization) ---
   use_iteration_scheduler: true

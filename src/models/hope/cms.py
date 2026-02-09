@@ -160,7 +160,11 @@ class CMS(nn.Module):
         """Forward pass through all CMS levels (cascade).
 
         In standard mode, all levels process every token. In chunk scheduling
-        mode, slower levels are skipped based on their update_period.
+        mode, slower levels are applied per-token based on their update_period:
+        each token is checked against the global temporal step counter so that
+        faster levels process every token while slower levels only process
+        every `update_period`-th token (matching the paper's multi-timescale
+        intent within a sequence).
 
         Args:
             x: [B, N, D] input tokens from Titan memory output.
@@ -168,17 +172,45 @@ class CMS(nn.Module):
         Returns:
             [B, N, D] processed tokens.
         """
-        for i, (block, spec) in enumerate(zip(self.blocks, self.levels_spec)):
-            if self.use_chunk_scheduling:
-                # Check if this level should update at current step
-                step = self._global_step.item()
-                if step < spec.warmup_steps:
-                    continue  # Skip during warmup
-                if spec.update_period > 1 and step % spec.update_period != 0:
-                    continue  # Skip non-update steps
-            x = block(x)
+        if not self.use_chunk_scheduling:
+            # Standard mode: all levels process all tokens
+            for block in self.blocks:
+                x = block(x)
+            return x
 
-        self._global_step += 1
+        # ─── Chunk-scheduling mode: per-token temporal frequency gating ───
+        B, N, D = x.shape
+        base_step = self._global_step.item()
+
+        for block, spec in zip(self.blocks, self.levels_spec):
+            if spec.update_period <= 1 and base_step >= spec.warmup_steps:
+                # Fast level: process all tokens (no filtering needed)
+                x = block(x)
+                continue
+
+            # Build a mask of which tokens should be processed by this level
+            # based on their temporal index within the sequence
+            token_steps = torch.arange(N, device=x.device) + base_step
+            update_mask = (
+                (token_steps >= spec.warmup_steps)
+                & (token_steps % spec.update_period == 0)
+            )
+
+            if not update_mask.any():
+                continue  # No tokens need this level at current steps
+
+            if update_mask.all():
+                x = block(x)  # All tokens qualify — skip masking overhead
+            else:
+                # Process only qualifying tokens, leave others unchanged
+                indices = update_mask.nonzero(as_tuple=True)[0]  # [K]
+                x_sub = x[:, indices, :]       # [B, K, D]
+                x_sub = block(x_sub)           # [B, K, D]
+                x = x.clone()  # Avoid in-place modification on autograd graph
+                x[:, indices, :] = x_sub
+
+        # Advance step counter by the number of tokens processed
+        self._global_step += N
         return x
 
     def reset_step_counter(self) -> None:

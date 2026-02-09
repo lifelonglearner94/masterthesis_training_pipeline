@@ -24,7 +24,8 @@ Implementation approach — functional forward with meta-learning:
 The memory supports:
     - Meta-learned initial states via preserved gradient flow (Pillar 3)
     - Self-generated target values v̂ = M(v) for self-referential learning
-    - Per-token η and α for fine-grained adaptation
+    - Per-token, per-feature η and α ∈ R^d for fine-grained adaptation (Eq. 88)
+    - DGD preconditioner (diagonal approx of k_t k_t^T) for decorrelated updates
     - Surprise-gated updates (only write when retrieval error is high)
     - Gradient norm clipping for inner-loop stability
     - Periodic graph detachment to bound VRAM usage
@@ -237,20 +238,23 @@ class TitanMemory(nn.Module):
         FOMAML-style). The meta-gradient flows through w_old, NOT through
         the inner-loop gradient computation itself.
 
-        Per-token η and α are averaged over batch/tokens for the weight update
-        (since weights are shared across tokens), but kept as tensors (not
-        Python floats) to preserve computational graph when needed.
+        Per-feature η and α are averaged over batch/tokens but kept as D-dim
+        vectors for per-feature adaptation granularity (Eq. 88, Behrouz 2025).
 
-        DGD update rule (Eq. 93 in Behrouz 2025, L2 regression):
+        Full DGD update rule (Eq. 93 in Behrouz 2025):
             M_t = M_{t-1} (α_t I − η_t k_t k_t^T) − η_t (M_{t-1} k_t − v̂_t) k_t^T
-            ≈ α * M_{t-1} − η * ∇L_inner   (simplified for nonlinear MLP)
+
+        For nonlinear MLPs, the k_t k_t^T preconditioner is applied as a
+        diagonal approximation: each weight row/column is scaled by the
+        mean squared key magnitude along its corresponding dimension.
+        This decorrelates correlated token updates (the core DGD innovation).
 
         Args:
             key:   [B, N, D]  keys to write.
             value: [B, N, D]  self-generated target values v̂_□.
             error_signal: [B]  per-sample gating (surprise).
-            lr:    [B, N, 1]  per-token adaptive learning rate η_t.
-            alpha: [B, N, 1]  per-token adaptive decay α_t (default 1.0).
+            lr:    [B, N, D]  per-token, per-feature adaptive learning rate η_t.
+            alpha: [B, N, D]  per-token, per-feature adaptive decay α_t (default 1.0).
 
         Raises:
             RuntimeError: If active weights have not been initialized via
@@ -275,13 +279,15 @@ class TitanMemory(nn.Module):
         retrieved = F.linear(h, w2_leaf) + key  # Residual
 
         # Inner loss: MSE between retrieved and target values (Eq. 93)
+        # Normalized by element count to decouple gradient magnitude from
+        # sequence/feature dimensions (prevents ~1.8M-scale raw gradients).
         inner_loss = F.mse_loss(
             retrieved, value.detach(), reduction="none"
         )  # [B, N, D]
 
         # Weight by error_signal (surprise gating): [B] → [B, 1, 1]
         gate = error_signal.detach().unsqueeze(-1).unsqueeze(-1)
-        inner_loss = (inner_loss * gate).sum()
+        inner_loss = (inner_loss * gate).mean()
 
         # First-order inner-loop gradients (FOMAML-style: no Hessian)
         grads = torch.autograd.grad(
@@ -291,23 +297,29 @@ class TitanMemory(nn.Module):
             allow_unused=True,
         )
 
-        # ─── Compute per-token η and α for weight update ───
-        # Weights are shared across batch/tokens, so we average η/α to get
-        # a single scalar multiplier. η and α are kept IN the computation
-        # graph (no .detach()) so the outer-loop can train M_eta and M_alpha
-        # through the DGD update: new_w = α * w_old − η * grad.
-        lr_mean = lr.mean()
-        alpha_mean = (
-            alpha.mean() if alpha is not None
-            else torch.ones(1, device=key.device)
+        # ─── Compute per-feature η and α for weight update ───
+        # η and α are [B, N, D] — average over batch and tokens to get
+        # per-feature [D] vectors, then kept IN the computation graph
+        # so the outer-loop can train M_eta and M_alpha through the
+        # DGD update: new_w = α * w_old − η * grad.
+        lr_feat = lr.mean(dim=(0, 1))    # [D] per-feature learning rate
+        alpha_feat = (
+            alpha.mean(dim=(0, 1)) if alpha is not None  # [D] per-feature decay
+            else torch.ones(key.shape[-1], device=key.device)
         )
+
+        # ─── DGD preconditioner: diagonal approximation of k_t k_t^T ───
+        # Paper Eq. 93: M_t = M_{t-1}(α I − η k k^T) − η ∇L
+        # For nonlinear MLP, we use diagonal: diag(mean(k^2)) per feature dim.
+        # This decorrelates correlated token updates (core DGD innovation).
+        k_sq = (key.detach() ** 2).mean(dim=(0, 1))  # [D] mean squared key per feature
 
         inner_grad_norm_sq = 0.0
         new_weights: list[Tensor] = []
 
-        for w_old, grad in zip(
+        for idx, (w_old, grad) in enumerate(zip(
             [self._active_w1, self._active_w2], grads
-        ):
+        )):
             if grad is None:
                 new_weights.append(w_old)
                 continue
@@ -326,10 +338,21 @@ class TitanMemory(nn.Module):
                     self.config.grad_clip_inner / (grad_norm + 1e-8)
                 )
 
-            # DGD update: W_new = alpha * W_old - eta * grad
+            # DGD update with preconditioner (Eq. 93, Behrouz 2025):
+            #   W_new = W_old * (α I − η k k^T) − η * grad
+            # For weight matrices:
+            #   w1 [hidden, D]: preconditioner scales columns (input dim = D)
+            #   w2 [D, hidden]: preconditioner scales rows (output dim = D)
             # w_old is connected to nn.Parameters (meta-gradient flows through)
             # grad is detached (first-order: no meta-gradient through inner grad)
-            new_w = alpha_mean * w_old - lr_mean * grad
+            if idx == 0:
+                # w1: [hidden, D] — α/η/k² broadcast along columns (dim D)
+                precond = alpha_feat.unsqueeze(0) - lr_feat.unsqueeze(0) * k_sq.unsqueeze(0)  # [1, D]
+                new_w = w_old * precond - lr_feat.unsqueeze(0) * grad
+            else:
+                # w2: [D, hidden] — α/η/k² broadcast along rows (dim D)
+                precond = alpha_feat.unsqueeze(1) - lr_feat.unsqueeze(1) * k_sq.unsqueeze(1)  # [D, 1]
+                new_w = w_old * precond - lr_feat.unsqueeze(1) * grad
             new_weights.append(new_w)
 
         # Assign updated active weights (tensor reassignment, no in-place)

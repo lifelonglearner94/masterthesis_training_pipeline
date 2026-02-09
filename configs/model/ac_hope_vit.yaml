@@ -110,3 +110,4 @@ model:
   titan_lr_scale: 0.2             # Titan params LR = learning_rate * 0.2
   cms_lr_scale: 1.0               # CMS params LR = learning_rate * 1.0
   titan_weight_decay: 0.005       # Separate WD for Titan (avoids double reg with inner-loop α)
+  aux_loss_weight: 0.1            # Weight for M_k/M_v auxiliary retrieval-quality loss

@@ -83,6 +83,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         titan_lr_scale: float = 0.2,  # Titan params LR = learning_rate * titan_lr_scale
         cms_lr_scale: float = 1.0,    # CMS params LR = learning_rate * cms_lr_scale
         titan_weight_decay: float | None = None,  # Separate WD for Titan (avoids double reg with inner α)
+        aux_loss_weight: float = 0.1,  # Weight for M_k/M_v auxiliary retrieval-quality loss
         # Loss settings (same as ACPredictorModule)
         T_teacher: int = 7,
         T_rollout: int = 2,
@@ -206,6 +207,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.titan_lr_scale = titan_lr_scale
         self.cms_lr_scale = cms_lr_scale
         self.titan_weight_decay = titan_weight_decay
+        self.aux_loss_weight = aux_loss_weight
 
         # Iteration-based LR schedule
         self.use_iteration_scheduler = use_iteration_scheduler
@@ -267,11 +269,20 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         Resets all Titan memory active weights before each forward pass so
         that DGD self-modification operates on fresh detached clones, avoiding
         in-place modification errors on the outer autograd graph.
+
+        Adds auxiliary M_k/M_v retrieval-quality loss to provide gradient
+        flow to otherwise dead Titan parameters.
         """
         # Reset memory state before forward — creates detached active weight clones
         self.model.reset_all_memories()
 
         loss = self._shared_step(batch, "train")
+
+        # Add auxiliary loss for M_k/M_v gradient flow
+        aux_loss = self.model.get_aux_loss()
+        if aux_loss.item() > 0:
+            loss = loss + self.aux_loss_weight * aux_loss
+            self.log("train/aux_loss_mk_mv", aux_loss.detach(), sync_dist=True)
 
         # Log HOPE diagnostics periodically (Criticism §1)
         if self.log_hope_diagnostics and batch_idx % self._diagnostics_log_interval == 0:

@@ -96,15 +96,13 @@ class TestTitanMemoryGradientFlow:
             )
 
     def test_auxiliary_memory_grads_with_chunking(self):
-        """With chunk_size > 0, M_eta and M_alpha should receive gradients
-        because their outputs (η, α) are kept in the computation graph
-        through the DGD update, and chunk 2 reads state modified in chunk 1.
-
-        M_k and M_v do NOT get gradients in the current architecture because
-        their outputs are only used in the inner loss (where weights are
-        detached for first-order gradient computation). This is a known
-        limitation — training M_k/M_v would require second-order gradients
-        or an architectural change (e.g., using k,v in attention output).
+        """With chunk_size > 0, ALL five memories should receive gradients:
+        - M_eta and M_alpha: through the DGD update chain (new_w = α * w_old - η * grad),
+          where chunk 2 reads state modified by chunk 1.
+        - M_k and M_v: through the auxiliary retrieval-quality loss that
+          creates a differentiable path M_k→k→retrieval→aux_loss and
+          M_v→v→target matching→aux_loss.
+        - M_memory: directly through the output.
         """
         # Need enough timesteps for at least 2 chunks
         B, T, N, D = 1, 4, 256, 1024
@@ -136,27 +134,20 @@ class TestTitanMemoryGradientFlow:
         model.reset_all_memories()
 
         out = model(x, actions, states)
-        loss = out.mean()
+        # Add auxiliary loss (same as training_step does)
+        aux_loss = model.get_aux_loss()
+        loss = out.mean() + 0.1 * aux_loss
         loss.backward()
 
         block = model.hope_blocks[0]
 
-        # M_memory, M_eta, M_alpha should all have gradients with chunking
-        for name in ["M_memory", "M_eta", "M_alpha"]:
+        # ALL five memories should have gradients with chunking + aux loss
+        for name in ["M_memory", "M_eta", "M_alpha", "M_k", "M_v"]:
             mem = getattr(block, name)
             for pname, p in mem.named_parameters():
                 assert p.grad is not None, (
                     f"{name}.{pname}: grad is None — "
-                    "meta-gradient not flowing through chunk boundary!"
-                )
-
-        # M_k and M_v have NO gradients (known limitation of first-order)
-        for name in ["M_k", "M_v"]:
-            mem = getattr(block, name)
-            for pname, p in mem.named_parameters():
-                assert p.grad is None, (
-                    f"{name}.{pname}: unexpectedly has gradients — "
-                    "if this changed, update the test expectations!"
+                    "gradient not flowing through to this memory!"
                 )
 
     def test_self_generated_targets_differ_per_memory(self, tiny_model, sample_inputs):
