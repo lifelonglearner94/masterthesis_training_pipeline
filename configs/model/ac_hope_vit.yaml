@@ -64,12 +64,19 @@ model:
   # Number of timesteps per chunk. 0 = no chunking (all timesteps at once).
   # With chunking, M_eta and M_alpha get outer-loop gradients because
   # chunk 2 reads memory state modified in chunk 1.
-  # Recommended: 1 (per-timestep updates, maximal gradient flow).
-  chunk_size: 1
+  #
+  # ⚠️ VRAM WARNING: chunk_size > 0 retains computation graph across chunks
+  # (5 memories × T chunks × depth layers). This can easily OOM on consumer
+  # GPUs / MPS. Use chunk_size=0 for limited VRAM.
+  #
+  # Values: 0 = safe default (trains M_memory only)
+  #         1 = per-timestep (also trains M_eta, M_alpha; needs ~2-3× VRAM)
+  chunk_size: 0
 
   # Detach memory graph every N update steps to bound VRAM (0 = never).
-  # Recommended: 4 for depth-matched, 0 for param-matched.
-  titan_detach_interval: 0
+  # With chunk_size=0 this only affects the single DGD step per block.
+  # With chunk_size>0, set to 1-2 for MPS/consumer GPU, 4+ for datacenter GPU.
+  titan_detach_interval: 1
 
   surprise_threshold: 0.0       # Min surprise to trigger memory update (0=always)
 
@@ -100,5 +107,6 @@ model:
   max_epochs: ${trainer.max_epochs}
 
   # Per-group LR scaling (Titan memories get lower LR for stability)
-  titan_lr_scale: 0.5             # Titan params LR = learning_rate * 0.5
+  titan_lr_scale: 0.2             # Titan params LR = learning_rate * 0.2
   cms_lr_scale: 1.0               # CMS params LR = learning_rate * 1.0
+  titan_weight_decay: 0.005       # Separate WD for Titan (avoids double reg with inner-loop α)

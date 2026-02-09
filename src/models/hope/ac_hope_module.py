@@ -79,9 +79,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         titan_detach_interval: int = 0,
         surprise_threshold: float = 0.0,
         log_hope_diagnostics: bool = True,
-        # Optimizer: per-group LR scaling
-        titan_lr_scale: float = 0.5,  # Titan params LR = learning_rate * titan_lr_scale
+        # Optimizer: per-group LR/WD scaling
+        titan_lr_scale: float = 0.2,  # Titan params LR = learning_rate * titan_lr_scale
         cms_lr_scale: float = 1.0,    # CMS params LR = learning_rate * cms_lr_scale
+        titan_weight_decay: float | None = None,  # Separate WD for Titan (avoids double reg with inner α)
         # Loss settings (same as ACPredictorModule)
         T_teacher: int = 7,
         T_rollout: int = 2,
@@ -204,6 +205,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.max_epochs = max_epochs
         self.titan_lr_scale = titan_lr_scale
         self.cms_lr_scale = cms_lr_scale
+        self.titan_weight_decay = titan_weight_decay
 
         # Iteration-based LR schedule
         self.use_iteration_scheduler = use_iteration_scheduler
@@ -731,21 +733,27 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
             if name == "titan":
                 lr = self.learning_rate * self.titan_lr_scale
+                # Titan memories have inner-loop α (weight decay) via DGD,
+                # so outer weight decay should be reduced to avoid double
+                # regularization. Use titan_weight_decay if set, else default.
+                wd = self.titan_weight_decay if self.titan_weight_decay is not None else self.weight_decay
             elif name == "cms":
                 lr = self.learning_rate * self.cms_lr_scale
+                wd = self.weight_decay
             else:
                 lr = self.learning_rate
+                wd = self.weight_decay
 
             optimizer_groups.append({
                 "params": params,
                 "lr": lr,
-                "weight_decay": self.weight_decay,
+                "weight_decay": wd,
             })
 
             n_params = sum(p.numel() for p in params)
             log.info(
                 f"[Optimizer] Group '{name}': {n_params:,} params, "
-                f"LR={lr:.2e}, WD={self.weight_decay}"
+                f"LR={lr:.2e}, WD={wd}"
             )
 
         optimizer = torch.optim.AdamW(

@@ -1125,7 +1125,6 @@ dependencies = [
 dev = [
     { name = "ipykernel" },
     { name = "matplotlib" },
-    { name = "numpy" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1142,7 +1141,6 @@ requires-dist = [
     { name = "lightning", specifier = ">=2.2.0" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "numpy", specifier = "<2.0.0" },
-    { name = "numpy", marker = "extra == 'dev'" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
     { name = "psutil" },
     { name = "pyrootutils", specifier = ">=1.0.4" },

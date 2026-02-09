@@ -73,9 +73,9 @@ data:
   pin_memory: true
 
 model:
-  # --- Temporal / loss settings (identical to vjepa2_ac for comparability) ---
+  # --- Temporal / loss settings (adapted for HOPE bi-level optimization) ---
   T_teacher: 7
-  T_rollout: 7
+  T_rollout: 2                     # ↓ from 7: memory corruption feedback loop over long rollouts
   context_frames: 1
   use_activation_checkpointing: true
 
@@ -87,8 +87,8 @@ model:
   titan_hidden_multiplier: 2       # ⚠️ Reduced from 4 (384×2=768 hidden)
   use_rope: true                   # 3D RoPE enabled (Criticism §2: toggleable)
   titan_grad_clip_inner: 1.0       # Inner-loop gradient clipping
-  chunk_size: 1                    # 0 = no chunking (all tokens at once)
-  titan_detach_interval: 0         # 0 = never detach (full meta-gradient)
+  chunk_size: 1                    # 0 = safe default; 1 = also trains M_eta/M_alpha (needs ~2-3× VRAM)
+  titan_detach_interval: 4         # Detach every step (MPS/consumer safe); set 0 on datacenter GPU
   surprise_threshold: 0.0          # 0 = always update memories
 
   # CMS levels — full multi-timescale hierarchy preserved
@@ -113,35 +113,39 @@ model:
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
 
-  # --- Curriculum Learning Schedule (identical to vjepa2_ac) ---
+  # --- Curriculum Learning Schedule (adapted for HOPE: delayed phases) ---
+  # HOPE's meta-learning needs longer teacher-forcing stabilization.
+  # Never go below 0.5 — teacher signal is the primary stable gradient for meta-learning.
   curriculum_schedule:
     - epoch: 0
       loss_weight_teacher: 1.0
-    - epoch: 7
+    - epoch: 15
       loss_weight_teacher: 0.7
-    - epoch: 11
-      loss_weight_teacher: 0.3
+    - epoch: 25
+      loss_weight_teacher: 0.5
 
-  # --- Optimizer (V-JEPA2 paper settings, adapted for HOPE) ---
-  learning_rate: 4.25e-4
-  weight_decay: 0.04
+  # --- Optimizer (adapted for HOPE bi-level optimization) ---
+  # See docs/HOPE_training_settings_evaluation.md for scientific rationale.
+  learning_rate: 1.5e-4             # ↓ from 4.25e-4 (bi-level needs lower outer LR)
+  weight_decay: 0.04               # Applied to CMS + projections
   betas: [0.9, 0.999]
 
   # Per-group LR scaling
-  titan_lr_scale: 0.5              # Titan LR = 4.25e-4 × 0.5 = 2.125e-4
-  cms_lr_scale: 1.0                # CMS LR = 4.25e-4 × 1.0 = 4.25e-4
+  titan_lr_scale: 0.2              # ↓ from 0.5 — Titan LR = 1.5e-4 × 0.2 = 3e-5
+  cms_lr_scale: 1.0                # CMS LR = 1.5e-4 × 1.0 = 1.5e-4
+  titan_weight_decay: 0.005        # ↓ from 0.04 — avoid double regularization with inner-loop α
 
-  # --- LR schedule (iteration-based, V-JEPA2 paper) ---
+  # --- LR schedule (longer warmup for meta-learning stabilization) ---
   use_iteration_scheduler: true
-  warmup_pct: 0.085
-  constant_pct: 0.83
-  decay_pct: 0.085
-  warmup_start_lr: 7.5e-5
+  warmup_pct: 0.15                 # ↑ from 0.085 (HOPE needs longer warmup)
+  constant_pct: 0.75               # Adjusted to sum to 1.0
+  decay_pct: 0.10
+  warmup_start_lr: 3.0e-5          # ↓ proportional to new peak LR
 
 # =============================================================================
-# TRAINER SETTINGS (identical to vjepa2_ac)
+# TRAINER SETTINGS (adapted for HOPE bi-level optimization)
 # =============================================================================
 trainer:
-  max_epochs: 30
-  gradient_clip_val: 1.01
+  max_epochs: 60                   # ↑ from 30 (meta-learning converges slower)
+  gradient_clip_val: 3.0           # ↑ from 1.01 (allow meta-gradient signal through)
   gradient_clip_algorithm: norm
