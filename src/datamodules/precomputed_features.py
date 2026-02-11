@@ -35,7 +35,7 @@ Directory structure:
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import lightning as L
 import numpy as np
@@ -44,6 +44,51 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from src.utils.device_utils import should_pin_memory
+
+# Constants
+MIN_NUM_TIMESTEPS: Final = 2
+FEATURE_MAPS_DIR = "feature_maps"
+ACTIONS_STATES_DIR = "actions_states"
+ACTIONS_FILE = "actions.npy"
+EXTRINSICS_FILE = "extrinsics.npy"
+IMPORTANT_ACTION_INDEX = 1
+
+
+class DatasetNotFoundError(ValueError):
+    """Raised when no valid clip directories are found."""
+
+    def __init__(self, data_dir: Path, clip_prefix: str, feature_map_name: str) -> None:
+        self.data_dir = data_dir
+        self.clip_prefix = clip_prefix
+        self.feature_map_name = feature_map_name
+        expected_structure = f"{clip_prefix}XXXXX/{FEATURE_MAPS_DIR}/{feature_map_name}.npy"
+        super().__init__(
+            f"No valid clips found in {data_dir}. "
+            f"Expected structure: {expected_structure}"
+        )
+
+
+class InvalidClipRangeError(ValueError):
+    """Raised when clip range configuration is invalid."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class TimestepsValidationError(ValueError):
+    """Raised when num_timesteps is invalid."""
+
+    def __init__(self, num_timesteps: int) -> None:
+        self.num_timesteps = num_timesteps
+        super().__init__(
+            f"num_timesteps must be >= {MIN_NUM_TIMESTEPS} (got {num_timesteps}). "
+            f"Need at least {MIN_NUM_TIMESTEPS} timesteps for context + target."
+        )
+
+
+type FeatureArray = np.ndarray
+type SampleDict = dict[str, Tensor | str]
+type BatchDict = dict[str, Tensor]
 
 
 class PrecomputedFeaturesDataset(Dataset):
@@ -67,19 +112,23 @@ class PrecomputedFeaturesDataset(Dataset):
         """Initialize the dataset.
 
         Args:
-            data_dir: Path to directory containing clip subdirectories
+            data_dir: Path to directory containing clip subdirectories.
             num_timesteps: Number of encoded timesteps to load from precomputed features.
                 This is T in the loss formulation. For V-JEPA2 with tubelet_size=2,
                 this equals original_frames // 2 (e.g., 16 frames -> 8 timesteps).
             patches_per_frame: Number of patches per frame (H*W). Required for reshaping
                 flattened features. Default 256 (16x16 patches for ViT-L).
-            use_extrinsics: Whether to load extrinsics data
-            feature_map_name: Name of the feature map file (without .npy extension)
-            clip_prefix: Prefix for clip directories (e.g., "clip_")
+            use_extrinsics: Whether to load extrinsics data.
+            feature_map_name: Name of the feature map file (without .npy extension).
+            clip_prefix: Prefix for clip directories (e.g., "clip_").
             clip_start: Start of clip range (inclusive). If None, no lower bound.
                 Clips are filtered by their numeric ID (e.g., clip_00042 -> 42).
             clip_end: End of clip range (exclusive). If None, no upper bound.
                 Example: clip_start=0, clip_end=5000 selects clips 0-4999.
+
+        Raises:
+            TimestepsValidationError: If num_timesteps < 2.
+            DatasetNotFoundError: If no valid clips are found.
         """
         self.data_dir = Path(data_dir)
         self.num_timesteps = num_timesteps
@@ -91,106 +140,89 @@ class PrecomputedFeaturesDataset(Dataset):
         self.clip_end = clip_end
 
         # Validate num_timesteps
-        if num_timesteps < 2:
-            raise ValueError(
-                f"num_timesteps must be >= 2 (got {num_timesteps}). "
-                "Need at least 2 timesteps for context + target."
-            )
+        if num_timesteps < MIN_NUM_TIMESTEPS:
+            raise TimestepsValidationError(num_timesteps)
 
         # Find all clip directories with the expected structure
+        feature_map_path = f"{FEATURE_MAPS_DIR}/{feature_map_name}.npy"
         self.episode_dirs = sorted([
             d for d in self.data_dir.iterdir()
             if d.is_dir()
             and d.name.startswith(clip_prefix)
-            and (d / "feature_maps" / f"{feature_map_name}.npy").exists()
+            and (d / feature_map_path).exists()
         ])
 
         # Filter by clip range if specified
         if clip_start is not None or clip_end is not None:
-            filtered_dirs = []
-            for d in self.episode_dirs:
-                # Extract numeric ID from clip directory name (e.g., "clip_00042" -> 42)
-                try:
-                    clip_id = int(d.name.replace(clip_prefix, ""))
-                except ValueError:
-                    continue  # Skip directories with non-numeric suffixes
-                # Apply range filter (start inclusive, end exclusive)
-                if clip_start is not None and clip_id < clip_start:
-                    continue
-                if clip_end is not None and clip_id >= clip_end:
-                    continue
-                filtered_dirs.append(d)
-            self.episode_dirs = filtered_dirs
+            self.episode_dirs = self._filter_by_clip_range(self.episode_dirs)
 
         if len(self.episode_dirs) == 0:
-            raise ValueError(
-                f"No valid clips found in {data_dir}. "
-                f"Expected structure: {clip_prefix}XXXXX/feature_maps/{feature_map_name}.npy"
-            )
+            raise DatasetNotFoundError(self.data_dir, clip_prefix, feature_map_name)
 
         # Infer action_dim from first clip
-        first_actions = np.load(self.episode_dirs[0] / "actions_states" / "actions.npy")
+        first_actions = np.load(
+            self.episode_dirs[0] / ACTIONS_STATES_DIR / ACTIONS_FILE
+        )
         self.action_dim = first_actions.shape[-1]
+
+    def _filter_by_clip_range(self, directories: list[Path]) -> list[Path]:
+        """Filter directories by numeric clip ID range.
+
+        Args:
+            directories: List of clip directory paths.
+
+        Returns:
+            Filtered list of directories within the specified range.
+        """
+        filtered = []
+        for directory in directories:
+            try:
+                clip_id = int(directory.name.replace(self.clip_prefix, ""))
+            except ValueError:
+                continue
+
+            if self.clip_start is not None and clip_id < self.clip_start:
+                continue
+            if self.clip_end is not None and clip_id >= self.clip_end:
+                continue
+
+            filtered.append(directory)
+
+        return filtered
 
     def __len__(self) -> int:
         return len(self.episode_dirs)
 
-    def __getitem__(self, idx: int) -> dict[str, Tensor | str]:
+    def __getitem__(self, idx: int) -> SampleDict:
         """Load a single clip.
 
-        Handles temporal alignment for V-JEPA2 tublet encoding:
-        - Features are reshaped from [T*N, D] to [T, N, D] if flattened
-        - T_actions = T - 1 (actions have one less timestep than features)
-        - Actions: only value at index 1 is preserved, moved to index 0
-        - States: zero-filled array with shape [T_actions, action_dim]
+        Handles temporal alignment for V-JEPA2 tubelet encoding:
+        - Features are reshaped from [T*N, D] to [T, N, D] if flattened.
+        - T_actions = T - 1 (actions have one less timestep than features).
+        - Actions: only value at index 1 is preserved, moved to index 0.
+        - States: zero-filled array with shape [T_actions, action_dim].
+
+        Args:
+            idx: Index of the clip to load.
 
         Returns:
             Dictionary with keys:
-                - features: [T, N, D] tensor (T encoded timesteps)
-                - actions: [T-1, action_dim] tensor (resampled)
-                - states: [T-1, action_dim] tensor (zeros)
-                - extrinsics (optional): [T-1, action_dim-1] tensor
-                - clip_name: str (name of the clip directory)
+                - features: [T, N, D] tensor (T encoded timesteps).
+                - actions: [T-1, action_dim] tensor (resampled).
+                - states: [T-1, action_dim] tensor (zeros).
+                - extrinsics (optional): [T-1, action_dim-1] tensor.
+                - clip_name: str (name of the clip directory).
         """
         episode_dir = self.episode_dirs[idx]
 
-        # Load features from clip_XXXXX/feature_maps/{feature_map_name}.npy
-        features = np.load(episode_dir / "feature_maps" / f"{self.feature_map_name}.npy")
-
-        # Handle different feature shapes:
-        # - [T*N, D] flattened -> reshape to [T, N, D]
-        # - [T, N, D] already correct shape
-        # - [T, H, W, D] -> reshape to [T, H*W, D]
-        if features.ndim == 2:
-            # Flattened format [T*N, D] -> [T, N, D]
-            total_tokens, D = features.shape
-            T_encoded = total_tokens // self.patches_per_frame
-            features = features.reshape(T_encoded, self.patches_per_frame, D)
-        elif features.ndim == 4:
-            # [T, H, W, D] -> [T, H*W, D]
-            T_encoded, H, W, D = features.shape
-            features = features.reshape(T_encoded, H * W, D)
-        else:
-            # Already [T, N, D]
-            T_encoded = features.shape[0]
-
-        # Limit to num_timesteps (for target prediction, we keep T+1 frames: T context + 1 target)
-        T_encoded = min(T_encoded, self.num_timesteps + 1)
-        features = features[:T_encoded]
+        # Load and reshape features
+        features = self._load_features(episode_dir)
 
         # Calculate T_actions = T_encoded - 1
-        # Actions/states have one less timestep than features
-        T_actions = T_encoded - 1
+        T_actions = features.shape[0] - 1
 
-        # Load actions from clip_XXXXX/actions_states/actions.npy
-        # Original actions have T_original timesteps, but only index 1 is important
-        # We create a new array with T_actions timesteps, placing the important
-        # value (from index 1) at index 0
-        actions_original = np.load(episode_dir / "actions_states" / "actions.npy")
-        actions = np.zeros((T_actions, self.action_dim), dtype=np.float32)
-        # Preserve the important action value from index 1 -> index 0
-        if actions_original.shape[0] > 1:
-            actions[0] = actions_original[1]
+        # Load and process actions
+        actions = self._load_actions(episode_dir, T_actions)
 
         # Create zero-filled states array
         states = np.zeros((T_actions, self.action_dim), dtype=np.float32)
@@ -204,19 +236,93 @@ class PrecomputedFeaturesDataset(Dataset):
 
         # Optionally load extrinsics
         if self.use_extrinsics:
-            extrinsics_path = episode_dir / "actions_states" / "extrinsics.npy"
-            if extrinsics_path.exists():
-                extrinsics = np.load(extrinsics_path)[:T_actions]
-                result["extrinsics"] = torch.from_numpy(extrinsics).float()
+            extrinsics = self._load_extrinsics(episode_dir, T_actions)
+            if extrinsics is not None:
+                result["extrinsics"] = extrinsics
 
         return result
 
+    def _load_features(self, episode_dir: Path) -> FeatureArray:
+        """Load and reshape feature array from disk.
 
-def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+        Args:
+            episode_dir: Path to the clip directory.
+
+        Returns:
+            Feature array with shape [T, N, D].
+        """
+        features = np.load(
+            episode_dir / FEATURE_MAPS_DIR / f"{self.feature_map_name}.npy"
+        )
+
+        # Handle different feature shapes:
+        # - [T*N, D] flattened -> reshape to [T, N, D]
+        # - [T, N, D] already correct shape
+        # - [T, H, W, D] -> reshape to [T, H*W, D]
+        if features.ndim == 2:
+            total_tokens, D = features.shape
+            T_encoded = total_tokens // self.patches_per_frame
+            features = features.reshape(T_encoded, self.patches_per_frame, D)
+        elif features.ndim == 4:
+            T_encoded, H, W, D = features.shape
+            features = features.reshape(T_encoded, H * W, D)
+        else:
+            T_encoded = features.shape[0]
+
+        # Limit to num_timesteps + 1 (T context + 1 target)
+        T_encoded = min(T_encoded, self.num_timesteps + 1)
+        return features[:T_encoded]
+
+    def _load_actions(self, episode_dir: Path, T_actions: int) -> FeatureArray:
+        """Load and process action array from disk.
+
+        Args:
+            episode_dir: Path to the clip directory.
+            T_actions: Number of action timesteps to output.
+
+        Returns:
+            Action array with shape [T_actions, action_dim].
+        """
+        actions_original = np.load(episode_dir / ACTIONS_STATES_DIR / ACTIONS_FILE)
+        actions = np.zeros((T_actions, self.action_dim), dtype=np.float32)
+
+        # Preserve the important action value from index 1 -> index 0
+        if actions_original.shape[0] > IMPORTANT_ACTION_INDEX:
+            actions[0] = actions_original[IMPORTANT_ACTION_INDEX]
+
+        return actions
+
+    def _load_extrinsics(
+        self, episode_dir: Path, T_actions: int
+    ) -> Tensor | None:
+        """Load extrinsics array from disk if available.
+
+        Args:
+            episode_dir: Path to the clip directory.
+            T_actions: Number of timesteps to slice.
+
+        Returns:
+            Extrinsics tensor with shape [T_actions, extrinsics_dim], or None.
+        """
+        extrinsics_path = episode_dir / ACTIONS_STATES_DIR / EXTRINSICS_FILE
+        if not extrinsics_path.exists():
+            return None
+
+        extrinsics = np.load(extrinsics_path)[:T_actions]
+        return torch.from_numpy(extrinsics).float()
+
+
+def collate_fn(batch: list[SampleDict]) -> BatchDict:
     """Custom collate function to handle variable-length sequences.
 
     Pads sequences to the maximum length in the batch.
     Infers action_dim from the batch data.
+
+    Args:
+        batch: List of sample dictionaries from the dataset.
+
+    Returns:
+        Dictionary with padded tensors and optional clip_names.
     """
     # Find max lengths
     max_T_plus_1 = max(item["features"].shape[0] for item in batch)
@@ -225,7 +331,6 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     # Get dimensions from first item
     N = batch[0]["features"].shape[1]
     D = batch[0]["features"].shape[2]
-    # Infer action_dim from actions tensor shape
     action_dim = batch[0]["actions"].shape[-1]
 
     # Check for extrinsics
@@ -236,9 +341,17 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     features = torch.zeros(B, max_T_plus_1, N, D)
     actions = torch.zeros(B, max_T, action_dim)
     states = torch.zeros(B, max_T, action_dim)
+
+    result: dict[str, Tensor | list[str]] = {
+        "features": features,
+        "actions": actions,
+        "states": states,
+    }
+
     if has_extrinsics:
         extrinsics_dim = batch[0]["extrinsics"].shape[-1]
         extrinsics = torch.zeros(B, max_T, extrinsics_dim)
+        result["extrinsics"] = extrinsics
 
     # Fill in data
     for i, item in enumerate(batch):
@@ -249,14 +362,6 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         states[i, :T] = item["states"]
         if has_extrinsics and "extrinsics" in item:
             extrinsics[i, :T] = item["extrinsics"]
-
-    result = {
-        "features": features,
-        "actions": actions,
-        "states": states,
-    }
-    if has_extrinsics:
-        result["extrinsics"] = extrinsics
 
     # Include clip_names if available in batch items
     if "clip_name" in batch[0]:
@@ -289,27 +394,30 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         """Initialize the DataModule.
 
         Args:
-            data_dir: Root directory containing clip subdirectories
+            data_dir: Root directory containing clip subdirectories.
             num_timesteps: Number of encoded timesteps per sample. This is T in the
                 loss formulation. For V-JEPA2 with tubelet_size=2, this equals
                 original_frames // 2 (e.g., 16 frames -> 8 timesteps).
-            patches_per_frame: Number of patches per frame (H*W)
-            use_extrinsics: Whether to load extrinsics data
-            feature_map_name: Name of the feature map file (without .npy extension)
-            clip_prefix: Prefix for clip directories (e.g., "clip_")
+            patches_per_frame: Number of patches per frame (H*W).
+            use_extrinsics: Whether to load extrinsics data.
+            feature_map_name: Name of the feature map file (without .npy extension).
+            clip_prefix: Prefix for clip directories (e.g., "clip_").
             clip_start: Start of clip range (inclusive). If None, no lower bound.
             clip_end: End of clip range (exclusive). If None, no upper bound.
             val_split: Fraction of clips to use for validation (e.g., 0.1 = 10%).
                 The last N% of clips (by ID) are used for validation.
                 Must be in range [0.0, 1.0). If 0.0, no validation set is created.
-            batch_size: Batch size for DataLoaders
-            num_workers: Number of worker processes for data loading
+            batch_size: Batch size for DataLoaders.
+            num_workers: Number of worker processes for data loading.
             pin_memory: Whether to pin memory for faster GPU transfer.
-                       If None, auto-detects based on CUDA availability.
+                If None, auto-detects based on CUDA availability.
             persistent_workers: Whether to keep worker processes alive between epochs.
-                       Speeds up dataloader initialization. Requires num_workers > 0.
+                Speeds up dataloader initialization. Requires num_workers > 0.
             shuffle_test: Whether to shuffle the test dataloader. Default False.
-                       Set to False for TTA to ensure deterministic clip ordering.
+                Set to False for TTA to ensure deterministic clip ordering.
+
+        Raises:
+            InvalidClipRangeError: If val_split would leave no clips for training.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -325,10 +433,13 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         self.val_split = val_split
         self.batch_size = batch_size
         self.num_workers = num_workers
+
         # Auto-detect pin_memory if not specified (only beneficial for CUDA)
         self.pin_memory = pin_memory if pin_memory is not None else should_pin_memory()
+
         # persistent_workers requires num_workers > 0
         self.persistent_workers = persistent_workers and num_workers > 0
+
         # shuffle_test for TTA compatibility
         self.shuffle_test = shuffle_test
 
@@ -341,36 +452,23 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
 
         Uses data_dir directly (flat structure with clip_* directories).
         If val_split > 0, the last N% of clips (by ID) are used for validation.
+
+        Args:
+            stage: One of "fit", "test", or None for all stages.
+
+        Raises:
+            InvalidClipRangeError: If val_split configuration is invalid.
         """
         # Compute effective clip range
         effective_start = self.clip_start if self.clip_start is not None else 0
-        effective_end = self.clip_end  # May be None
+        effective_end = self.clip_end
 
         # Calculate train/val split point if val_split is specified
         if self.val_split > 0.0:
-            if self.val_split >= 1.0:
-                raise ValueError(
-                    f"val_split must be in range [0.0, 1.0), got {self.val_split}"
-                )
-            if effective_end is None:
-                raise ValueError(
-                    "clip_end must be specified when using val_split to determine "
-                    "the validation range. Set clip_end to the total number of clips."
-                )
-            total_clips = effective_end - effective_start
-            val_clips = int(total_clips * self.val_split)
-            # Ensure at least 1 clip in validation if val_split > 0
-            val_clips = max(1, val_clips)
-            # Ensure at least 1 clip remains for training
-            if val_clips >= total_clips:
-                raise ValueError(
-                    f"val_split={self.val_split} would leave no clips for training. "
-                    f"Total clips: {total_clips}, val clips: {val_clips}"
-                )
-            val_start = effective_end - val_clips
-            train_end = val_start
+            val_start, train_end = self._calculate_split_ranges(
+                effective_start, effective_end
+            )
         else:
-            # No validation split
             train_end = effective_end
             val_start = None
 
@@ -385,34 +483,103 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         }
 
         if stage == "fit" or stage is None:
-            # Training dataset: clips from start to split point
-            self.train_dataset = PrecomputedFeaturesDataset(
-                **base_kwargs,
-                clip_start=effective_start,
-                clip_end=train_end,
-            )
-            # Validation dataset: clips from split point to end (if val_split > 0)
-            if val_start is not None:
-                self.val_dataset = PrecomputedFeaturesDataset(
-                    **base_kwargs,
-                    clip_start=val_start,
-                    clip_end=effective_end,
-                )
-            else:
-                self.val_dataset = None
+            self._setup_train_val_datasets(base_kwargs, effective_start, train_end, val_start, effective_end)
 
         if stage == "test" or stage is None:
-            # Test uses same range as training (or full range if no split)
             self.test_dataset = PrecomputedFeaturesDataset(
                 **base_kwargs,
                 clip_start=effective_start,
                 clip_end=train_end,
             )
 
+    def _calculate_split_ranges(
+        self, effective_start: int, effective_end: int | None
+    ) -> tuple[int | None, int | None]:
+        """Calculate train/val split ranges.
+
+        Args:
+            effective_start: Start of the clip range.
+            effective_end: End of the clip range.
+
+        Returns:
+            Tuple of (val_start, train_end).
+
+        Raises:
+            InvalidClipRangeError: If val_split configuration is invalid.
+        """
+        if self.val_split >= 1.0:
+            raise InvalidClipRangeError(
+                f"val_split must be in range [0.0, 1.0), got {self.val_split}"
+            )
+
+        if effective_end is None:
+            raise InvalidClipRangeError(
+                "clip_end must be specified when using val_split to determine "
+                "the validation range. Set clip_end to the total number of clips."
+            )
+
+        total_clips = effective_end - effective_start
+        val_clips = int(total_clips * self.val_split)
+        val_clips = max(1, val_clips)  # Ensure at least 1 clip in validation
+
+        # Ensure at least 1 clip remains for training
+        if val_clips >= total_clips:
+            raise InvalidClipRangeError(
+                f"val_split={self.val_split} would leave no clips for training. "
+                f"Total clips: {total_clips}, val clips: {val_clips}"
+            )
+
+        val_start = effective_end - val_clips
+        train_end = val_start
+
+        return val_start, train_end
+
+    def _setup_train_val_datasets(
+        self,
+        base_kwargs: dict[str, Any],
+        effective_start: int,
+        train_end: int | None,
+        val_start: int | None,
+        effective_end: int | None,
+    ) -> None:
+        """Set up training and validation datasets.
+
+        Args:
+            base_kwargs: Base dataset keyword arguments.
+            effective_start: Start of the clip range.
+            train_end: End of training clip range.
+            val_start: Start of validation clip range.
+            effective_end: End of the total clip range.
+        """
+        # Training dataset: clips from start to split point
+        self.train_dataset = PrecomputedFeaturesDataset(
+            **base_kwargs,
+            clip_start=effective_start,
+            clip_end=train_end,
+        )
+
+        # Validation dataset: clips from split point to end (if val_split > 0)
+        if val_start is not None:
+            self.val_dataset = PrecomputedFeaturesDataset(
+                **base_kwargs,
+                clip_start=val_start,
+                clip_end=effective_end,
+            )
+        else:
+            self.val_dataset = None
+
     def train_dataloader(self) -> DataLoader:
-        """Create training DataLoader."""
+        """Create training DataLoader.
+
+        Returns:
+            DataLoader for training data.
+
+        Raises:
+            RuntimeError: If train_dataset is not initialized.
+        """
         if self.train_dataset is None:
             raise RuntimeError("Train dataset not initialized. Call setup() first.")
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -428,9 +595,13 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
 
         Returns None if no validation dataset is configured, which signals
         to PyTorch Lightning to skip validation entirely.
+
+        Returns:
+            DataLoader for validation data, or None if no validation set.
         """
         if self.val_dataset is None:
             return None
+
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
@@ -446,9 +617,16 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
 
         Uses shuffle_test parameter to control shuffling (default: False).
         For TTA, shuffle should be disabled to ensure deterministic ordering.
+
+        Returns:
+            DataLoader for test data.
+
+        Raises:
+            RuntimeError: If test_dataset is not initialized.
         """
         if self.test_dataset is None:
             raise RuntimeError("Test dataset not initialized. Call setup() first.")
+
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,

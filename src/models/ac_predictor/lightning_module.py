@@ -22,7 +22,12 @@ Key features matching original paper:
 - TF-seeded initialization for rollout stability
 """
 
-from typing import Any
+import json
+import logging
+import warnings
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any, Final
 
 import lightning as L
 import torch
@@ -32,9 +37,15 @@ from torch import Tensor
 from src.models.ac_predictor.ac_predictor import vit_ac_predictor
 from src.models.mixins import ACPredictorLossMixin, TTAMixin
 
+# Constants
+DEFAULT_LAYER_NORM_EPS: Final = 1e-6
+ROLLING_AVG_WINDOW_SIZE: Final = 50
+JSON_INDENT: Final = 2
+NUM_WORST_CLIPS: Final = 10
+NUM_BEST_CLIPS: Final = 5
 
 # Type alias for test results
-TestResultsDict = dict[str, Any]
+type TestResultsDict = dict[str, Any]
 
 
 class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
@@ -170,18 +181,18 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         # Validate T_teacher and T_rollout against available timesteps
         max_prediction_steps = num_timesteps - 1  # Need at least 1 context + 1 target
         if T_teacher > max_prediction_steps:
-            import warnings
             warnings.warn(
                 f"T_teacher ({T_teacher}) exceeds available prediction steps ({max_prediction_steps}) "
                 f"for num_timesteps={num_timesteps}. Will be clamped to {max_prediction_steps} at runtime.",
-                UserWarning
+                UserWarning,
+                stacklevel=2,
             )
         if T_rollout > max_prediction_steps:
-            import warnings
             warnings.warn(
                 f"T_rollout ({T_rollout}) exceeds available prediction steps ({max_prediction_steps}) "
                 f"for num_timesteps={num_timesteps}. Will be clamped to {max_prediction_steps} at runtime.",
-                UserWarning
+                UserWarning,
+                stacklevel=2,
             )
         self.loss_weight_teacher = loss_weight_teacher
         self.loss_weight_rollout = loss_weight_rollout
@@ -223,6 +234,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         # Storage for test results (populated during test_step, aggregated in on_test_epoch_end)
         self._test_results: list[TestResultsDict] = []
 
+        # Logger instance
+        self._log = logging.getLogger(__name__)
+
     def _validate_curriculum_schedule(self, schedule: list[dict]) -> None:
         """Validate curriculum schedule format and values.
 
@@ -233,15 +247,11 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         Raises:
             ValueError: If schedule is invalid
         """
-        # Support both Python lists and OmegaConf ListConfig
-        from collections.abc import Sequence
         if not isinstance(schedule, Sequence) or isinstance(schedule, str) or len(schedule) == 0:
             raise ValueError("curriculum_schedule must be a non-empty list")
 
         max_prediction_steps = self.num_timesteps - 1
 
-        # Support both Python dicts and OmegaConf DictConfig
-        from collections.abc import Mapping
         for i, phase in enumerate(schedule):
             if not isinstance(phase, Mapping):
                 raise ValueError(f"Phase {i} must be a dict, got {type(phase)}")
@@ -263,7 +273,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         if epochs != sorted(epochs):
             raise ValueError("curriculum_schedule phases must be sorted by epoch")
 
-    def _get_curriculum_params_for_epoch(self, epoch: int) -> dict:
+    def _get_curriculum_params_for_epoch(self, epoch: int) -> dict[str, Any]:
         """Get curriculum parameters for the given epoch.
 
         Finds the most recent phase whose epoch is <= current epoch.
@@ -322,9 +332,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         # Log changes
         if changes:
-            import logging
-            log = logging.getLogger(__name__)
-            log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
+            self._log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
 
         # Log current curriculum state for tracking
         self.log("curriculum/T_rollout", float(self.T_rollout), sync_dist=True)
@@ -371,7 +379,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         """
         z_pred = self.model(z, actions, states, extrinsics)
         if self.normalize_reps:
-            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=1e-6)
+            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=DEFAULT_LAYER_NORM_EPS)
         return z_pred
 
     # Loss computation methods are inherited from ACPredictorLossMixin:
@@ -389,6 +397,63 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         """Validation step."""
         return self._shared_step(batch, "val")
 
+    def _log_test_metrics(
+        self,
+        loss_teacher: Tensor,
+        loss_rollout: Tensor,
+        loss: Tensor,
+        per_timestep_losses: list[Tensor],
+    ) -> None:
+        """Log test metrics.
+
+        Args:
+            loss_teacher: Teacher-forcing loss
+            loss_rollout: Rollout loss
+            loss: Combined loss
+            per_timestep_losses: Per-timestep loss breakdown
+        """
+        # Log aggregate metrics
+        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
+        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss", loss, prog_bar=True, sync_dist=True)
+
+        # Log per-timestep losses
+        for step, step_loss in enumerate(per_timestep_losses):
+            predicted_frame = self.context_frames + step  # e.g., 3, 4, 5, 6
+            self.log(f"test/loss_step_{predicted_frame}", step_loss.mean(), sync_dist=True)
+
+    def _store_test_results(
+        self,
+        clip_names: list[str],
+        batch_idx: int,
+        B: int,
+        per_sample_losses: list[list[Tensor]],
+        per_timestep_losses: list[Tensor],
+        loss_teacher: Tensor,
+    ) -> None:
+        """Store test results for later aggregation.
+
+        Args:
+            clip_names: List of clip identifiers
+            batch_idx: Batch index
+            B: Batch size
+            per_sample_losses: Per-sample rollout losses
+            per_timestep_losses: Per-timestep losses
+            loss_teacher: Teacher-forcing loss
+        """
+        per_sample_rollout_losses = per_sample_losses[0]  # [B]
+        for i in range(B):
+            clip_result: TestResultsDict = {
+                "clip_name": clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}",
+                "loss_rollout": per_sample_rollout_losses[i].item(),
+                "loss_teacher": loss_teacher.item(),  # Note: this is batch-level for teacher
+                "per_timestep_losses": {
+                    f"step_{self.context_frames + s}": per_timestep_losses[s][i].item()
+                    for s in range(len(per_timestep_losses))
+                },
+            }
+            self._test_results.append(clip_result)
+
     def test_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         """Test step with detailed per-clip and per-timestep analysis.
 
@@ -398,9 +463,6 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         If TTA is enabled (tta_enabled=True), performs online adaptation using
         the look-back scheme before computing final predictions.
         """
-        import logging
-        log = logging.getLogger(__name__)
-
         features = batch["features"]
         actions = batch["actions"]
         states = batch["states"]
@@ -433,31 +495,103 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         # Combined loss
         loss = self.loss_weight_teacher * loss_teacher + self.loss_weight_rollout * loss_rollout
 
-        # Log aggregate metrics
-        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
-        self.log("test/loss", loss, prog_bar=True, sync_dist=True)
-
-        # Log per-timestep losses
-        for step, step_loss in enumerate(per_timestep_losses):
-            predicted_frame = self.context_frames + step  # e.g., 3, 4, 5, 6
-            self.log(f"test/loss_step_{predicted_frame}", step_loss.mean(), sync_dist=True)
-
-        # Store per-clip results for aggregation
-        per_sample_rollout_losses = per_sample_losses[0]  # [B]
-        for i in range(B):
-            clip_result: TestResultsDict = {
-                "clip_name": clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}",
-                "loss_rollout": per_sample_rollout_losses[i].item(),
-                "loss_teacher": loss_teacher.item(),  # Note: this is batch-level for teacher
-                "per_timestep_losses": {
-                    f"step_{self.context_frames + s}": per_timestep_losses[s][i].item()
-                    for s in range(len(per_timestep_losses))
-                },
-            }
-            self._test_results.append(clip_result)
+        self._log_test_metrics(loss_teacher, loss_rollout, loss, per_timestep_losses)
+        self._store_test_results(
+            clip_names, batch_idx, B, per_sample_losses, per_timestep_losses, loss_teacher
+        )
 
         return loss
+
+    def _process_single_sample_tta(
+        self,
+        sample_features: Tensor,
+        sample_actions: Tensor,
+        sample_states: Tensor,
+        sample_extrinsics: Tensor | None,
+        clip_name: str,
+        batch_idx: int,
+        sample_idx: int,
+        T_pred: int,
+        C: int,
+        N: int,
+    ) -> tuple[float, dict[str, float], dict[str, Any]]:
+        """Process a single sample with TTA.
+
+        Args:
+            sample_features: Features for single sample [1, T+1, N, D]
+            sample_actions: Actions for single sample [1, T, action_dim]
+            sample_states: States for single sample [1, T, action_dim]
+            sample_extrinsics: Optional extrinsics [1, T, action_dim-1]
+            clip_name: Clip identifier
+            batch_idx: Batch index for logging
+            sample_idx: Sample index within batch
+            T_pred: Number of prediction steps
+            C: Context frames
+            N: Patches per frame
+
+        Returns:
+            Tuple of (sample_loss, per_step_losses, tta_stats)
+        """
+        # Process with TTA (from TTAMixin)
+        if self.tta_mode == "full_rollout":
+            predictions, targets, tta_stats = self._tta_process_clip_full_rollout(
+                sample_features, sample_actions, sample_states, sample_extrinsics,
+                num_adaptation_steps=self.tta_num_adaptation_steps,
+            )
+        else:  # "sequential" mode
+            predictions, targets, tta_stats = self._tta_process_clip_sequential(
+                sample_features, sample_actions, sample_states, sample_extrinsics
+            )
+
+        # Compute loss for this sample
+        sample_loss = self._compute_loss(predictions, targets)
+
+        # Compute per-timestep losses for analysis
+        per_step_losses: dict[str, float] = {}
+        for step in range(T_pred):
+            step_pred = predictions[:, step*N:(step+1)*N, :]
+            step_target = targets[:, step*N:(step+1)*N, :]
+            step_loss = self._compute_loss(step_pred, step_target)
+            per_step_losses[f"step_{C + step}"] = step_loss.item()
+
+        return sample_loss.item(), per_step_losses, tta_stats
+
+    def _log_tta_sample_metrics(
+        self,
+        sample_loss: float,
+        tta_stats: dict[str, Any],
+        batch_idx: int,
+        sample_idx: int,
+    ) -> None:
+        """Log TTA metrics for a single sample.
+
+        Args:
+            sample_loss: Loss for the sample
+            tta_stats: TTA statistics dictionary
+            batch_idx: Batch index
+            sample_idx: Sample index within batch
+        """
+        # Core per-clip metrics (logged every clip)
+        self.log("test/tta_loss_rollout", sample_loss, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+        self.log("test/tta_improvement", tta_stats.get("improvement", 0.0), on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+
+        # Track cumulative statistics for adaptation trend
+        if not hasattr(self, '_tta_cumulative_losses'):
+            self._tta_cumulative_losses: list[float] = []
+        self._tta_cumulative_losses.append(sample_loss)
+
+        # Log rolling average (last 50 clips) to show adaptation trend
+        window_size = min(ROLLING_AVG_WINDOW_SIZE, len(self._tta_cumulative_losses))
+        rolling_avg = sum(self._tta_cumulative_losses[-window_size:]) / window_size
+        self.log("test/tta_loss_rolling_50", rolling_avg, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+
+        # Log gradient diagnostics if available
+        if "grad_norm_before_clip" in tta_stats:
+            self.log("test/tta_grad_norm_before", tta_stats["grad_norm_before_clip"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+        if "grad_norm_after_clip" in tta_stats:
+            self.log("test/tta_grad_norm_after", tta_stats["grad_norm_after_clip"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+        if "param_delta_norm" in tta_stats:
+            self.log("test/tta_param_delta", tta_stats["param_delta_norm"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
 
     def _test_step_with_tta(
         self,
@@ -484,14 +618,11 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         Returns:
             Combined loss tensor
         """
-        import logging
-        log = logging.getLogger(__name__)
-
         B, T_plus_1, N, D = features.shape
         C = self.context_frames
         T_pred = min(T_plus_1 - C, self.T_rollout)
 
-        all_losses = []
+        all_losses: list[float] = []
         all_per_timestep_losses: list[list[float]] = [[] for _ in range(T_pred)]
 
         # Process each sample individually for per-clip TTA
@@ -503,66 +634,31 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             sample_extrinsics = extrinsics[i:i+1] if extrinsics is not None else None
             clip_name = clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}"
 
-            # Process with TTA (from TTAMixin)
-            # Choose TTA mode based on configuration
-            if self.tta_mode == "full_rollout":
-                predictions, targets, tta_stats = self._tta_process_clip_full_rollout(
-                    sample_features, sample_actions, sample_states, sample_extrinsics,
-                    num_adaptation_steps=self.tta_num_adaptation_steps,
-                )
-            else:  # "sequential" mode
-                predictions, targets, tta_stats = self._tta_process_clip_sequential(
-                    sample_features, sample_actions, sample_states, sample_extrinsics
-                )
+            # Process single sample with TTA
+            sample_loss, per_step_losses, tta_stats = self._process_single_sample_tta(
+                sample_features, sample_actions, sample_states, sample_extrinsics,
+                clip_name, batch_idx, i, T_pred, C, N,
+            )
 
-            # Compute loss for this sample
-            sample_loss = self._compute_loss(predictions, targets)
-            all_losses.append(sample_loss.item())
+            all_losses.append(sample_loss)
 
-            # Compute per-timestep losses for analysis
-            per_step_losses = {}
-            for step in range(T_pred):
-                step_pred = predictions[:, step*N:(step+1)*N, :]
-                step_target = targets[:, step*N:(step+1)*N, :]
-                step_loss = self._compute_loss(step_pred, step_target)
-                per_step_losses[f"step_{C + step}"] = step_loss.item()
-                all_per_timestep_losses[step].append(step_loss.item())
+            # Collect per-timestep losses
+            for step, step_loss in per_step_losses.items():
+                step_idx = int(step.split("_")[1]) - C
+                all_per_timestep_losses[step_idx].append(step_loss)
 
             # Store result
             clip_result: TestResultsDict = {
                 "clip_name": clip_name,
-                "loss_rollout": sample_loss.item(),
+                "loss_rollout": sample_loss,
                 "loss_teacher": 0.0,  # Not computed in TTA mode
                 "per_timestep_losses": per_step_losses,
                 "tta_stats": tta_stats,
             }
             self._test_results.append(clip_result)
 
-            # Log TTA metrics per-clip for wandb visualization
-            # Use on_step=True, on_epoch=False to get per-clip logging instead of aggregated
-            clip_idx = batch_idx * B + i
-
-            # Core per-clip metrics (logged every clip)
-            self.log("test/tta_loss_rollout", sample_loss.item(), on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
-            self.log("test/tta_improvement", tta_stats.get("improvement", 0.0), on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
-
-            # Track cumulative statistics for adaptation trend
-            if not hasattr(self, '_tta_cumulative_losses'):
-                self._tta_cumulative_losses = []
-            self._tta_cumulative_losses.append(sample_loss.item())
-
-            # Log rolling average (last 50 clips) to show adaptation trend
-            window_size = min(50, len(self._tta_cumulative_losses))
-            rolling_avg = sum(self._tta_cumulative_losses[-window_size:]) / window_size
-            self.log("test/tta_loss_rolling_50", rolling_avg, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
-
-            # Log gradient diagnostics if available
-            if "grad_norm_before_clip" in tta_stats:
-                self.log("test/tta_grad_norm_before", tta_stats["grad_norm_before_clip"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
-            if "grad_norm_after_clip" in tta_stats:
-                self.log("test/tta_grad_norm_after", tta_stats["grad_norm_after_clip"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
-            if "param_delta_norm" in tta_stats:
-                self.log("test/tta_param_delta", tta_stats["param_delta_norm"], on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            # Log TTA metrics per-clip
+            self._log_tta_sample_metrics(sample_loss, tta_stats, batch_idx, i)
 
         # Compute batch-level metrics
         loss_rollout = sum(all_losses) / len(all_losses)
@@ -570,12 +666,12 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         # Log metrics - only essential ones, remove tta_enabled/tta_mode noise
         self.log("test/loss_rollout", loss_rollout, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("test/loss", loss_rollout, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        # Note: Removed test/tta_enabled and test/tta_mode - they are constant values that clutter logs
 
         # Log per-timestep losses (epoch-level aggregation is fine for these)
         for step in range(T_pred):
-            step_mean = sum(all_per_timestep_losses[step]) / len(all_per_timestep_losses[step])
-            self.log(f"test/loss_step_{C + step + 1}", step_mean, on_step=False, on_epoch=True, sync_dist=True)
+            if all_per_timestep_losses[step]:
+                step_mean = sum(all_per_timestep_losses[step]) / len(all_per_timestep_losses[step])
+                self.log(f"test/loss_step_{C + step + 1}", step_mean, on_step=False, on_epoch=True, sync_dist=True)
 
         return torch.tensor(loss_rollout, device=features.device)
 
@@ -584,7 +680,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self._test_results = []
 
         # Reset cumulative tracking for new test epoch
-        self._tta_cumulative_losses = []
+        self._tta_cumulative_losses: list[float] = []
 
         # Configure TTA if enabled
         if self.tta_enabled:
@@ -600,30 +696,18 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 "num_adaptations": 0,
             }
 
-            import logging
-            log = logging.getLogger(__name__)
-            log.info(
+            self._log.info(
                 f"[TTA] Test epoch started with TTA enabled. "
                 f"LR={self.tta_lr}, grad_clip={self.tta_grad_clip}, "
                 f"reset_per_clip={self.tta_reset_per_clip}"
             )
 
-    def on_test_epoch_end(self) -> None:
-        """Aggregate test results and output summary.
+    def _compute_test_statistics(self) -> dict[str, Any]:
+        """Compute aggregate test statistics.
 
-        Prints summary statistics and optionally exports detailed results to JSON.
+        Returns:
+            Dictionary containing mean, median, std, min, max, and per-timestep stats
         """
-        import json
-        import logging
-        from pathlib import Path
-
-        log = logging.getLogger(__name__)
-
-        if not self._test_results:
-            log.warning("No test results to aggregate")
-            return
-
-        # Compute aggregate statistics
         num_clips = len(self._test_results)
         rollout_losses = [r["loss_rollout"] for r in self._test_results]
 
@@ -636,7 +720,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         # Compute per-timestep statistics
         num_timesteps = len(self._test_results[0]["per_timestep_losses"])
-        per_timestep_stats = {}
+        per_timestep_stats: dict[str, dict[str, float]] = {}
         for step_key in self._test_results[0]["per_timestep_losses"].keys():
             step_losses = [r["per_timestep_losses"][step_key] for r in self._test_results]
             per_timestep_stats[step_key] = {
@@ -645,11 +729,38 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 "max": max(step_losses),
             }
 
-        # Find worst-performing clips
-        worst_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"], reverse=True)[:10]
-        best_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"])[:5]
+        # Find worst-performing and best-performing clips
+        worst_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"], reverse=True)[:NUM_WORST_CLIPS]
+        best_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"])[:NUM_BEST_CLIPS]
 
-        # Print summary to console
+        return {
+            "num_clips": num_clips,
+            "mean_loss": mean_loss,
+            "median_loss": median_loss,
+            "std_loss": std_loss,
+            "min_loss": min_loss,
+            "max_loss": max_loss,
+            "per_timestep_stats": per_timestep_stats,
+            "worst_clips": worst_clips,
+            "best_clips": best_clips,
+        }
+
+    def _print_test_summary(self, stats: dict[str, Any]) -> None:
+        """Print formatted test results summary to console.
+
+        Args:
+            stats: Statistics dictionary from _compute_test_statistics
+        """
+        num_clips = stats["num_clips"]
+        mean_loss = stats["mean_loss"]
+        median_loss = stats["median_loss"]
+        std_loss = stats["std_loss"]
+        min_loss = stats["min_loss"]
+        max_loss = stats["max_loss"]
+        per_timestep_stats = stats["per_timestep_stats"]
+        worst_clips = stats["worst_clips"]
+        best_clips = stats["best_clips"]
+
         print("\n" + "=" * 70)
         print("                    TEST RESULTS SUMMARY")
         print("=" * 70)
@@ -666,16 +777,16 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         print("-" * 50)
         print(f"  {'Frame':<10} {'Mean Loss':<12} {'Min':<12} {'Max':<12}")
         print(f"  {'-'*10} {'-'*12} {'-'*12} {'-'*12}")
-        for step_key, stats in per_timestep_stats.items():
+        for step_key, step_stats in per_timestep_stats.items():
             frame_num = step_key.replace("step_", "z_")
-            print(f"  {frame_num:<10} {stats['mean']:<12.6f} {stats['min']:<12.6f} {stats['max']:<12.6f}")
+            print(f"  {frame_num:<10} {step_stats['mean']:<12.6f} {step_stats['min']:<12.6f} {step_stats['max']:<12.6f}")
 
-        print(f"\n🔴 WORST-PERFORMING CLIPS (top 10)")
+        print(f"\n🔴 WORST-PERFORMING CLIPS (top {NUM_WORST_CLIPS})")
         print("-" * 50)
         for i, clip in enumerate(worst_clips, 1):
             print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
 
-        print(f"\n🟢 BEST-PERFORMING CLIPS (top 5)")
+        print(f"\n🟢 BEST-PERFORMING CLIPS (top {NUM_BEST_CLIPS})")
         print("-" * 50)
         for i, clip in enumerate(best_clips, 1):
             print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
@@ -705,62 +816,76 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         print("\n" + "=" * 70)
 
-        # Export to JSON if configured
-        # Check trainer for config or use default
-        export_results = True
-        output_dir = None
+    def _export_test_results(self, stats: dict[str, Any], output_dir: Path) -> None:
+        """Export test results to JSON file.
 
-        if self.trainer and hasattr(self.trainer, "log_dir") and self.trainer.log_dir:
-            output_dir = Path(self.trainer.log_dir)
-        else:
-            # Use current directory as fallback
-            output_dir = Path(".")
-
-        if export_results:
-            results_file = output_dir / "test_results.json"
-            export_data = {
-                "summary": {
-                    "num_clips": num_clips,
-                    "context_frames": self.context_frames,
-                    "T_rollout": self.T_rollout,
-                    "tta_enabled": self.tta_enabled,
-                    "rollout_loss": {
-                        "mean": mean_loss,
-                        "median": median_loss,
-                        "std": std_loss,
-                        "min": min_loss,
-                        "max": max_loss,
-                    },
-                    "per_timestep": per_timestep_stats,
+        Args:
+            stats: Statistics dictionary from _compute_test_statistics
+            output_dir: Directory to save results file
+        """
+        export_data = {
+            "summary": {
+                "num_clips": stats["num_clips"],
+                "context_frames": self.context_frames,
+                "T_rollout": self.T_rollout,
+                "tta_enabled": self.tta_enabled,
+                "rollout_loss": {
+                    "mean": stats["mean_loss"],
+                    "median": stats["median_loss"],
+                    "std": stats["std_loss"],
+                    "min": stats["min_loss"],
+                    "max": stats["max_loss"],
                 },
-                "worst_clips": worst_clips,
-                "best_clips": best_clips,
-                "all_clips": self._test_results,
+                "per_timestep": stats["per_timestep_stats"],
+            },
+            "worst_clips": stats["worst_clips"],
+            "best_clips": stats["best_clips"],
+            "all_clips": self._test_results,
+        }
+
+        # Add TTA statistics if enabled
+        if self.tta_enabled:
+            export_data["summary"]["tta_config"] = {
+                "lr": self.tta_lr,
+                "grad_clip": self.tta_grad_clip,
+                "reset_per_clip": self.tta_reset_per_clip,
+                "adaptation_horizon": self.tta_adaptation_horizon,
             }
+            export_data["summary"]["tta_stats"] = self._tta_get_epoch_stats()
 
-            # Add TTA statistics if enabled
-            if self.tta_enabled:
-                export_data["summary"]["tta_config"] = {
-                    "lr": self.tta_lr,
-                    "grad_clip": self.tta_grad_clip,
-                    "reset_per_clip": self.tta_reset_per_clip,
-                    "adaptation_horizon": self.tta_adaptation_horizon,
-                }
-                export_data["summary"]["tta_stats"] = self._tta_get_epoch_stats()
+        try:
+            results_file = output_dir / "test_results.json"
+            results_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(results_file, "w") as f:
+                json.dump(export_data, f, indent=JSON_INDENT)
+            print(f"\n💾 Detailed results exported to: {results_file}")
+        except OSError as e:
+            self._log.warning(f"Failed to export results to JSON: {e}")
 
-            try:
-                results_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(results_file, "w") as f:
-                    json.dump(export_data, f, indent=2)
-                print(f"\n💾 Detailed results exported to: {results_file}")
-            except Exception as e:
-                log.warning(f"Failed to export results to JSON: {e}")
+    def on_test_epoch_end(self) -> None:
+        """Aggregate test results and output summary.
+
+        Prints summary statistics and optionally exports detailed results to JSON.
+        """
+        if not self._test_results:
+            self._log.warning("No test results to aggregate")
+            return
+
+        # Compute aggregate statistics
+        stats = self._compute_test_statistics()
+
+        # Print summary to console
+        self._print_test_summary(stats)
 
         # Log final metrics
-        self.log("test/final_mean_loss_rollout", mean_loss, sync_dist=True)
-        self.log("test/final_median_loss_rollout", median_loss, sync_dist=True)
+        self.log("test/final_mean_loss_rollout", stats["mean_loss"], sync_dist=True)
+        self.log("test/final_median_loss_rollout", stats["median_loss"], sync_dist=True)
 
-    def configure_optimizers(self) -> dict:
+        # Export to JSON
+        output_dir = Path(self.trainer.log_dir) if self.trainer and self.trainer.log_dir else Path(".")
+        self._export_test_results(stats, output_dir)
+
+    def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and learning rate scheduler.
 
         Supports two scheduling modes:
@@ -769,6 +894,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
            - Linear warmup from warmup_start_lr to learning_rate
            - Constant phase at peak learning_rate
            - Linear decay from learning_rate to 0
+
+        Returns:
+            Dictionary with optimizer and optional lr_scheduler config
         """
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -778,87 +906,103 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         )
 
         if self.use_iteration_scheduler:
-            # Iteration-based: Warmup → Constant → Decay (V-JEPA2 paper)
-            # Compute total training iterations from trainer
-            # total_iters = num_batches_per_epoch * max_epochs
-            if self.trainer is not None and self.trainer.estimated_stepping_batches:
-                total_iters = int(self.trainer.estimated_stepping_batches)
-            else:
-                # Fallback: estimate from dataloader if trainer not fully set up
-                import warnings
-                warnings.warn(
-                    "Could not get total iterations from trainer. "
-                    "LR schedule may not work correctly.",
-                    UserWarning
-                )
-                total_iters = 10000  # Fallback default
-
-            # Convert percentages to iteration counts
-            warmup_iters = int(self.warmup_pct * total_iters)
-            constant_iters = int(self.constant_pct * total_iters)
-            decay_iters = int(self.decay_pct * total_iters)
-
-            # Ensure we don't exceed total due to rounding
-            # Adjust constant_iters to account for any rounding differences
-            computed_total = warmup_iters + constant_iters + decay_iters
-            if computed_total != total_iters:
-                constant_iters += (total_iters - computed_total)
-
-            import logging
-            log = logging.getLogger(__name__)
-            log.info(
-                f"[LR Schedule] Total iters: {total_iters}, "
-                f"warmup: {warmup_iters} ({self.warmup_pct*100:.1f}%), "
-                f"constant: {constant_iters} ({self.constant_pct*100:.1f}%), "
-                f"decay: {decay_iters} ({self.decay_pct*100:.1f}%)"
-            )
-
-            warmup_end = warmup_iters
-            constant_end = warmup_end + constant_iters
-
-            # Scale factor for warmup: start_lr / peak_lr
-            warmup_start_factor = self.warmup_start_lr / self.learning_rate
-
-            def lr_lambda_iter(step: int) -> float:
-                if step < warmup_end:
-                    # Linear warmup from warmup_start_lr to learning_rate
-                    progress = step / warmup_iters
-                    return warmup_start_factor + (1.0 - warmup_start_factor) * progress
-                elif step < constant_end:
-                    # Constant at peak learning_rate
-                    return 1.0
-                elif step < total_iters:
-                    # Linear decay from learning_rate to 0
-                    progress = (step - constant_end) / decay_iters
-                    return 1.0 - progress
-                else:
-                    # After total_iters, stay at 0
-                    return 0.0
-
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_iter)
-
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",  # Iteration-based
-                    "frequency": 1,
-                },
-            }
+            return self._configure_iteration_scheduler(optimizer)
         else:
-            # Epoch-based: Cosine annealing with linear warmup (default)
-            def lr_lambda_epoch(epoch: int) -> float:
-                if epoch < self.warmup_epochs:
-                    return epoch / self.warmup_epochs
-                progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
-                return 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item())
+            return self._configure_epoch_scheduler(optimizer)
 
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_epoch)
+    def _configure_epoch_scheduler(self, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+        """Configure epoch-based learning rate scheduler.
 
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "epoch",
-                },
-            }
+        Args:
+            optimizer: The optimizer to schedule
+
+        Returns:
+            Dictionary with optimizer and scheduler config
+        """
+        def lr_lambda_epoch(epoch: int) -> float:
+            if epoch < self.warmup_epochs:
+                return epoch / self.warmup_epochs
+            progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
+            return 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item())
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_epoch)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }
+
+    def _configure_iteration_scheduler(self, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+        """Configure iteration-based learning rate scheduler (V-JEPA2 paper).
+
+        Args:
+            optimizer: The optimizer to schedule
+
+        Returns:
+            Dictionary with optimizer and scheduler config
+        """
+        # Compute total training iterations from trainer
+        if self.trainer is not None and self.trainer.estimated_stepping_batches:
+            total_iters = int(self.trainer.estimated_stepping_batches)
+        else:
+            # Fallback: estimate from dataloader if trainer not fully set up
+            warnings.warn(
+                "Could not get total iterations from trainer. "
+                "LR schedule may not work correctly.",
+                UserWarning,
+                stacklevel=2,
+            )
+            total_iters = 10000  # Fallback default
+
+        # Convert percentages to iteration counts
+        warmup_iters = int(self.warmup_pct * total_iters)
+        constant_iters = int(self.constant_pct * total_iters)
+        decay_iters = int(self.decay_pct * total_iters)
+
+        # Ensure we don't exceed total due to rounding
+        computed_total = warmup_iters + constant_iters + decay_iters
+        if computed_total != total_iters:
+            constant_iters += (total_iters - computed_total)
+
+        self._log.info(
+            f"[LR Schedule] Total iters: {total_iters}, "
+            f"warmup: {warmup_iters} ({self.warmup_pct*100:.1f}%), "
+            f"constant: {constant_iters} ({self.constant_pct*100:.1f}%), "
+            f"decay: {decay_iters} ({self.decay_pct*100:.1f}%)"
+        )
+
+        warmup_end = warmup_iters
+        constant_end = warmup_end + constant_iters
+
+        # Scale factor for warmup: start_lr / peak_lr
+        warmup_start_factor = self.warmup_start_lr / self.learning_rate
+
+        def lr_lambda_iter(step: int) -> float:
+            if step < warmup_end:
+                # Linear warmup from warmup_start_lr to learning_rate
+                progress = step / warmup_iters
+                return warmup_start_factor + (1.0 - warmup_start_factor) * progress
+            elif step < constant_end:
+                # Constant at peak learning_rate
+                return 1.0
+            elif step < total_iters:
+                # Linear decay from learning_rate to 0
+                progress = (step - constant_end) / decay_iters
+                return 1.0 - progress
+            else:
+                # After total_iters, stay at 0
+                return 0.0
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_iter)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",  # Iteration-based
+                "frequency": 1,
+            },
+        }

@@ -12,7 +12,9 @@ Architecture:
 Reference: docs/possible_Baseline.md
 """
 
-from typing import Any
+import logging
+from collections.abc import Mapping, Sequence
+from typing import Any, Final
 
 import lightning as L
 import torch
@@ -21,6 +23,41 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.models.mixins import ACPredictorLossMixin
+
+
+# Constants
+DEFAULT_HIDDEN_DIM: Final = 256
+DEFAULT_ACTION_DIM: Final = 2
+DEFAULT_SPATIAL_SIZE: Final = 16
+DEFAULT_KERNEL_SIZE: Final = 3
+DEFAULT_INPUT_DIM: Final = 1024
+DEFAULT_NUM_TIMESTEPS: Final = 8
+DEFAULT_T_TEACHER: Final = 7
+DEFAULT_T_ROLLOUT: Final = 7
+DEFAULT_CONTEXT_FRAMES: Final = 1
+DEFAULT_LOSS_WEIGHT_TEACHER: Final = 1.0
+DEFAULT_LOSS_WEIGHT_ROLLOUT: Final = 1.0
+DEFAULT_LOSS_EXP: Final = 1.0
+DEFAULT_LEARNING_RATE: Final = 4.25e-4
+DEFAULT_WEIGHT_DECAY: Final = 0.04
+DEFAULT_BETAS: Final = (0.9, 0.999)
+DEFAULT_WARMUP_EPOCHS: Final = 10
+DEFAULT_MAX_EPOCHS: Final = 100
+DEFAULT_WARMUP_PCT: Final = 0.085
+DEFAULT_CONSTANT_PCT: Final = 0.83
+DEFAULT_DECAY_PCT: Final = 0.085
+DEFAULT_WARMUP_START_LR: Final = 7.5e-5
+LAYER_NORM_EPS: Final = 1e-6
+NUM_GATES: Final = 4
+
+
+# Type aliases
+type HiddenState = tuple[Tensor, Tensor]
+type CurriculumParams = dict[str, float | int]
+type TestResult = dict[str, Any]
+
+
+log = logging.getLogger(__name__)
 
 
 class ConvLSTMCell(nn.Module):
@@ -40,7 +77,7 @@ class ConvLSTMCell(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int,
-        kernel_size: int = 3,
+        kernel_size: int = DEFAULT_KERNEL_SIZE,
         bias: bool = True,
     ) -> None:
         super().__init__()
@@ -52,7 +89,7 @@ class ConvLSTMCell(nn.Module):
         # Combined gates convolution (input, forget, cell, output)
         self.conv_gates = nn.Conv2d(
             in_channels=input_dim + hidden_dim,
-            out_channels=4 * hidden_dim,
+            out_channels=NUM_GATES * hidden_dim,
             kernel_size=kernel_size,
             padding=self.padding,
             bias=bias,
@@ -61,8 +98,8 @@ class ConvLSTMCell(nn.Module):
     def forward(
         self,
         x: Tensor,
-        hidden_state: tuple[Tensor, Tensor] | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        hidden_state: HiddenState | None = None,
+    ) -> HiddenState:
         """Forward pass through the ConvLSTM cell.
 
         Args:
@@ -112,7 +149,7 @@ class ConvLSTMBaseline(nn.Module):
     3. Uses ConvLSTM for temporal modeling
     4. Predicts residuals with a 1×1 conv decoder
 
-    The model predicts: z_{t+1} = z_t + delta_t
+    The model predicts: z_{t+1} = z_t + delta
 
     Args:
         input_dim: Dimension of input features (1024 for V-JEPA2)
@@ -124,11 +161,11 @@ class ConvLSTMBaseline(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 1024,
-        hidden_dim: int = 256,
-        action_dim: int = 2,
-        spatial_size: int = 16,
-        kernel_size: int = 3,
+        input_dim: int = DEFAULT_INPUT_DIM,
+        hidden_dim: int = DEFAULT_HIDDEN_DIM,
+        action_dim: int = DEFAULT_ACTION_DIM,
+        spatial_size: int = DEFAULT_SPATIAL_SIZE,
+        kernel_size: int = DEFAULT_KERNEL_SIZE,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -201,7 +238,8 @@ class ConvLSTMBaseline(nn.Module):
         z_spatial = z_spatial.reshape(B, T, D, self.spatial_size, self.spatial_size)
 
         # Initialize hidden state
-        h, c = None, None
+        h: Tensor | None = None
+        c: Tensor | None = None
 
         # Store predictions
         predictions = []
@@ -269,33 +307,33 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
     def __init__(
         self,
         # Model architecture
-        input_dim: int = 1024,
-        hidden_dim: int = 256,
-        action_dim: int = 2,
-        spatial_size: int = 16,
-        kernel_size: int = 3,
-        num_timesteps: int = 8,
+        input_dim: int = DEFAULT_INPUT_DIM,
+        hidden_dim: int = DEFAULT_HIDDEN_DIM,
+        action_dim: int = DEFAULT_ACTION_DIM,
+        spatial_size: int = DEFAULT_SPATIAL_SIZE,
+        kernel_size: int = DEFAULT_KERNEL_SIZE,
+        num_timesteps: int = DEFAULT_NUM_TIMESTEPS,
         # Loss settings (same as ACPredictorModule)
-        T_teacher: int = 7,
-        T_rollout: int = 7,
-        context_frames: int = 1,
-        loss_weight_teacher: float = 1.0,
-        loss_weight_rollout: float = 1.0,
+        T_teacher: int = DEFAULT_T_TEACHER,
+        T_rollout: int = DEFAULT_T_ROLLOUT,
+        context_frames: int = DEFAULT_CONTEXT_FRAMES,
+        loss_weight_teacher: float = DEFAULT_LOSS_WEIGHT_TEACHER,
+        loss_weight_rollout: float = DEFAULT_LOSS_WEIGHT_ROLLOUT,
         normalize_reps: bool = True,
-        loss_exp: float = 1.0,
+        loss_exp: float = DEFAULT_LOSS_EXP,
         # Optimizer settings
-        learning_rate: float = 4.25e-4,
-        weight_decay: float = 0.04,
-        betas: tuple[float, float] = (0.9, 0.999),
-        warmup_epochs: int = 10,
-        max_epochs: int = 100,
+        learning_rate: float = DEFAULT_LEARNING_RATE,
+        weight_decay: float = DEFAULT_WEIGHT_DECAY,
+        betas: tuple[float, float] = DEFAULT_BETAS,
+        warmup_epochs: int = DEFAULT_WARMUP_EPOCHS,
+        max_epochs: int = DEFAULT_MAX_EPOCHS,
         # Iteration-based LR schedule
         use_iteration_scheduler: bool = False,
-        curriculum_schedule: list[dict] | None = None,
-        warmup_pct: float = 0.085,
-        constant_pct: float = 0.83,
-        decay_pct: float = 0.085,
-        warmup_start_lr: float = 7.5e-5,
+        curriculum_schedule: list[dict[str, float | int]] | None = None,
+        warmup_pct: float = DEFAULT_WARMUP_PCT,
+        constant_pct: float = DEFAULT_CONSTANT_PCT,
+        decay_pct: float = DEFAULT_DECAY_PCT,
+        warmup_start_lr: float = DEFAULT_WARMUP_START_LR,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -349,13 +387,15 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
             self._validate_curriculum_schedule(curriculum_schedule)
 
         # Test results storage
-        self._test_results: list[dict[str, Any]] = []
+        self._test_results: list[TestResult] = []
 
     def _validate_curriculum_schedule(self, schedule: list[dict]) -> None:
         """Validate curriculum schedule format."""
-        from collections.abc import Mapping, Sequence
-
-        if not isinstance(schedule, Sequence) or isinstance(schedule, str) or len(schedule) == 0:
+        if (
+            not isinstance(schedule, Sequence)
+            or isinstance(schedule, str)
+            or len(schedule) == 0
+        ):
             raise ValueError("curriculum_schedule must be a non-empty list")
 
         max_prediction_steps = self.num_timesteps - 1
@@ -366,7 +406,9 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
             if "epoch" not in phase:
                 raise ValueError(f"Phase {i} must have 'epoch' key")
             if not isinstance(phase["epoch"], int) or phase["epoch"] < 0:
-                raise ValueError(f"Phase {i} 'epoch' must be a non-negative integer")
+                raise ValueError(
+                    f"Phase {i} 'epoch' must be a non-negative integer"
+                )
 
             if "T_rollout" in phase and phase["T_rollout"] > max_prediction_steps:
                 raise ValueError(
@@ -378,7 +420,7 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         if epochs != sorted(epochs):
             raise ValueError("curriculum_schedule phases must be sorted by epoch")
 
-    def _get_curriculum_params_for_epoch(self, epoch: int) -> dict:
+    def _get_curriculum_params_for_epoch(self, epoch: int) -> CurriculumParams:
         """Get curriculum parameters for the given epoch."""
         if not self.curriculum_schedule:
             return {}
@@ -410,28 +452,35 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
 
         if "T_rollout" in params and params["T_rollout"] != self.T_rollout:
             old_val = self.T_rollout
-            self.T_rollout = params["T_rollout"]
+            self.T_rollout = int(params["T_rollout"])
             changes.append(f"T_rollout: {old_val} → {self.T_rollout}")
 
-        if "loss_weight_teacher" in params and params["loss_weight_teacher"] != self.loss_weight_teacher:
+        if (
+            "loss_weight_teacher" in params
+            and params["loss_weight_teacher"] != self.loss_weight_teacher
+        ):
             old_val = self.loss_weight_teacher
-            self.loss_weight_teacher = params["loss_weight_teacher"]
+            self.loss_weight_teacher = float(params["loss_weight_teacher"])
             changes.append(f"loss_weight_teacher: {old_val} → {self.loss_weight_teacher}")
 
-        if "loss_weight_rollout" in params and params["loss_weight_rollout"] != self.loss_weight_rollout:
+        if (
+            "loss_weight_rollout" in params
+            and params["loss_weight_rollout"] != self.loss_weight_rollout
+        ):
             old_val = self.loss_weight_rollout
-            self.loss_weight_rollout = params["loss_weight_rollout"]
+            self.loss_weight_rollout = float(params["loss_weight_rollout"])
             changes.append(f"loss_weight_rollout: {old_val} → {self.loss_weight_rollout}")
 
         if changes:
-            import logging
-
-            log = logging.getLogger(__name__)
             log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
 
         self.log("curriculum/T_rollout", float(self.T_rollout), sync_dist=True)
-        self.log("curriculum/loss_weight_teacher", self.loss_weight_teacher, sync_dist=True)
-        self.log("curriculum/loss_weight_rollout", self.loss_weight_rollout, sync_dist=True)
+        self.log(
+            "curriculum/loss_weight_teacher", self.loss_weight_teacher, sync_dist=True
+        )
+        self.log(
+            "curriculum/loss_weight_rollout", self.loss_weight_rollout, sync_dist=True
+        )
 
     def forward(
         self,
@@ -475,7 +524,7 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         """
         z_pred = self.model(z, actions, states, extrinsics)
         if self.normalize_reps:
-            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=1e-6)
+            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=LAYER_NORM_EPS)
         return z_pred
 
     # Loss methods are inherited from ACPredictorLossMixin:
@@ -512,12 +561,19 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
             B = features.shape[0]
 
         # Compute losses
-        loss_teacher = self._compute_teacher_forcing_loss(features, actions, states, extrinsics)
-        loss_rollout, per_timestep_losses, per_sample_losses = self._compute_rollout_loss_per_timestep(
+        loss_teacher = self._compute_teacher_forcing_loss(
             features, actions, states, extrinsics
         )
+        loss_rollout, per_timestep_losses, per_sample_losses = (
+            self._compute_rollout_loss_per_timestep(
+                features, actions, states, extrinsics
+            )
+        )
 
-        loss = self.loss_weight_teacher * loss_teacher + self.loss_weight_rollout * loss_rollout
+        loss = (
+            self.loss_weight_teacher * loss_teacher
+            + self.loss_weight_rollout * loss_rollout
+        )
 
         # Log metrics
         self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
@@ -550,12 +606,6 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
 
     def on_test_epoch_end(self) -> None:
         """Aggregate and output test results."""
-        import json
-        import logging
-        from pathlib import Path
-
-        log = logging.getLogger(__name__)
-
         if not self._test_results:
             log.warning("No test results to aggregate")
             return
@@ -650,7 +700,9 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
             def lr_lambda_epoch(epoch: int) -> float:
                 if epoch < self.warmup_epochs:
                     return epoch / self.warmup_epochs
-                progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
+                progress = (epoch - self.warmup_epochs) / (
+                    self.max_epochs - self.warmup_epochs
+                )
                 return 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item())
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_epoch)

@@ -3,7 +3,7 @@ name = "HOPE-vs-vit-research"
 version = "0.1.0"
 description = "Gold standard research repository comparing HOPE and ViT"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.2.0",
     "lightning>=2.2.0",

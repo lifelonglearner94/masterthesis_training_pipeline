@@ -1,22 +1,26 @@
 import pyrootutils
 
-# Finds the root of the repo automatically
+# Finds the root of the repo automatically — MUST run before any `src.*` imports
 root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import logging
-from typing import Any, List, Optional
+from typing import Any
 
 import hydra
-import lightning as L
 import omegaconf
 import torch
 from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
+
+from src.utils import instantiators
+from src.utils.device_utils import log_device_info
+from src.utils.logging_utils import log_hyperparameters
 
 # Fix for PyTorch 2.6+ security update: allow OmegaConf objects in checkpoints
 torch.serialization.add_safe_globals([
@@ -26,20 +30,26 @@ torch.serialization.add_safe_globals([
     Any,  # typing.Any used in checkpoint hyperparameters
 ])
 
-from src.utils import instantiators
-from src.utils.device_utils import log_device_info
-from src.utils.logging_utils import log_hyperparameters
+# Constants
+DEFAULT_CHECKPOINT_PATH = "best"
 
 
 def setup_verbose_logging(cfg: DictConfig) -> None:
-    """Configure logging level based on config."""
-    # Check if verbose logging is enabled with at least one flag turned on
+    """Configure logging level based on config.
+
+    Checks if verbose logging is enabled by examining the callbacks config
+    for any enabled verbose logging flags.
+
+    Args:
+        cfg: Hydra configuration dictionary.
+    """
     verbose = False
+
     if cfg.get("callbacks"):
         callbacks_cfg = cfg.callbacks
         if hasattr(callbacks_cfg, "verbose_logging") or "verbose_logging" in callbacks_cfg:
             vl_cfg = callbacks_cfg.get("verbose_logging", {})
-            # Only enable verbose logging if at least one flag is True
+            # Enable verbose logging if at least one flag is True
             verbose = any([
                 vl_cfg.get("log_memory", False),
                 vl_cfg.get("log_data", False),
@@ -50,13 +60,11 @@ def setup_verbose_logging(cfg: DictConfig) -> None:
             ])
 
     if verbose:
-        # Set root logger to DEBUG for maximum verbosity
         logging.basicConfig(
             level=logging.DEBUG,
             format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-            datefmt='%H:%M:%S'
+            datefmt='%H:%M:%S',
         )
-        # Also set specific loggers
         logging.getLogger("src").setLevel(logging.DEBUG)
         logging.getLogger("src.models").setLevel(logging.DEBUG)
         logging.getLogger("src.callbacks").setLevel(logging.DEBUG)
@@ -65,12 +73,30 @@ def setup_verbose_logging(cfg: DictConfig) -> None:
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s | %(levelname)s | %(message)s',
-            datefmt='%H:%M:%S'
+            datefmt='%H:%M:%S',
         )
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config.yaml")
-def main(cfg: DictConfig) -> Optional[float]:
+def main(cfg: DictConfig) -> float | None:
+    """Main training pipeline entry point.
+
+    Orchestrates the complete training workflow including:
+    - Logging configuration
+    - Hardware info logging
+    - Seed setting for reproducibility
+    - DataModule instantiation
+    - Model instantiation
+    - Callback and logger setup
+    - Trainer configuration
+    - Training and testing execution
+
+    Args:
+        cfg: Hydra configuration dictionary containing all experiment settings.
+
+    Returns:
+        Validation loss metric from the best checkpoint, or None if not available.
+    """
     # Setup logging first
     setup_verbose_logging(cfg)
 
@@ -79,6 +105,7 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     # 1. Gold Standard: Determinism
     if cfg.get("seed"):
+        import lightning as L
         L.seed_everything(cfg.seed, workers=True)
 
     # 2. Instantiate DataModule
@@ -89,15 +116,15 @@ def main(cfg: DictConfig) -> Optional[float]:
     model: LightningModule = hydra.utils.instantiate(cfg.model)
 
     # 4. Callbacks & Loggers
-    callbacks: List[Callback] = instantiators.instantiate_callbacks(cfg.get("callbacks"))
-    logger: List[Logger] = instantiators.instantiate_loggers(cfg.get("logger"))
+    callbacks: list[Callback] = instantiators.instantiate_callbacks(cfg.get("callbacks"))
+    loggers: list[Logger] = instantiators.instantiate_loggers(cfg.get("logger"))
 
     # 5. Trainer
     trainer: Trainer = hydra.utils.instantiate(
         cfg.trainer,
         callbacks=callbacks,
-        logger=logger,
-        _convert_="partial"
+        logger=loggers,
+        _convert_="partial",
     )
 
     # 6. Log hyperparameters
@@ -109,9 +136,10 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     # 8. Test
     if cfg.get("test"):
-        trainer.test(model=model, datamodule=datamodule, ckpt_path="best")
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=DEFAULT_CHECKPOINT_PATH)
 
     return trainer.callback_metrics.get("val/loss")
+
 
 if __name__ == "__main__":
     main()

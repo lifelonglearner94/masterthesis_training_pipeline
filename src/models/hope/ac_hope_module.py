@@ -19,7 +19,11 @@ ensuring scientific comparability between the original AC predictor and AC-HOPE-
 
 from __future__ import annotations
 
+import json
 import logging
+import warnings
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import lightning as L
@@ -33,7 +37,14 @@ from src.models.mixins import ACPredictorLossMixin, TTAMixin
 log = logging.getLogger(__name__)
 
 # Type alias
-TestResultsDict = dict[str, Any]
+type TestResultsDict = dict[str, Any]
+
+
+class InvalidConfigurationError(ValueError):
+    """Raised when module configuration is invalid."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
 class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
@@ -50,6 +61,11 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     Args:
         See ACHOPEViT and ACPredictorModule for parameter documentation.
     """
+
+    # Constants
+    DEFAULT_DIAGNOSTICS_LOG_INTERVAL: int = 50
+    DEFAULT_TOTAL_ITERS_FALLBACK: int = 10000
+    LAYER_NORM_EPS: float = 1e-6
 
     def __init__(
         self,
@@ -79,11 +95,12 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         titan_detach_interval: int = 0,
         surprise_threshold: float = 0.0,
         log_hope_diagnostics: bool = True,
+        diagnostics_log_interval: int = DEFAULT_DIAGNOSTICS_LOG_INTERVAL,
         # Optimizer: per-group LR/WD scaling
-        titan_lr_scale: float = 0.2,  # Titan params LR = learning_rate * titan_lr_scale
-        cms_lr_scale: float = 1.0,    # CMS params LR = learning_rate * cms_lr_scale
-        titan_weight_decay: float | None = None,  # Separate WD for Titan (avoids double reg with inner α)
-        aux_loss_weight: float = 0.1,  # Weight for M_k/M_v auxiliary retrieval-quality loss
+        titan_lr_scale: float = 0.2,
+        cms_lr_scale: float = 1.0,
+        titan_weight_decay: float | None = None,
+        aux_loss_weight: float = 0.1,
         # Loss settings (same as ACPredictorModule)
         T_teacher: int = 7,
         T_rollout: int = 2,
@@ -121,7 +138,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # Initialize TTA configuration (from TTAMixin)
         self._init_tta(
             tta_enabled=tta_enabled,
             tta_lr=tta_lr,
@@ -137,7 +153,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         self.num_timesteps = num_timesteps
 
-        # ─── Build the HOPE model ───
         self.model = ac_hope_vit(
             img_size=img_size,
             patch_size=patch_size,
@@ -165,40 +180,23 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             log_hope_diagnostics=log_hope_diagnostics,
         )
 
-        # ─── Loss hyperparameters (same as ACPredictorModule) ───
         self.T_teacher = T_teacher
         self.T_rollout = T_rollout
         self.context_frames = context_frames
 
-        # Validate temporal dimensions
-        max_prediction_steps = num_timesteps - 1
-        if T_teacher > max_prediction_steps:
-            import warnings
-            warnings.warn(
-                f"T_teacher ({T_teacher}) exceeds available prediction steps "
-                f"({max_prediction_steps}). Will be clamped at runtime.",
-                UserWarning,
-            )
-        if T_rollout > max_prediction_steps:
-            import warnings
-            warnings.warn(
-                f"T_rollout ({T_rollout}) exceeds available prediction steps "
-                f"({max_prediction_steps}). Will be clamped at runtime.",
-                UserWarning,
-            )
+        self._validate_temporal_dimensions(T_teacher, T_rollout)
 
         self.loss_weight_teacher = loss_weight_teacher
         self.loss_weight_rollout = loss_weight_rollout
         self.normalize_reps = normalize_reps
 
         if loss_exp <= 0:
-            raise ValueError(
+            raise InvalidConfigurationError(
                 f"loss_exp must be positive (got {loss_exp}). "
                 "Use 1.0 for L1, 2.0 for L2."
             )
         self.loss_exp = loss_exp
 
-        # ─── Optimizer hyperparameters ───
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.betas = betas
@@ -209,29 +207,43 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.titan_weight_decay = titan_weight_decay
         self.aux_loss_weight = aux_loss_weight
 
-        # Iteration-based LR schedule
         self.use_iteration_scheduler = use_iteration_scheduler
         self.warmup_pct = warmup_pct
         self.constant_pct = constant_pct
         self.decay_pct = decay_pct
         self.warmup_start_lr = warmup_start_lr
 
-        # Grid size for reshaping
         self.grid_height = img_size[0] // patch_size
         self.grid_width = img_size[1] // patch_size
         self.patches_per_frame = self.grid_height * self.grid_width
 
-        # Curriculum learning
         self.curriculum_schedule = curriculum_schedule
         if curriculum_schedule:
             self._validate_curriculum_schedule(curriculum_schedule)
 
-        # HOPE diagnostics
         self.log_hope_diagnostics = log_hope_diagnostics
-        self._diagnostics_log_interval = 50  # Log every N steps
+        self._diagnostics_log_interval = diagnostics_log_interval
 
-        # Test results storage
         self._test_results: list[TestResultsDict] = []
+
+    def _validate_temporal_dimensions(self, T_teacher: int, T_rollout: int) -> None:
+        """Validate that temporal dimensions are within bounds."""
+        max_prediction_steps = self.num_timesteps - 1
+
+        if T_teacher > max_prediction_steps:
+            warnings.warn(
+                f"T_teacher ({T_teacher}) exceeds available prediction steps "
+                f"({max_prediction_steps}). Will be clamped at runtime.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if T_rollout > max_prediction_steps:
+            warnings.warn(
+                f"T_rollout ({T_rollout}) exceeds available prediction steps "
+                f"({max_prediction_steps}). Will be clamped at runtime.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     # ─── Forward pass ───
 
@@ -255,13 +267,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         """Single predictor step with optional layer normalization."""
         z_pred = self.model(z, actions, states, extrinsics)
         if self.normalize_reps:
-            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=1e-6)
+            z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=self.LAYER_NORM_EPS)
         return z_pred
 
     # ─── Training / Validation ───
-    # Loss computation methods are inherited from ACPredictorLossMixin:
-    #   _compute_loss, _compute_teacher_forcing_loss, _compute_rollout_loss,
-    #   _compute_rollout_loss_per_timestep, _shared_step
 
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         """Training step with HOPE diagnostic logging.
@@ -273,18 +282,15 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         Adds auxiliary M_k/M_v retrieval-quality loss to provide gradient
         flow to otherwise dead Titan parameters.
         """
-        # Reset memory state before forward — creates detached active weight clones
         self.model.reset_all_memories()
 
         loss = self._shared_step(batch, "train")
 
-        # Add auxiliary loss for M_k/M_v gradient flow
         aux_loss = self.model.get_aux_loss()
         if aux_loss.item() > 0:
             loss = loss + self.aux_loss_weight * aux_loss
             self.log("train/aux_loss_mk_mv", aux_loss.detach(), sync_dist=True)
 
-        # Log HOPE diagnostics periodically (Criticism §1)
         if self.log_hope_diagnostics and batch_idx % self._diagnostics_log_interval == 0:
             self._log_hope_diagnostics("train")
 
@@ -292,7 +298,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
     def validation_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         """Validation step."""
-        # Reset memory state before forward
         self.model.reset_all_memories()
         return self._shared_step(batch, "val")
 
@@ -310,7 +315,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             [f"clip_{batch_idx}_{i}" for i in range(features.shape[0])],
         )
 
-        # Reshape if needed
         if features.dim() == 3:
             B, total_tokens, D = features.shape
             T_plus_1 = total_tokens // self.patches_per_frame
@@ -318,13 +322,11 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         else:
             B = features.shape[0]
 
-        # TTA support
         if self.tta_enabled:
             return self._test_step_with_tta(
                 features, actions, states, extrinsics, clip_names, batch_idx
             )
 
-        # Standard test step
         loss_teacher = self._compute_teacher_forcing_loss(
             features, actions, states, extrinsics
         )
@@ -383,7 +385,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         C = self.context_frames
         T_pred = min(T_plus_1 - C, self.T_rollout)
 
-        all_losses = []
+        all_losses: list[float] = []
         all_per_timestep_losses: list[list[float]] = [[] for _ in range(T_pred)]
 
         for i in range(B):
@@ -422,7 +424,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             sample_loss = self._compute_loss(predictions, targets)
             all_losses.append(sample_loss.item())
 
-            per_step_losses = {}
+            per_step_losses: dict[str, float] = {}
             for step in range(T_pred):
                 step_pred = predictions[:, step * N : (step + 1) * N, :]
                 step_target = targets[:, step * N : (step + 1) * N, :]
@@ -454,44 +456,46 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
     def _validate_curriculum_schedule(self, schedule: list[dict]) -> None:
         """Validate curriculum schedule format."""
-        from collections.abc import Mapping, Sequence
-
         if (
             not isinstance(schedule, Sequence)
             or isinstance(schedule, str)
             or len(schedule) == 0
         ):
-            raise ValueError("curriculum_schedule must be a non-empty list")
+            raise InvalidConfigurationError(
+                "curriculum_schedule must be a non-empty list"
+            )
 
         max_prediction_steps = self.num_timesteps - 1
 
         for i, phase in enumerate(schedule):
             if not isinstance(phase, Mapping):
-                raise ValueError(f"Phase {i} must be a dict, got {type(phase)}")
+                raise InvalidConfigurationError(
+                    f"Phase {i} must be a dict, got {type(phase).__name__}"
+                )
             if "epoch" not in phase:
-                raise ValueError(f"Phase {i} must have 'epoch' key")
+                raise InvalidConfigurationError(f"Phase {i} must have 'epoch' key")
             if not isinstance(phase["epoch"], int) or phase["epoch"] < 0:
-                raise ValueError(
+                raise InvalidConfigurationError(
                     f"Phase {i} 'epoch' must be a non-negative integer"
                 )
             if "T_rollout" in phase and phase["T_rollout"] > max_prediction_steps:
-                raise ValueError(
+                raise InvalidConfigurationError(
                     f"Phase {i}: T_rollout ({phase['T_rollout']}) exceeds "
                     f"max prediction steps ({max_prediction_steps})"
                 )
 
         epochs = [p["epoch"] for p in schedule]
         if epochs != sorted(epochs):
-            raise ValueError(
+            raise InvalidConfigurationError(
                 "curriculum_schedule phases must be sorted by epoch"
             )
 
-    def _get_curriculum_params_for_epoch(self, epoch: int) -> dict:
+    def _get_curriculum_params_for_epoch(self, epoch: int) -> dict[str, Any]:
         """Get curriculum parameters for the given epoch."""
         if not self.curriculum_schedule:
             return {}
 
-        applicable_phase = None
+        applicable_phase: dict[str, Any] | None = None
         for phase in self.curriculum_schedule:
             if phase["epoch"] <= epoch:
                 applicable_phase = phase
@@ -514,7 +518,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         if not params:
             return
 
-        changes = []
+        changes: list[str] = []
 
         if "T_rollout" in params and params["T_rollout"] != self.T_rollout:
             old_val = self.T_rollout
@@ -576,8 +580,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         config = self.model.get_config_summary()
         log.info(f"[AC-HOPE-ViT] Configuration: {config}")
 
-        # Log scalar config values to wandb for reproducibility
-        # Note: self.log() is not allowed in on_fit_start, use logger directly
         if self.logger:
             for key, val in config.items():
                 if isinstance(val, (int, float)):
@@ -606,9 +608,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
     def on_test_epoch_end(self) -> None:
         """Aggregate and log test results (mirrors ACPredictorModule)."""
-        import json
-        from pathlib import Path
-
         if not self._test_results:
             log.warning("No test results to aggregate")
             return
@@ -625,9 +624,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             sum((x - mean_loss) ** 2 for x in rollout_losses) / num_clips
         ) ** 0.5
 
-        # Per-timestep statistics
-        num_ts = len(self._test_results[0]["per_timestep_losses"])
-        per_timestep_stats = {}
+        per_timestep_stats: dict[str, dict[str, float]] = {}
         for step_key in self._test_results[0]["per_timestep_losses"].keys():
             step_losses = [
                 r["per_timestep_losses"][step_key] for r in self._test_results
@@ -645,6 +642,46 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             self._test_results, key=lambda x: x["loss_rollout"]
         )[:5]
 
+        self._print_test_results_summary(
+            num_clips,
+            mean_loss,
+            median_loss,
+            std_loss,
+            min_loss,
+            max_loss,
+            per_timestep_stats,
+            worst_clips,
+            best_clips,
+        )
+
+        self._export_test_results(
+            num_clips,
+            mean_loss,
+            median_loss,
+            std_loss,
+            min_loss,
+            max_loss,
+            per_timestep_stats,
+            worst_clips,
+            best_clips,
+        )
+
+        self.log("test/final_mean_loss_rollout", mean_loss, sync_dist=True)
+        self.log("test/final_median_loss_rollout", median_loss, sync_dist=True)
+
+    def _print_test_results_summary(
+        self,
+        num_clips: int,
+        mean_loss: float,
+        median_loss: float,
+        std_loss: float,
+        min_loss: float,
+        max_loss: float,
+        per_timestep_stats: dict[str, dict[str, float]],
+        worst_clips: list[TestResultsDict],
+        best_clips: list[TestResultsDict],
+    ) -> None:
+        """Print formatted test results summary to console."""
         print("\n" + "=" * 70)
         print("              AC-HOPE-ViT TEST RESULTS SUMMARY")
         print("=" * 70)
@@ -682,7 +719,19 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             )
         print("=" * 70)
 
-        # Export to JSON
+    def _export_test_results(
+        self,
+        num_clips: int,
+        mean_loss: float,
+        median_loss: float,
+        std_loss: float,
+        min_loss: float,
+        max_loss: float,
+        per_timestep_stats: dict[str, dict[str, float]],
+        worst_clips: list[TestResultsDict],
+        best_clips: list[TestResultsDict],
+    ) -> None:
+        """Export test results to JSON file."""
         output_dir = Path(".")
         if self.trainer and hasattr(self.trainer, "log_dir") and self.trainer.log_dir:
             output_dir = Path(self.trainer.log_dir)
@@ -710,18 +759,14 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         try:
             results_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(results_file, "w") as f:
-                json.dump(export_data, f, indent=2, default=str)
+            results_file.write_text(json.dumps(export_data, indent=2, default=str))
             print(f"\n💾 Results exported to: {results_file}")
-        except Exception as e:
+        except OSError as e:
             log.warning(f"Failed to export results: {e}")
-
-        self.log("test/final_mean_loss_rollout", mean_loss, sync_dist=True)
-        self.log("test/final_median_loss_rollout", median_loss, sync_dist=True)
 
     # ─── Optimizer ───
 
-    def configure_optimizers(self) -> dict:
+    def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer with per-group learning rates.
 
         Uses AdamW with 3 parameter groups:
@@ -735,7 +780,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         """
         param_groups = self.model.get_parameter_groups()
 
-        optimizer_groups = []
+        optimizer_groups: list[dict[str, Any]] = []
         for group in param_groups:
             name = group.get("group_name", "default")
             params = group["params"]
@@ -744,10 +789,11 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
             if name == "titan":
                 lr = self.learning_rate * self.titan_lr_scale
-                # Titan memories have inner-loop α (weight decay) via DGD,
-                # so outer weight decay should be reduced to avoid double
-                # regularization. Use titan_weight_decay if set, else default.
-                wd = self.titan_weight_decay if self.titan_weight_decay is not None else self.weight_decay
+                wd = (
+                    self.titan_weight_decay
+                    if self.titan_weight_decay is not None
+                    else self.weight_decay
+                )
             elif name == "cms":
                 lr = self.learning_rate * self.cms_lr_scale
                 wd = self.weight_decay
@@ -773,86 +819,87 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         )
 
         if self.use_iteration_scheduler:
-            # Iteration-based: Warmup → Constant → Decay (V-JEPA2 paper)
-            if (
-                self.trainer is not None
-                and self.trainer.estimated_stepping_batches
-            ):
-                total_iters = int(self.trainer.estimated_stepping_batches)
-            else:
-                import warnings
-                warnings.warn(
-                    "Could not get total iterations from trainer. "
-                    "LR schedule may not work correctly.",
-                    UserWarning,
-                )
-                total_iters = 10000
-
-            warmup_iters = int(self.warmup_pct * total_iters)
-            constant_iters = int(self.constant_pct * total_iters)
-            decay_iters = int(self.decay_pct * total_iters)
-
-            computed_total = warmup_iters + constant_iters + decay_iters
-            if computed_total != total_iters:
-                constant_iters += total_iters - computed_total
-
-            warmup_end = warmup_iters
-            constant_end = warmup_end + constant_iters
-            warmup_start_factor = self.warmup_start_lr / self.learning_rate
-
-            log.info(
-                f"[LR Schedule] Total iters: {total_iters}, "
-                f"warmup: {warmup_iters}, constant: {constant_iters}, "
-                f"decay: {decay_iters}"
-            )
-
-            def lr_lambda_iter(step: int) -> float:
-                if step < warmup_end:
-                    progress = step / max(warmup_iters, 1)
-                    return warmup_start_factor + (
-                        1.0 - warmup_start_factor
-                    ) * progress
-                elif step < constant_end:
-                    return 1.0
-                elif step < total_iters:
-                    progress = (step - constant_end) / max(decay_iters, 1)
-                    return 1.0 - progress
-                else:
-                    return 0.0
-
-            scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda_iter
-            )
-
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                    "frequency": 1,
-                },
-            }
+            return self._configure_iteration_scheduler(optimizer)
         else:
-            # Epoch-based: Cosine annealing with linear warmup
-            def lr_lambda_epoch(epoch: int) -> float:
-                if epoch < self.warmup_epochs:
-                    return epoch / max(self.warmup_epochs, 1)
-                progress = (epoch - self.warmup_epochs) / max(
-                    self.max_epochs - self.warmup_epochs, 1
-                )
-                return 0.5 * (
-                    1.0
-                    + torch.cos(torch.tensor(torch.pi * progress)).item()
-                )
+            return self._configure_epoch_scheduler(optimizer)
 
-            scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda_epoch
+    def _configure_iteration_scheduler(
+        self, optimizer: torch.optim.Optimizer
+    ) -> dict[str, Any]:
+        """Configure iteration-based LR scheduler (V-JEPA2 paper)."""
+        if (
+            self.trainer is not None
+            and self.trainer.estimated_stepping_batches
+        ):
+            total_iters = int(self.trainer.estimated_stepping_batches)
+        else:
+            warnings.warn(
+                "Could not get total iterations from trainer. "
+                "LR schedule may not work correctly.",
+                UserWarning,
+                stacklevel=2,
             )
+            total_iters = self.DEFAULT_TOTAL_ITERS_FALLBACK
 
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "epoch",
-                },
-            }
+        warmup_iters = int(self.warmup_pct * total_iters)
+        constant_iters = int(self.constant_pct * total_iters)
+        decay_iters = int(self.decay_pct * total_iters)
+
+        computed_total = warmup_iters + constant_iters + decay_iters
+        if computed_total != total_iters:
+            constant_iters += total_iters - computed_total
+
+        warmup_end = warmup_iters
+        constant_end = warmup_end + constant_iters
+        warmup_start_factor = self.warmup_start_lr / self.learning_rate
+
+        log.info(
+            f"[LR Schedule] Total iters: {total_iters}, "
+            f"warmup: {warmup_iters}, constant: {constant_iters}, "
+            f"decay: {decay_iters}"
+        )
+
+        def lr_lambda_iter(step: int) -> float:
+            if step < warmup_end:
+                progress = step / max(warmup_iters, 1)
+                return warmup_start_factor + (1.0 - warmup_start_factor) * progress
+            elif step < constant_end:
+                return 1.0
+            elif step < total_iters:
+                progress = (step - constant_end) / max(decay_iters, 1)
+                return 1.0 - progress
+            else:
+                return 0.0
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_iter)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+    def _configure_epoch_scheduler(
+        self, optimizer: torch.optim.Optimizer
+    ) -> dict[str, Any]:
+        """Configure epoch-based LR scheduler with cosine annealing."""
+        def lr_lambda_epoch(epoch: int) -> float:
+            if epoch < self.warmup_epochs:
+                return epoch / max(self.warmup_epochs, 1)
+            progress = (epoch - self.warmup_epochs) / max(
+                self.max_epochs - self.warmup_epochs, 1
+            )
+            return 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item())
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_epoch)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }

@@ -1,8 +1,9 @@
 """Python logger utilities."""
 
 import logging
+from typing import Final
 
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 
 
 def get_pylogger(name: str = __name__) -> logging.Logger:
@@ -12,13 +13,14 @@ def get_pylogger(name: str = __name__) -> logging.Logger:
         name: Name of the logger, defaults to __name__.
 
     Returns:
-        A configured logger instance.
+        A configured logger instance that only logs on rank 0 in
+        multi-GPU setups, preventing log multiplication across processes.
     """
     logger = logging.getLogger(name)
 
-    # This ensures all logging levels get marked with the rank zero decorator
-    # otherwise logs would get multiplied for each GPU process in multi-GPU setup
-    logging_levels = (
+    # Decorate all logging levels with rank_zero_only to prevent
+    # log multiplication in multi-GPU training
+    logging_levels: Final = (
         "debug",
         "info",
         "warning",

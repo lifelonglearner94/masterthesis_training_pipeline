@@ -1,18 +1,16 @@
 """Instantiation utilities for Hydra configs."""
 
-from typing import List, Optional
-
 import hydra
 from omegaconf import DictConfig
-from pytorch_lightning import Callback
-from pytorch_lightning.loggers import Logger
+from lightning.pytorch import Callback
+from lightning.pytorch.loggers import Logger
 
 from src.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
 
 
-def instantiate_callbacks(callbacks_cfg: Optional[DictConfig]) -> List[Callback]:
+def instantiate_callbacks(callbacks_cfg: DictConfig | None) -> list[Callback]:
     """Instantiate callbacks from config.
 
     Args:
@@ -21,7 +19,7 @@ def instantiate_callbacks(callbacks_cfg: Optional[DictConfig]) -> List[Callback]
     Returns:
         A list of instantiated callbacks.
     """
-    callbacks: List[Callback] = []
+    callbacks: list[Callback] = []
 
     if not callbacks_cfg:
         log.warning("No callback configs found! Skipping...")
@@ -30,7 +28,7 @@ def instantiate_callbacks(callbacks_cfg: Optional[DictConfig]) -> List[Callback]
     if not isinstance(callbacks_cfg, DictConfig):
         raise TypeError("Callbacks config must be a DictConfig!")
 
-    for _, cb_conf in callbacks_cfg.items():
+    for cb_conf in callbacks_cfg.values():
         if isinstance(cb_conf, DictConfig) and "_target_" in cb_conf:
             log.info(f"Instantiating callback <{cb_conf._target_}>")
             callbacks.append(hydra.utils.instantiate(cb_conf))
@@ -38,7 +36,7 @@ def instantiate_callbacks(callbacks_cfg: Optional[DictConfig]) -> List[Callback]
     return callbacks
 
 
-def instantiate_loggers(logger_cfg: Optional[DictConfig]) -> List[Logger]:
+def instantiate_loggers(logger_cfg: DictConfig | None) -> list[Logger]:
     """Instantiate loggers from config.
 
     Args:
@@ -47,7 +45,7 @@ def instantiate_loggers(logger_cfg: Optional[DictConfig]) -> List[Logger]:
     Returns:
         A list of instantiated loggers.
     """
-    loggers: List[Logger] = []
+    loggers: list[Logger] = []
 
     if not logger_cfg:
         log.warning("No logger configs found! Skipping...")
@@ -56,7 +54,7 @@ def instantiate_loggers(logger_cfg: Optional[DictConfig]) -> List[Logger]:
     if not isinstance(logger_cfg, DictConfig):
         raise TypeError("Logger config must be a DictConfig!")
 
-    for _, lg_conf in logger_cfg.items():
+    for lg_conf in logger_cfg.values():
         if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
             log.info(f"Instantiating logger <{lg_conf._target_}>")
             loggers.append(hydra.utils.instantiate(lg_conf))

@@ -6,13 +6,20 @@ hardware accelerator, with automatic fallbacks for different platforms.
 
 import logging
 import warnings
-from typing import Literal
+from typing import Final, Literal
 
 import torch
 
 log = logging.getLogger(__name__)
 
 DeviceType = Literal["cuda", "mps", "cpu"]
+Precision = Literal["16-mixed", "32"]
+Accelerator = Literal["gpu", "mps", "cpu"]
+
+# Constants
+MIN_COMPUTE_CAPABILITY: Final = 7
+LOG_SEPARATOR_LENGTH: Final = 60
+FLASH_ATTENTION_COMPUTE_CAPABILITY: Final = 7.5
 
 
 def get_best_device() -> DeviceType:
@@ -23,13 +30,12 @@ def get_best_device() -> DeviceType:
     """
     if torch.cuda.is_available():
         return "cuda"
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return "mps"
-    else:
-        return "cpu"
+    return "cpu"
 
 
-def get_accelerator() -> str:
+def get_accelerator() -> Accelerator:
     """Get the PyTorch Lightning accelerator string for the best available device.
 
     Returns:
@@ -38,13 +44,12 @@ def get_accelerator() -> str:
     device = get_best_device()
     if device == "cuda":
         return "gpu"
-    elif device == "mps":
+    if device == "mps":
         return "mps"
-    else:
-        return "cpu"
+    return "cpu"
 
 
-def get_precision(device: DeviceType | None = None) -> str:
+def get_precision(device: DeviceType | None = None) -> Precision:
     """Get the recommended precision setting for the given device.
 
     Args:
@@ -58,10 +63,7 @@ def get_precision(device: DeviceType | None = None) -> str:
 
     if device == "cuda":
         return "16-mixed"  # Mixed precision works well on CUDA
-    elif device == "mps":
-        return "32"  # MPS has limited fp16 support
-    else:
-        return "32"  # CPU doesn't benefit from mixed precision
+    return "32"  # MPS has limited fp16 support; CPU doesn't benefit
 
 
 def check_flash_attention_support() -> bool:
@@ -74,13 +76,22 @@ def check_flash_attention_support() -> bool:
         return False
 
     try:
-        # FlashAttention requires CUDA compute capability >= 7.5
-        if torch.cuda.get_device_capability()[0] >= 7:
+        if torch.cuda.get_device_capability()[0] >= MIN_COMPUTE_CAPABILITY:
             return True
     except Exception:
-        pass
+        return False
 
     return False
+
+
+def _log_flash_attention_warning(device: str) -> None:
+    """Log a warning about FlashAttention unavailability for non-CUDA devices."""
+    warnings.warn(
+        f"FlashAttention is not available on {device}. "
+        "Using PyTorch's scaled_dot_product_attention with automatic backend selection.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def log_device_info() -> DeviceType:
@@ -96,9 +107,10 @@ def log_device_info() -> DeviceType:
     accelerator = get_accelerator()
     precision = get_precision(device)
 
-    log.info("=" * 60)
+    separator = "=" * LOG_SEPARATOR_LENGTH
+    log.info(separator)
     log.info("Hardware Detection")
-    log.info("=" * 60)
+    log.info(separator)
 
     if device == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
@@ -113,38 +125,28 @@ def log_device_info() -> DeviceType:
         if check_flash_attention_support():
             log.info("FlashAttention: Available")
         else:
-            log.info("FlashAttention: Not available (compute capability < 7.5)")
+            log.info(f"FlashAttention: Not available (compute capability < {FLASH_ATTENTION_COMPUTE_CAPABILITY})")
 
     elif device == "mps":
-        log.info(f"Device: Apple Silicon (MPS)")
+        log.info("Device: Apple Silicon (MPS)")
         log.info(f"Precision: {precision}")
         log.warning(
             "Running on Apple MPS. Some features may have reduced performance. "
             "Mixed precision is disabled due to limited fp16 support."
         )
-        warnings.warn(
-            "FlashAttention is not available on MPS. "
-            "Using PyTorch's scaled_dot_product_attention with automatic backend selection.",
-            UserWarning,
-            stacklevel=2
-        )
+        _log_flash_attention_warning("MPS")
 
     else:
-        log.info(f"Device: CPU")
+        log.info("Device: CPU")
         log.info(f"Precision: {precision}")
         log.warning(
             "Running on CPU. Training will be significantly slower than GPU. "
             "Consider using a CUDA GPU or Apple Silicon Mac for better performance."
         )
-        warnings.warn(
-            "FlashAttention is not available on CPU. "
-            "Using PyTorch's scaled_dot_product_attention with automatic backend selection.",
-            UserWarning,
-            stacklevel=2
-        )
+        _log_flash_attention_warning("CPU")
 
     log.info(f"PyTorch Lightning Accelerator: {accelerator}")
-    log.info("=" * 60)
+    log.info(separator)
 
     return device
 

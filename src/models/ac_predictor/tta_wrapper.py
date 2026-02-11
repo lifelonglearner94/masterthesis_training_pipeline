@@ -15,13 +15,34 @@ TTA Loop ("Look-Back" Update):
     5. Predict z_{t+2} with updated model
 """
 
-from copy import deepcopy
-from typing import Any
+import logging
+from enum import StrEnum
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+# Type aliases for better readability
+type LayerNormState = dict[str, Tensor]
+type AdaptationStats = dict[str, float | int]
+
+# Constants
+DEFAULT_TTA_LR = 1e-4
+DEFAULT_GRAD_CLIP_NORM = 1.0
+DEFAULT_CONTEXT_FRAMES = 1
+DEFAULT_PATCHES_PER_FRAME = 256
+LAYER_NORM_EPS = 1e-6
+
+
+class OptimizerType(StrEnum):
+    """Supported optimizer types for TTA."""
+
+    ADAM = "adam"
+    ADAMW = "adamw"
+
+
+logger = logging.getLogger(__name__)
 
 
 class RolloutTTAAgent(nn.Module):
@@ -47,9 +68,9 @@ class RolloutTTAAgent(nn.Module):
     def __init__(
         self,
         predictor_model: nn.Module,
-        tta_lr: float = 1e-4,
-        grad_clip_norm: float = 1.0,
-        optimizer_type: str = "adam",
+        tta_lr: float = DEFAULT_TTA_LR,
+        grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
+        optimizer_type: str = OptimizerType.ADAM,
         optimizer_betas: tuple[float, float] = (0.9, 0.999),
         reset_per_clip: bool = True,
     ) -> None:
@@ -79,7 +100,7 @@ class RolloutTTAAgent(nn.Module):
 
         # Store original state for per-clip reset
         if reset_per_clip:
-            self._original_ln_state = self._get_layernorm_state()
+            self._original_ln_state: LayerNormState | None = self._get_layernorm_state()
         else:
             self._original_ln_state = None
 
@@ -89,7 +110,7 @@ class RolloutTTAAgent(nn.Module):
 
         # Tracking metrics
         self._adaptation_losses: list[float] = []
-        self._num_adaptations: int = 0
+        self._num_adaptations = 0
 
     def _configure_trainable_params(self) -> None:
         """Freeze all parameters except LayerNorm weights and biases."""
@@ -98,7 +119,7 @@ class RolloutTTAAgent(nn.Module):
 
         # Then selectively unfreeze LayerNorm parameters
         num_ln_params = 0
-        for name, module in self.model.named_modules():
+        for module in self.model.modules():
             if isinstance(module, nn.LayerNorm):
                 for param in module.parameters():
                     param.requires_grad = True
@@ -108,32 +129,48 @@ class RolloutTTAAgent(nn.Module):
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-        import logging
-        log = logging.getLogger(__name__)
-        log.info(
-            f"[TTA] Configured model: {trainable_params:,} / {total_params:,} params trainable "
-            f"({100*trainable_params/total_params:.2f}% - LayerNorm only)"
+        trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0.0
+
+        logger.info(
+            "TTA model configured",
+            extra={
+                "trainable_params": trainable_params,
+                "total_params": total_params,
+                "trainable_percentage": trainable_percentage,
+            },
         )
 
     def _get_layernorm_params(self) -> list[nn.Parameter]:
-        """Get list of LayerNorm parameters for optimizer."""
+        """Get list of LayerNorm parameters for optimizer.
+
+        Returns:
+            List of LayerNorm parameters.
+        """
         params = []
         for module in self.model.modules():
             if isinstance(module, nn.LayerNorm):
                 params.extend(module.parameters())
         return params
 
-    def _get_layernorm_state(self) -> dict[str, Tensor]:
-        """Get current state of LayerNorm parameters."""
-        state = {}
+    def _get_layernorm_state(self) -> LayerNormState:
+        """Get current state of LayerNorm parameters.
+
+        Returns:
+            Dictionary mapping parameter names to their tensor values.
+        """
+        state: LayerNormState = {}
         for name, module in self.model.named_modules():
             if isinstance(module, nn.LayerNorm):
                 state[f"{name}.weight"] = module.weight.data.clone()
                 state[f"{name}.bias"] = module.bias.data.clone()
         return state
 
-    def _restore_layernorm_state(self, state: dict[str, Tensor]) -> None:
-        """Restore LayerNorm parameters from saved state."""
+    def _restore_layernorm_state(self, state: LayerNormState) -> None:
+        """Restore LayerNorm parameters from saved state.
+
+        Args:
+            state: Dictionary of LayerNorm parameters to restore.
+        """
         for name, module in self.model.named_modules():
             if isinstance(module, nn.LayerNorm):
                 weight_key = f"{name}.weight"
@@ -144,21 +181,24 @@ class RolloutTTAAgent(nn.Module):
                     module.bias.data.copy_(state[bias_key])
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
-        """Create optimizer for LayerNorm parameters."""
+        """Create optimizer for LayerNorm parameters.
+
+        Returns:
+            Configured optimizer instance.
+        """
         ln_params = self._get_layernorm_params()
 
-        if self.optimizer_type.lower() == "adamw":
+        if self.optimizer_type.lower() == OptimizerType.ADAMW:
             return torch.optim.AdamW(
                 ln_params,
                 lr=self.tta_lr,
                 betas=self.optimizer_betas,
             )
-        else:  # default: adam
-            return torch.optim.Adam(
-                ln_params,
-                lr=self.tta_lr,
-                betas=self.optimizer_betas,
-            )
+        return torch.optim.Adam(
+            ln_params,
+            lr=self.tta_lr,
+            betas=self.optimizer_betas,
+        )
 
     def reset_for_new_clip(self) -> None:
         """Reset model state for a new clip (per-clip TTA).
@@ -196,7 +236,7 @@ class RolloutTTAAgent(nn.Module):
             ground_truth: Ground-truth features [B, N, D]
 
         Returns:
-            The adaptation loss value (for logging)
+            The adaptation loss value (for logging).
         """
         # Compute L1 loss with detached ground-truth (stop gradient into encoder)
         loss = F.l1_loss(prediction, ground_truth.detach())
@@ -245,7 +285,7 @@ class RolloutTTAAgent(nn.Module):
             extrinsics: Optional extrinsics [B, C, action_dim-1]
 
         Returns:
-            Predicted next features [B, N, D] (detached for downstream use)
+            Predicted next features [B, N, D] (detached for downstream use).
         """
         # --- Phase A: Look-Back Adaptation ---
         if self.prev_prediction is not None and ground_truth_next is not None:
@@ -259,7 +299,8 @@ class RolloutTTAAgent(nn.Module):
             z_pred_all = self.model(z_context, actions, states, extrinsics)
 
             # Extract only the last frame prediction (single-step rollout)
-            N = z_context.shape[1] // (actions.shape[1] if actions.dim() > 1 else 1)
+            num_action_steps = actions.shape[1] if actions.dim() > 1 else 1
+            N = z_context.shape[1] // num_action_steps
             # For single-step, extract last N tokens
             z_pred_next = z_pred_all[:, -N:, :]
 
@@ -269,8 +310,17 @@ class RolloutTTAAgent(nn.Module):
         # Return detached prediction for downstream tasks (avoid graph retention)
         return z_pred_next.detach()
 
-    def get_adaptation_stats(self) -> dict[str, Any]:
-        """Get statistics about adaptation performed on this clip."""
+    def get_adaptation_stats(self) -> AdaptationStats:
+        """Get statistics about adaptation performed on this clip.
+
+        Returns:
+            Dictionary containing:
+                - num_adaptations: Number of adaptation steps performed
+                - mean_loss: Average loss across all adaptations
+                - first_loss: Loss of the first adaptation step
+                - last_loss: Loss of the last adaptation step
+                - improvement: Difference between first and last loss
+        """
         if not self._adaptation_losses:
             return {
                 "num_adaptations": 0,
@@ -285,7 +335,8 @@ class RolloutTTAAgent(nn.Module):
             "first_loss": self._adaptation_losses[0],
             "last_loss": self._adaptation_losses[-1],
             "improvement": self._adaptation_losses[0] - self._adaptation_losses[-1]
-            if len(self._adaptation_losses) > 1 else 0.0,
+            if len(self._adaptation_losses) > 1
+            else 0.0,
         }
 
     def forward(
@@ -298,6 +349,15 @@ class RolloutTTAAgent(nn.Module):
         """Standard forward pass (without TTA adaptation).
 
         Use this for evaluation after adaptation or when TTA is disabled.
+
+        Args:
+            features: Input features [B, C*N, D]
+            actions: Actions [B, C, action_dim]
+            states: States [B, C, action_dim]
+            extrinsics: Optional extrinsics [B, C, action_dim-1]
+
+        Returns:
+            Model predictions.
         """
         with torch.no_grad():
             return self.model(features, actions, states, extrinsics)
@@ -317,8 +377,8 @@ class SequentialTTAProcessor:
     def __init__(
         self,
         tta_agent: RolloutTTAAgent,
-        context_frames: int = 1,
-        patches_per_frame: int = 256,
+        context_frames: int = DEFAULT_CONTEXT_FRAMES,
+        patches_per_frame: int = DEFAULT_PATCHES_PER_FRAME,
         normalize_reps: bool = True,
     ) -> None:
         """Initialize the sequential processor.
@@ -340,7 +400,7 @@ class SequentialTTAProcessor:
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
-    ) -> tuple[Tensor, dict[str, Any]]:
+    ) -> tuple[Tensor, dict[str, float | int]]:
         """Process a complete clip with TTA adaptation.
 
         Iterates through the sequence, making predictions and adapting
@@ -368,9 +428,9 @@ class SequentialTTAProcessor:
         # Normalize features if enabled
         h = features
         if self.normalize_reps:
-            h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(
-                B, T_plus_1, N, D
-            )
+            h = F.layer_norm(
+                features.reshape(B, -1, D), (D,), eps=LAYER_NORM_EPS
+            ).reshape(B, T_plus_1, N, D)
 
         # Initialize context with ground-truth frames
         z_context = h[:, :C, :, :].reshape(B, C * N, D)
@@ -388,7 +448,9 @@ class SequentialTTAProcessor:
             step_actions = actions[:, :num_action_steps, :]
             step_states = states[:, :num_action_steps, :]
             step_extrinsics = (
-                extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
+                extrinsics[:, :num_action_steps, :]
+                if extrinsics is not None
+                else None
             )
 
             # Ground-truth for this timestep (for adaptation in next iteration)

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 
 import torch
 import torch.nn as nn
@@ -45,9 +46,26 @@ from torch import Tensor
 log = logging.getLogger(__name__)
 
 
+class Activation(StrEnum):
+    """Activation function types for Titan Memory."""
+    GELU = "gelu"
+    SILU = "silu"
+    RELU = "relu"
+
+
 @dataclass
 class TitanMemoryConfig:
-    """Configuration for a single Titan memory module."""
+    """Configuration for a single Titan memory module.
+
+    Attributes:
+        dim: Feature dimension (default: 384).
+        hidden_multiplier: Multiplier for hidden layer size (default: 4).
+        num_layers: Number of layers (default: 2).
+        activation: Activation function name (default: "gelu").
+        grad_clip_inner: Gradient clipping threshold for inner loop (default: 1.0).
+        output_norm: Apply LayerNorm to output (default: True).
+        detach_interval: Detach memory graph every N update steps, 0 = never (default: 0).
+    """
 
     dim: int = 384
     hidden_multiplier: int = 4
@@ -55,7 +73,6 @@ class TitanMemoryConfig:
     activation: str = "gelu"
     grad_clip_inner: float = 1.0
     output_norm: bool = True
-    # Detach memory graph every N update steps to bound memory cost (0 = never)
     detach_interval: int = 0
 
 
@@ -96,14 +113,19 @@ class TitanMemory(nn.Module):
         # Meta-learned initial memory weights (2-layer MLP with residual)
         self.w1 = nn.Linear(dim, hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
-        self.norm = nn.LayerNorm(dim) if config.output_norm else nn.Identity()
+        self.norm = (
+            nn.LayerNorm(dim) if config.output_norm else nn.Identity()
+        )
 
         # Activation function
-        act_map = {"gelu": nn.GELU(), "silu": nn.SiLU(), "relu": nn.ReLU()}
+        act_map: dict[str, nn.Module] = {
+            Activation.GELU: nn.GELU(),
+            Activation.SILU: nn.SiLU(),
+            Activation.RELU: nn.ReLU(),
+        }
         self.act = act_map.get(config.activation, nn.GELU())
 
-        # Active weights for functional forward (plain tensors, NOT nn.Parameters).
-        # When None, forward() falls back to using nn.Linear modules directly.
+        # Active weights for functional forward (plain tensors, NOT nn.Parameters)
         self._active_w1: Tensor | None = None
         self._active_w2: Tensor | None = None
 
@@ -135,8 +157,6 @@ class TitanMemory(nn.Module):
             nn.Parameter → active_weight → F.linear(query, active_weight) → loss
         so backprop through the loss updates the meta-learned initial state.
         """
-        # Clone WITHOUT detach: preserves gradient connection to nn.Parameters
-        # This is the fix for the meta-learning bug (Review §4.1)
         self._active_w1 = self.w1.weight.clone()
         self._active_w2 = self.w2.weight.clone()
 
@@ -162,14 +182,12 @@ class TitanMemory(nn.Module):
             [B, ..., D] retrieved memory output (with LayerNorm).
         """
         if self._active_w1 is not None and self._active_w2 is not None:
-            # Functional path — uses active weights (connected to Parameters)
             h = F.linear(query, self._active_w1)
             h = self.act(h)
-            out = F.linear(h, self._active_w2) + query  # Residual
+            out = F.linear(h, self._active_w2) + query
         else:
-            # Standard nn.Module path (inference without reset, or eval)
             h = self.act(self.w1(query))
-            out = self.w2(h) + query  # Residual
+            out = self.w2(h) + query
         return self.norm(out)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -205,7 +223,7 @@ class TitanMemory(nn.Module):
         Returns:
             [B] scalar surprise per sample.
         """
-        norms = residual.detach().norm(dim=-1)  # [B, ...] or [B]
+        norms = residual.detach().norm(dim=-1)
         if norms.dim() > 1:
             s = norms.mean(dim=list(range(1, norms.dim())))
         else:
@@ -250,11 +268,11 @@ class TitanMemory(nn.Module):
         This decorrelates correlated token updates (the core DGD innovation).
 
         Args:
-            key:   [B, N, D]  keys to write.
-            value: [B, N, D]  self-generated target values v̂_□.
-            error_signal: [B]  per-sample gating (surprise).
-            lr:    [B, N, D]  per-token, per-feature adaptive learning rate η_t.
-            alpha: [B, N, D]  per-token, per-feature adaptive decay α_t (default 1.0).
+            key: [B, N, D] keys to write.
+            value: [B, N, D] self-generated target values v̂_□.
+            error_signal: [B] per-sample gating (surprise).
+            lr: [B, N, D] per-token, per-feature adaptive learning rate η_t.
+            alpha: [B, N, D] per-token, per-feature adaptive decay α_t (default 1.0).
 
         Raises:
             RuntimeError: If active weights have not been initialized via
@@ -267,37 +285,24 @@ class TitanMemory(nn.Module):
             )
 
         # ─── Compute inner-loop gradient ───
-        # The inner-loop runs during BOTH training and inference (paper:
-        # "There is no distinction between training and test time.").
-        # We need torch.enable_grad() here because during validation/test
-        # Lightning disables gradients, but the inner-loop still needs to
-        # compute gradients w.r.t. its own leaf weights for the DGD update.
-        # This does NOT affect the outer-loop: create_graph=False ensures
-        # no second-order gradients are computed.
+        # torch.enable_grad() needed because Lightning disables gradients during
+        # validation/test, but the inner-loop still needs gradients for DGD.
+        # create_graph=False ensures no second-order gradients (FOMAML).
         with torch.enable_grad():
-            # Create leaf copies for autograd.grad() — these are detached from
-            # the meta-gradient chain (first-order: we don't differentiate through
-            # the gradient computation itself, only through w_old in the update).
+            # Leaf copies for autograd.grad() — detached from meta-gradient chain
+            # (first-order: we don't differentiate through the gradient computation)
             w1_leaf = self._active_w1.detach().requires_grad_(True)
             w2_leaf = self._active_w2.detach().requires_grad_(True)
 
-            # Forward through memory with leaf weights
             h = F.linear(key, w1_leaf)
             h = self.act(h)
-            retrieved = F.linear(h, w2_leaf) + key  # Residual
+            retrieved = F.linear(h, w2_leaf) + key
 
-            # Inner loss: MSE between retrieved and target values (Eq. 93)
-            # Normalized by element count to decouple gradient magnitude from
-            # sequence/feature dimensions (prevents ~1.8M-scale raw gradients).
-            inner_loss = F.mse_loss(
-                retrieved, value.detach(), reduction="none"
-            )  # [B, N, D]
+            inner_loss = F.mse_loss(retrieved, value.detach(), reduction="none")
 
-            # Weight by error_signal (surprise gating): [B] → [B, 1, 1]
             gate = error_signal.detach().unsqueeze(-1).unsqueeze(-1)
             inner_loss = (inner_loss * gate).mean()
 
-            # First-order inner-loop gradients (FOMAML-style: no Hessian)
             grads = torch.autograd.grad(
                 inner_loss,
                 [w1_leaf, w2_leaf],
@@ -306,21 +311,14 @@ class TitanMemory(nn.Module):
             )
 
         # ─── Compute per-feature η and α for weight update ───
-        # η and α are [B, N, D] — average over batch and tokens to get
-        # per-feature [D] vectors, then kept IN the computation graph
-        # so the outer-loop can train M_eta and M_alpha through the
-        # DGD update: new_w = α * w_old − η * grad.
-        lr_feat = lr.mean(dim=(0, 1))    # [D] per-feature learning rate
+        lr_feat = lr.mean(dim=(0, 1))
         alpha_feat = (
-            alpha.mean(dim=(0, 1)) if alpha is not None  # [D] per-feature decay
+            alpha.mean(dim=(0, 1)) if alpha is not None
             else torch.ones(key.shape[-1], device=key.device)
         )
 
         # ─── DGD preconditioner: diagonal approximation of k_t k_t^T ───
-        # Paper Eq. 93: M_t = M_{t-1}(α I − η k k^T) − η ∇L
-        # For nonlinear MLP, we use diagonal: diag(mean(k^2)) per feature dim.
-        # This decorrelates correlated token updates (core DGD innovation).
-        k_sq = (key.detach() ** 2).mean(dim=(0, 1))  # [D] mean squared key per feature
+        k_sq = (key.detach() ** 2).mean(dim=(0, 1))
 
         inner_grad_norm_sq = 0.0
         new_weights: list[Tensor] = []
@@ -332,12 +330,10 @@ class TitanMemory(nn.Module):
                 new_weights.append(w_old)
                 continue
 
-            # Detach grad from inner loop graph (first-order only)
             grad = grad.detach()
             grad_norm = grad.norm().item()
             inner_grad_norm_sq += grad_norm ** 2
 
-            # Clip inner-loop gradients for stability
             if (
                 self.config.grad_clip_inner > 0
                 and grad_norm > self.config.grad_clip_inner
@@ -346,33 +342,21 @@ class TitanMemory(nn.Module):
                     self.config.grad_clip_inner / (grad_norm + 1e-8)
                 )
 
-            # DGD update with preconditioner (Eq. 93, Behrouz 2025):
-            #   W_new = W_old * (α I − η k k^T) − η * grad
-            # For weight matrices:
-            #   w1 [hidden, D]: preconditioner scales columns (input dim = D)
-            #   w2 [D, hidden]: preconditioner scales rows (output dim = D)
-            # w_old is connected to nn.Parameters (meta-gradient flows through)
-            # grad is detached (first-order: no meta-gradient through inner grad)
-            #
-            # STABILITY: Clamp preconditioner to [0, 1] range. The paper defines
-            # α as a "retention gate" (Eq. 88) and η as a learning rate, so
-            # (α − η·k²) is a decay factor that MUST stay in [0, 1] to prevent
-            # exponential weight growth across sequential chunk updates.
-            # Without clamping, 7 sequential updates can compound to precond^7,
-            # which causes NaN gradients in the backward pass.
+            # DGD preconditioned update (Eq. 93): W_new = W_old * (α − η·k²) − η·grad
+            # STABILITY: Clamp preconditioner to [0, 1] — without this, precond^7
+            # across sequential chunk updates causes exponential weight growth / NaN.
             if idx == 0:
-                # w1: [hidden, D] — α/η/k² broadcast along columns (dim D)
-                precond = alpha_feat.unsqueeze(0) - lr_feat.unsqueeze(0) * k_sq.unsqueeze(0)  # [1, D]
+                # w1 [hidden, D]: preconditioner scales columns (input dim = D)
+                precond = alpha_feat.unsqueeze(0) - lr_feat.unsqueeze(0) * k_sq.unsqueeze(0)
                 precond = precond.clamp(0.0, 1.0)
                 new_w = w_old * precond - lr_feat.unsqueeze(0) * grad
             else:
-                # w2: [D, hidden] — α/η/k² broadcast along rows (dim D)
-                precond = alpha_feat.unsqueeze(1) - lr_feat.unsqueeze(1) * k_sq.unsqueeze(1)  # [D, 1]
+                # w2 [D, hidden]: preconditioner scales rows (output dim = D)
+                precond = alpha_feat.unsqueeze(1) - lr_feat.unsqueeze(1) * k_sq.unsqueeze(1)
                 precond = precond.clamp(0.0, 1.0)
                 new_w = w_old * precond - lr_feat.unsqueeze(1) * grad
             new_weights.append(new_w)
 
-        # Assign updated active weights (tensor reassignment, no in-place)
         self._active_w1 = new_weights[0]
         self._active_w2 = new_weights[1]
 
@@ -385,7 +369,6 @@ class TitanMemory(nn.Module):
             self._active_w1 = self._active_w1.detach().clone()
             self._active_w2 = self._active_w2.detach().clone()
 
-        # Update diagnostics
         self._step_counter += 1
         self._total_inner_grad_norm += inner_grad_norm_sq ** 0.5
 
@@ -402,11 +385,12 @@ class TitanMemory(nn.Module):
     def get_diagnostics(self) -> dict[str, float]:
         """Get averaged diagnostic metrics for logging.
 
-        Returns dict with keys:
-            - titan/mean_inner_grad_norm
-            - titan/param_norm_w1
-            - titan/param_norm_w2
-            - titan/num_updates
+        Returns:
+            Dict with keys:
+                - titan/mean_inner_grad_norm
+                - titan/param_norm_w1
+                - titan/param_norm_w2
+                - titan/num_updates
         """
         n = max(self._step_counter.item(), 1)
         return {

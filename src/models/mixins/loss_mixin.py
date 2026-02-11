@@ -4,11 +4,13 @@ Provides reusable loss computation methods for both the ViT AC Predictor
 and baseline models, ensuring scientific comparability.
 """
 
-from typing import Callable
+import logging
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+logger = logging.getLogger(__name__)
 
 
 class ACPredictorLossMixin:
@@ -56,30 +58,26 @@ class ACPredictorLossMixin:
         Returns:
             Scalar loss tensor
         """
-        import logging
-
-        log = logging.getLogger(__name__)
-
         # Compute element-wise absolute difference
         diff = torch.abs(pred - target)
-        log.debug(
+        logger.debug(
             f"    [LOSS] pred shape: {pred.shape}, target shape: {target.shape}"
         )
-        log.debug(
+        logger.debug(
             f"    [LOSS] |pred - target|: min={diff.min().item():.6f}, "
             f"max={diff.max().item():.6f}, mean={diff.mean().item():.6f}"
         )
 
         # Apply exponent
         diff_exp = diff**self.loss_exp
-        log.debug(
+        logger.debug(
             f"    [LOSS] |diff|^{self.loss_exp}: min={diff_exp.min().item():.6f}, "
             f"max={diff_exp.max().item():.6f}, mean={diff_exp.mean().item():.6f}"
         )
 
         # Compute final loss
         loss = torch.mean(diff_exp) / self.loss_exp
-        log.debug(f"    [LOSS] Final loss: {loss.item():.8f}")
+        logger.debug(f"    [LOSS] Final loss: {loss.item():.8f}")
 
         return loss
 
@@ -121,26 +119,22 @@ class ACPredictorLossMixin:
         Returns:
             Scalar loss tensor
         """
-        import logging
-
-        log = logging.getLogger(__name__)
-
         B, T_plus_1, N, D = features.shape
-        log.debug(
+        logger.debug(
             f"  [TEACHER FORCING] Input features: B={B}, T+1={T_plus_1}, N={N}, D={D}"
         )
         T = min(T_plus_1 - 1, self.T_teacher)
-        log.debug(
+        logger.debug(
             f"  [TEACHER FORCING] Using T={T} timesteps (T_teacher={self.T_teacher})"
         )
 
         # Context: all frames except the last one (frames 0 to T-1)
         # Shape: [B, T*N, D]
         context_features = features[:, :T, :, :].reshape(B, T * N, D)
-        log.debug(
+        logger.debug(
             f"  [TEACHER FORCING] Context features reshaped to: {context_features.shape}"
         )
-        log.debug(
+        logger.debug(
             f"  [TEACHER FORCING] Context stats: min={context_features.min().item():.6f}, "
             f"max={context_features.max().item():.6f}, mean={context_features.mean().item():.6f}"
         )
@@ -150,7 +144,7 @@ class ACPredictorLossMixin:
             context_features = F.layer_norm(
                 context_features, (context_features.size(-1),), eps=1e-6
             )
-            log.debug(
+            logger.debug(
                 f"  [TEACHER FORCING] After LayerNorm: min={context_features.min().item():.6f}, "
                 f"max={context_features.max().item():.6f}, mean={context_features.mean().item():.6f}"
             )
@@ -159,17 +153,17 @@ class ACPredictorLossMixin:
         context_actions = actions[:, :T, :]
         context_states = states[:, :T, :]
         context_extrinsics = extrinsics[:, :T, :] if extrinsics is not None else None
-        log.debug(
+        logger.debug(
             f"  [TEACHER FORCING] Actions shape: {context_actions.shape}, "
             f"States shape: {context_states.shape}"
         )
 
         # Single forward pass - predicts all T frames
-        log.debug("  [TEACHER FORCING] >>> Calling predictor forward pass >>>")
+        logger.debug("  [TEACHER FORCING] >>> Calling predictor forward pass >>>")
         z_tf = self._step_predictor(
             context_features, context_actions, context_states, context_extrinsics
         )
-        log.debug(
+        logger.debug(
             f"  [TEACHER FORCING] <<< Predictor output: shape={z_tf.shape}, "
             f"min={z_tf.min().item():.6f}, max={z_tf.max().item():.6f}, "
             f"mean={z_tf.mean().item():.6f}"
@@ -178,15 +172,15 @@ class ACPredictorLossMixin:
         # Target: frames 1 to T (shifted by one from context)
         # Shape: [B, T*N, D]
         target = features[:, 1 : T + 1, :, :].reshape(B, T * N, D)
-        log.debug(f"  [TEACHER FORCING] Target features: shape={target.shape}")
+        logger.debug(f"  [TEACHER FORCING] Target features: shape={target.shape}")
         if self.normalize_reps:
             target = F.layer_norm(target, (target.size(-1),), eps=1e-6)
-            log.debug(
+            logger.debug(
                 f"  [TEACHER FORCING] Target after LayerNorm: "
                 f"min={target.min().item():.6f}, max={target.max().item():.6f}"
             )
 
-        log.debug("  [TEACHER FORCING] Computing loss between prediction and target...")
+        logger.debug("  [TEACHER FORCING] Computing loss between prediction and target...")
         return self._compute_loss(z_tf, target)
 
     def _compute_rollout_loss(
@@ -215,15 +209,11 @@ class ACPredictorLossMixin:
         Returns:
             Scalar loss tensor
         """
-        import logging
-
-        log = logging.getLogger(__name__)
-
         B, T_plus_1, N, D = features.shape
         C = self.context_frames  # Number of ground-truth context frames
         T_pred = min(T_plus_1 - C, self.T_rollout)  # Number of steps to predict
-        log.debug(f"  [ROLLOUT] Input: B={B}, T+1={T_plus_1}, N={N}, D={D}")
-        log.debug(
+        logger.debug(f"  [ROLLOUT] Input: B={B}, T+1={T_plus_1}, N={N}, D={D}")
+        logger.debug(
             f"  [ROLLOUT] Context frames C={C}, Prediction steps T_pred={T_pred}"
         )
 
@@ -233,17 +223,17 @@ class ACPredictorLossMixin:
             h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(
                 B, T_plus_1, N, D
             )
-            log.debug("  [ROLLOUT] Features normalized")
+            logger.debug("  [ROLLOUT] Features normalized")
 
         # Step 1: Initialize with C ground-truth context frames
         # z_ar contains frames 0, 1, ..., C-1
         z_ar = h[:, :C, :, :].reshape(B, C * N, D)  # [B, C*N, D]
-        log.debug(f"  [ROLLOUT] Initial context z_ar shape: {z_ar.shape}")
+        logger.debug(f"  [ROLLOUT] Initial context z_ar shape: {z_ar.shape}")
 
         # Step 2: Autoregressive rollout for T_pred steps
         # First prediction is frame C, using actions/states 0 to C-1
         for step in range(T_pred):
-            log.debug(f"  [ROLLOUT] >>> Autoregressive step {step+1}/{T_pred} >>>")
+            logger.debug(f"  [ROLLOUT] >>> Autoregressive step {step+1}/{T_pred} >>>")
             # Current prediction target is frame (C + step)
             # Use actions/states from 0 to (C + step - 1)
             num_action_steps = C + step
@@ -252,37 +242,37 @@ class ACPredictorLossMixin:
             ar_extrinsics = (
                 extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
             )
-            log.debug(
+            logger.debug(
                 f"  [ROLLOUT] Step {step+1}: Using {num_action_steps} action steps, "
                 f"z_ar shape: {z_ar.shape}"
             )
 
             # Predict next frame using full context
             z_nxt = self._step_predictor(z_ar, ar_actions, ar_states, ar_extrinsics)
-            log.debug(
+            logger.debug(
                 f"  [ROLLOUT] Step {step+1}: Predictor output shape: {z_nxt.shape}"
             )
             # Extract only the last frame prediction
             z_nxt = z_nxt[:, -N:, :]  # [B, N, D]
-            log.debug(
+            logger.debug(
                 f"  [ROLLOUT] Step {step+1}: Extracted last frame: shape={z_nxt.shape}, "
                 f"mean={z_nxt.mean().item():.6f}"
             )
 
             # Append to autoregressive context
             z_ar = torch.cat([z_ar, z_nxt], dim=1)  # [B, (C+step+1)*N, D]
-            log.debug(f"  [ROLLOUT] Step {step+1}: Updated z_ar shape: {z_ar.shape}")
+            logger.debug(f"  [ROLLOUT] Step {step+1}: Updated z_ar shape: {z_ar.shape}")
 
         # Step 3: Compare autoregressive predictions with targets
         # z_ar[:, C*N:] contains predictions for frames C, C+1, ..., C+T_pred-1
         # Target: h[:, C:C+T_pred] contains ground-truth for same frames
         z_ar_pred = z_ar[:, C * N :]  # [B, T_pred*N, D]
         target = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)  # [B, T_pred*N, D]
-        log.debug(
+        logger.debug(
             f"  [ROLLOUT] Final prediction shape: {z_ar_pred.shape}, "
             f"target shape: {target.shape}"
         )
-        log.debug("  [ROLLOUT] Computing rollout loss...")
+        logger.debug("  [ROLLOUT] Computing rollout loss...")
 
         return self._compute_loss(z_ar_pred, target)
 
@@ -382,19 +372,15 @@ class ACPredictorLossMixin:
         Returns:
             Combined loss tensor
         """
-        import logging
-
-        log = logging.getLogger(__name__)
-
         features = batch["features"]
         actions = batch["actions"]
         states = batch["states"]
         extrinsics = batch.get("extrinsics", None)
 
-        log.debug(f"\n{'='*60}")
-        log.debug(f"[SHARED STEP] Stage: {stage}")
-        log.debug(f"[SHARED STEP] Input features shape: {features.shape}")
-        log.debug(
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"[SHARED STEP] Stage: {stage}")
+        logger.debug(f"[SHARED STEP] Input features shape: {features.shape}")
+        logger.debug(
             f"[SHARED STEP] Actions shape: {actions.shape}, States shape: {states.shape}"
         )
 
@@ -403,32 +389,32 @@ class ACPredictorLossMixin:
             B, total_tokens, D = features.shape
             T_plus_1 = total_tokens // self.patches_per_frame
             features = features.reshape(B, T_plus_1, self.patches_per_frame, D)
-            log.debug(f"[SHARED STEP] Reshaped features to: {features.shape}")
+            logger.debug(f"[SHARED STEP] Reshaped features to: {features.shape}")
 
-        log.debug("\n--- COMPUTING TEACHER FORCING LOSS ---")
+        logger.debug("\n--- COMPUTING TEACHER FORCING LOSS ---")
         # Compute losses
         loss_teacher = self._compute_teacher_forcing_loss(
             features, actions, states, extrinsics
         )
-        log.debug(f"[SHARED STEP] Teacher forcing loss: {loss_teacher.item():.8f}")
+        logger.debug(f"[SHARED STEP] Teacher forcing loss: {loss_teacher.item():.8f}")
 
-        log.debug("\n--- COMPUTING ROLLOUT LOSS ---")
+        logger.debug("\n--- COMPUTING ROLLOUT LOSS ---")
         loss_rollout = self._compute_rollout_loss(
             features, actions, states, extrinsics
         )
-        log.debug(f"[SHARED STEP] Rollout loss: {loss_rollout.item():.8f}")
+        logger.debug(f"[SHARED STEP] Rollout loss: {loss_rollout.item():.8f}")
 
         # Combined loss
         loss = (
             self.loss_weight_teacher * loss_teacher
             + self.loss_weight_rollout * loss_rollout
         )
-        log.debug("\n--- COMBINED LOSS ---")
-        log.debug(
+        logger.debug("\n--- COMBINED LOSS ---")
+        logger.debug(
             f"[SHARED STEP] weight_teacher={self.loss_weight_teacher}, "
             f"weight_rollout={self.loss_weight_rollout}"
         )
-        log.debug(
+        logger.debug(
             f"[SHARED STEP] Combined loss = {self.loss_weight_teacher} * "
             f"{loss_teacher.item():.8f} + {self.loss_weight_rollout} * "
             f"{loss_rollout.item():.8f} = {loss.item():.8f}"

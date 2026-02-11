@@ -5,10 +5,10 @@ root = pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=Tr
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from pathlib import Path
-from typing import List, Optional
 
 import hydra
 import lightning as L
@@ -21,8 +21,23 @@ from src.utils import instantiators
 from src.utils.device_utils import log_device_info
 
 
+class CheckpointNotFoundError(FileNotFoundError):
+    """Raised when a checkpoint file cannot be found at the specified path."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(
+            f"Checkpoint not found: {path}\n"
+            f"Please provide a valid checkpoint path via: ckpt_path=/path/to/checkpoint.ckpt"
+        )
+
+
 def print_test_config(cfg: DictConfig) -> None:
-    """Print test configuration summary."""
+    """Print test configuration summary.
+
+    Args:
+        cfg: Hydra configuration dictionary.
+    """
     print("\n" + "=" * 70)
     print("                    TEST CONFIGURATION")
     print("=" * 70)
@@ -30,7 +45,9 @@ def print_test_config(cfg: DictConfig) -> None:
     print(f"   {cfg.get('ckpt_path', 'None (random weights)')}")
 
     print(f"\n📊 DATA:")
-    print(f"   Data dir:    {cfg.data.get('data_dir', cfg.paths.get('data_dir', 'default'))}")
+    print(
+        f"   Data dir:    {cfg.data.get('data_dir', cfg.paths.get('data_dir', 'default'))}"
+    )
     print(f"   Clip range:  {cfg.data.get('clip_start', 0)} - {cfg.data.get('clip_end', 'end')}")
     print(f"   Batch size:  {cfg.data.get('batch_size', 32)}")
 
@@ -46,11 +63,18 @@ def print_test_config(cfg: DictConfig) -> None:
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config.yaml")
-def main(cfg: DictConfig) -> Optional[float]:
+def main(cfg: DictConfig) -> float | None:
     """Evaluate a trained model on test data.
 
     This script loads a checkpoint and runs evaluation on a test dataset,
     computing rollout losses with per-timestep breakdown.
+
+    Args:
+        cfg: Hydra configuration dictionary containing model, data, and
+            training parameters.
+
+    Returns:
+        Final test loss if available, None otherwise.
 
     Usage:
         # Basic usage with default test config
@@ -81,10 +105,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     if ckpt_path:
         ckpt_path = Path(ckpt_path)
         if not ckpt_path.exists():
-            raise FileNotFoundError(
-                f"Checkpoint not found: {ckpt_path}\n"
-                f"Please provide a valid checkpoint path via: ckpt_path=/path/to/checkpoint.ckpt"
-            )
+            raise CheckpointNotFoundError(ckpt_path)
         print(f"✅ Checkpoint found: {ckpt_path}")
         print(f"   Size: {ckpt_path.stat().st_size / 1e6:.1f} MB")
     else:
@@ -106,15 +127,15 @@ def main(cfg: DictConfig) -> Optional[float]:
         print("   ✅ Weights loaded successfully")
 
     # 7. Callbacks & Loggers
-    callbacks: List[Callback] = instantiators.instantiate_callbacks(cfg.get("callbacks"))
-    logger: List[Logger] = instantiators.instantiate_loggers(cfg.get("logger"))
+    callbacks: list[Callback] = instantiators.instantiate_callbacks(cfg.get("callbacks"))
+    logger: list[Logger] = instantiators.instantiate_loggers(cfg.get("logger"))
 
     # 8. Trainer
     trainer: Trainer = hydra.utils.instantiate(
         cfg.trainer,
         callbacks=callbacks,
         logger=logger,
-        _convert_="partial"
+        _convert_="partial",
     )
 
     # 9. Run test (no ckpt_path since weights are already loaded)

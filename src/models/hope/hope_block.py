@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,19 @@ from src.models.hope.titan_memory import TitanMemory, TitanMemoryConfig
 log = logging.getLogger(__name__)
 
 
+# Constants
+DEFAULT_ETA_SCALE = 0.01  # Scaling factor for learning rate normalization
+
+
+class TitanActivation(StrEnum):
+    """Supported activation functions for Titan memory layers."""
+
+    GELU = "gelu"
+    RELU = "relu"
+    SILU = "silu"
+    TANH = "tanh"
+
+
 @dataclass
 class HOPEBlockConfig:
     """Configuration for a single HOPE block."""
@@ -51,15 +65,17 @@ class HOPEBlockConfig:
     # Titan memory settings
     titan_hidden_multiplier: int = 4
     titan_layers: int = 2
-    titan_activation: str = "gelu"
+    titan_activation: str = TitanActivation.GELU
     titan_grad_clip_inner: float = 1.0
 
     # CMS settings
-    cms_levels: list[LevelSpec] = field(default_factory=lambda: [
-        LevelSpec(name="fast", update_period=1, hidden_multiplier=4.0),
-        LevelSpec(name="medium", update_period=4, hidden_multiplier=4.0),
-        LevelSpec(name="slow", update_period=16, hidden_multiplier=4.0),
-    ])
+    cms_levels: list[LevelSpec] = field(
+        default_factory=lambda: [
+            LevelSpec(name="fast", update_period=1, hidden_multiplier=4.0),
+            LevelSpec(name="medium", update_period=4, hidden_multiplier=4.0),
+            LevelSpec(name="slow", update_period=16, hidden_multiplier=4.0),
+        ]
+    )
     cms_use_chunk_scheduling: bool = False
 
     # Chunk-wise processing (Section 8.2)
@@ -127,9 +143,9 @@ class HOPEBlock(nn.Module):
             grad_clip_inner=config.titan_grad_clip_inner,
             detach_interval=titan_detach_interval,
         )
-        self.M_k = TitanMemory(mem_cfg)      # Key generation memory
-        self.M_v = TitanMemory(mem_cfg)      # Value generation memory
-        self.M_eta = TitanMemory(mem_cfg)    # Learning rate generation memory
+        self.M_k = TitanMemory(mem_cfg)  # Key generation memory
+        self.M_v = TitanMemory(mem_cfg)  # Value generation memory
+        self.M_eta = TitanMemory(mem_cfg)  # Learning rate generation memory
         self.M_alpha = TitanMemory(mem_cfg)  # Decay factor generation memory
         self.M_memory = TitanMemory(mem_cfg)  # Main retrieval memory
 
@@ -154,7 +170,10 @@ class HOPEBlock(nn.Module):
 
         # ─── Drop path (stochastic depth) ───
         from src.models.ac_predictor.utils.modules import DropPath
-        self.drop_path = DropPath(config.drop_path) if config.drop_path > 0.0 else nn.Identity()
+
+        self.drop_path = (
+            DropPath(config.drop_path) if config.drop_path > 0.0 else nn.Identity()
+        )
 
         # Diagnostics
         self._last_surprise: Tensor | None = None
@@ -239,7 +258,9 @@ class HOPEBlock(nn.Module):
 
         # If no chunking or T is unknown, process all tokens at once
         if chunk_size <= 0 or T is None or chunk_size >= T:
-            return self._titan_forward_chunk(x, T=T, H=H, W=W, action_tokens=action_tokens)
+            return self._titan_forward_chunk(
+                x, T=T, H=H, W=W, action_tokens=action_tokens
+            )
 
         # ─── Chunk-wise processing along temporal dimension ───
         # Split into groups of `chunk_size` timesteps. Each chunk has
@@ -258,7 +279,7 @@ class HOPEBlock(nn.Module):
 
             # Process chunk with current memory state
             out_chunk = self._titan_forward_chunk(
-                x_chunk, T=chunk_T, H=H, W=W, action_tokens=action_tokens,
+                x_chunk, T=chunk_T, H=H, W=W, action_tokens=action_tokens
             )
             output_chunks.append(out_chunk)
 
@@ -290,16 +311,16 @@ class HOPEBlock(nn.Module):
         B, C, D = x.shape
 
         # Step 1: Generate adaptive projections using current memory state
-        q = self.q_proj(x)          # Static: q_t = x_t W_q  (Eq. 76)
-        k = self.M_k(x)             # Adaptive: k_t = M_{k,t-1}(x_t)  (Eq. 79)
-        v = self.M_v(x)             # Adaptive: v_t = M_{v,t-1}(x_t)  (Eq. 79)
-        eta_raw = self.M_eta(x)     # Adaptive: η_t raw  (Eq. 80)
+        q = self.q_proj(x)  # Static: q_t = x_t W_q  (Eq. 76)
+        k = self.M_k(x)  # Adaptive: k_t = M_{k,t-1}(x_t)  (Eq. 79)
+        v = self.M_v(x)  # Adaptive: v_t = M_{v,t-1}(x_t)  (Eq. 79)
+        eta_raw = self.M_eta(x)  # Adaptive: η_t raw  (Eq. 80)
         alpha_raw = self.M_alpha(x)  # Adaptive: α_t raw  (Eq. 80)
 
         # Normalize η and α to reasonable ranges — per-token, per-feature [B, C, D]
         # Paper Eq. 88: η_t, α_t ∈ R^d (full-dimensional, per-token)
         # η (learning rate): softplus to ensure positive, then scale down
-        eta = F.softplus(eta_raw) * 0.01  # [B, C, D]
+        eta = F.softplus(eta_raw) * DEFAULT_ETA_SCALE  # [B, C, D]
         # α (decay): sigmoid to [0, 1] range
         alpha = torch.sigmoid(alpha_raw)  # [B, C, D]
 
@@ -308,7 +329,7 @@ class HOPEBlock(nn.Module):
             q, k = self._apply_rope(q, k, T, H, W, action_tokens)
 
         # Step 3: Retrieve from main memory
-        output = self.M_memory(q)   # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
+        output = self.M_memory(q)  # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
 
         # Step 4-6: Compute surprise + per-memory self-targets + DGD update
         # Paper: "There is no distinction between training and test time."
@@ -375,21 +396,31 @@ class HOPEBlock(nn.Module):
             k_reshaped = k.view(B, T, action_tokens + H * W, D)
 
             # Process action tokens: only apply temporal RoPE
-            q_act = q_reshaped[:, :, :action_tokens, :].reshape(B, T * action_tokens, D)
-            k_act = k_reshaped[:, :, :action_tokens, :].reshape(B, T * action_tokens, D)
+            q_act = q_reshaped[:, :, :action_tokens, :].reshape(
+                B, T * action_tokens, D
+            )
+            k_act = k_reshaped[:, :, :action_tokens, :].reshape(
+                B, T * action_tokens, D
+            )
 
             # Reshape to multi-head for rotation
             q_act = q_act.view(B, T * action_tokens, num_heads, head_dim).transpose(1, 2)
             k_act = k_act.view(B, T * action_tokens, num_heads, head_dim).transpose(1, 2)
 
             # Temporal positions for action tokens
-            act_time_pos = torch.arange(T, device=q.device).unsqueeze(1).expand(T, action_tokens).reshape(-1).float()
+            act_time_pos = (
+                torch.arange(T, device=q.device)
+                .unsqueeze(1)
+                .expand(T, action_tokens)
+                .reshape(-1)
+                .float()
+            )
 
             # Rotate only depth dimension for action tokens
-            qd_act = rotate_queries_or_keys(q_act[..., :self.d_dim], pos=act_time_pos)
-            kd_act = rotate_queries_or_keys(k_act[..., :self.d_dim], pos=act_time_pos)
-            qr_act = q_act[..., self.d_dim:]
-            kr_act = k_act[..., self.d_dim:]
+            qd_act = rotate_queries_or_keys(q_act[..., : self.d_dim], pos=act_time_pos)
+            kd_act = rotate_queries_or_keys(k_act[..., : self.d_dim], pos=act_time_pos)
+            qr_act = q_act[..., self.d_dim :]
+            kr_act = k_act[..., self.d_dim :]
             q_act = torch.cat([qd_act, qr_act], dim=-1)
             k_act = torch.cat([kd_act, kr_act], dim=-1)
 
@@ -398,8 +429,8 @@ class HOPEBlock(nn.Module):
             k_act = k_act.transpose(1, 2).reshape(B, T, action_tokens, D)
 
             # Process frame tokens: apply full 3D RoPE
-            q_frame = q_reshaped[:, :, action_tokens:, :].reshape(B, T * H * W, D)
-            k_frame = k_reshaped[:, :, action_tokens:, :].reshape(B, T * H * W, D)
+            q_frame = q_reshaped[:, :, action_tokens :, :].reshape(B, T * H * W, D)
+            k_frame = k_reshaped[:, :, action_tokens :, :].reshape(B, T * H * W, D)
         else:
             q_frame = q
             k_frame = k
@@ -421,16 +452,16 @@ class HOPEBlock(nn.Module):
 
         # Rotate each dimension
         s = 0
-        qd = rotate_queries_or_keys(q_frame[..., s:s + self.d_dim], pos=d_pos)
-        kd = rotate_queries_or_keys(k_frame[..., s:s + self.d_dim], pos=d_pos)
+        qd = rotate_queries_or_keys(q_frame[..., s : s + self.d_dim], pos=d_pos)
+        kd = rotate_queries_or_keys(k_frame[..., s : s + self.d_dim], pos=d_pos)
         s += self.d_dim
 
-        qh = rotate_queries_or_keys(q_frame[..., s:s + self.h_dim], pos=h_pos)
-        kh = rotate_queries_or_keys(k_frame[..., s:s + self.h_dim], pos=h_pos)
+        qh = rotate_queries_or_keys(q_frame[..., s : s + self.h_dim], pos=h_pos)
+        kh = rotate_queries_or_keys(k_frame[..., s : s + self.h_dim], pos=h_pos)
         s += self.h_dim
 
-        qw = rotate_queries_or_keys(q_frame[..., s:s + self.w_dim], pos=w_pos)
-        kw = rotate_queries_or_keys(k_frame[..., s:s + self.w_dim], pos=w_pos)
+        qw = rotate_queries_or_keys(q_frame[..., s : s + self.w_dim], pos=w_pos)
+        kw = rotate_queries_or_keys(k_frame[..., s : s + self.w_dim], pos=w_pos)
         s += self.w_dim
 
         # Combine rotated and unrotated dimensions

@@ -4,12 +4,26 @@ Provides TTA capabilities that can be mixed into LightningModule subclasses.
 Implements per-clip TTA with LayerNorm-only adaptation.
 """
 
-from typing import Any
+import logging
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+class MPSFallbackResult(NamedTuple):
+    """Result of MPS device fallback check for TTA."""
+
+    use_fallback: bool
+    original_device: torch.device | None
+    features: Tensor
+    actions: Tensor
+    states: Tensor
+    extrinsics: Tensor | None
+
+logger = logging.getLogger(__name__)
 
 
 class TTAMixin:
@@ -47,13 +61,15 @@ class TTAMixin:
     tta_adaptation_horizon: int
     tta_optimizer_type: str
     tta_optimizer_betas: tuple[float, float]
-    tta_mode: str  # "full_rollout" or "sequential"
-    tta_num_adaptation_steps: int  # Number of TTA updates per clip
+    tta_mode: str
+    tta_num_adaptation_steps: int
+    tta_adapt_layers: str
 
     # Internal state
     _tta_optimizer: torch.optim.Optimizer | None
     _tta_original_ln_state: dict[str, Tensor] | None
     _tta_clip_stats: dict[str, Any]
+    _tta_all_clip_stats: list[dict[str, Any]]
 
     def _init_tta(
         self,
@@ -66,29 +82,27 @@ class TTAMixin:
         tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
         tta_mode: str = "full_rollout",
         tta_num_adaptation_steps: int = 1,
-        tta_adapt_layers: str = "layernorm",  # Which layers to adapt
+        tta_adapt_layers: str = "layernorm",
     ) -> None:
         """Initialize TTA configuration.
 
         Call this in the __init__ of the inheriting class.
 
         Args:
-            tta_enabled: Whether TTA is enabled
-            tta_lr: Learning rate for TTA updates
-            tta_grad_clip: Maximum gradient norm for clipping
-            tta_reset_per_clip: Whether to reset model state per clip
-            tta_adaptation_horizon: Number of steps for adaptation (deprecated, use T_rollout)
-            tta_optimizer_type: Type of optimizer ("adam" or "adamw")
-            tta_optimizer_betas: Beta parameters for Adam
-            tta_mode: TTA mode - "full_rollout" (recommended) or "sequential"
-                - "full_rollout": Predict full sequence, compute loss, adapt, then evaluate
-                - "sequential": Step-by-step look-back adaptation (original TENT-style)
-            tta_num_adaptation_steps: Number of TTA update iterations per clip (default: 1)
+            tta_enabled: Whether TTA is enabled.
+            tta_lr: Learning rate for TTA updates.
+            tta_grad_clip: Maximum gradient norm for clipping.
+            tta_reset_per_clip: Whether to reset model state per clip.
+            tta_adaptation_horizon: Number of steps for adaptation (deprecated, use T_rollout).
+            tta_optimizer_type: Type of optimizer ("adam" or "adamw").
+            tta_optimizer_betas: Beta parameters for Adam.
+            tta_mode: TTA mode - "full_rollout" (recommended) or "sequential".
+            tta_num_adaptation_steps: Number of TTA update iterations per clip.
             tta_adapt_layers: Which layers to adapt during TTA. Options:
-                - "layernorm": Only LayerNorm γ and β (default, ~0.1% params)
-                - "layernorm+attn_proj": LayerNorm + attention output projections (~1-2% params)
-                - "layernorm+bias": LayerNorm + all bias terms (~0.5% params)
-                - "layernorm+mlp_out": LayerNorm + MLP output layers (~3-5% params)
+                - "layernorm": Only LayerNorm γ and β (default, ~0.1% params).
+                - "layernorm+attn_proj": LayerNorm + attention output projections (~1-2% params).
+                - "layernorm+bias": LayerNorm + all bias terms (~0.5% params).
+                - "layernorm+mlp_out": LayerNorm + MLP output layers (~3-5% params).
         """
         self.tta_enabled = tta_enabled
         self.tta_lr = tta_lr
@@ -101,93 +115,114 @@ class TTAMixin:
         self.tta_num_adaptation_steps = tta_num_adaptation_steps
         self.tta_adapt_layers = tta_adapt_layers
 
-        # Internal state (initialized in on_test_start)
         self._tta_optimizer = None
         self._tta_original_ln_state = None
         self._tta_clip_stats = {}
-        self._tta_all_clip_stats: list[dict[str, Any]] = []
+        self._tta_all_clip_stats = []
 
     def _tta_configure_params(self) -> None:
         """Configure trainable parameters for TTA based on tta_adapt_layers setting."""
         if not self.tta_enabled:
             return
 
-        # Freeze all parameters
         self.model.requires_grad_(False)
 
         num_adapted_params = 0
         adapted_layer_types = []
 
-        # Always unfreeze LayerNorm parameters
+        num_adapted_params += self._enable_layernorm_params(adapted_layer_types)
+
+        if "attn_proj" in self.tta_adapt_layers:
+            num_adapted_params += self._enable_attn_proj_params(adapted_layer_types)
+
+        if "bias" in self.tta_adapt_layers and "attn" not in self.tta_adapt_layers:
+            num_adapted_params += self._enable_bias_params(adapted_layer_types)
+
+        if "mlp_out" in self.tta_adapt_layers:
+            num_adapted_params += self._enable_mlp_out_params(adapted_layer_types)
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+
+        logger.info(
+            f"[TTA] Configured: {num_adapted_params:,} / {total_params:,} params trainable "
+            f"({100 * num_adapted_params / total_params:.2f}%) - "
+            f"Layers: {', '.join(adapted_layer_types)}"
+        )
+
+    def _enable_layernorm_params(
+        self,
+        adapted_layer_types: list[str],
+    ) -> int:
+        """Enable LayerNorm parameters for TTA."""
+        count = 0
         for module in self.model.modules():
             if isinstance(module, nn.LayerNorm):
                 for param in module.parameters():
                     param.requires_grad = True
-                    num_adapted_params += param.numel()
+                    count += param.numel()
         adapted_layer_types.append("LayerNorm")
+        return count
 
-        # Additional layers based on tta_adapt_layers setting
-        if "attn_proj" in self.tta_adapt_layers:
-            # Unfreeze attention output projections (attn.proj)
-            for name, module in self.model.named_modules():
-                if name.endswith(".attn.proj") or name.endswith(".attn") and hasattr(module, 'proj'):
-                    # Handle both direct .proj and Attention module with .proj attribute
-                    if hasattr(module, 'proj'):
-                        proj = module.proj
-                    else:
-                        proj = module
-                    if isinstance(proj, nn.Linear):
-                        for param in proj.parameters():
-                            param.requires_grad = True
-                            num_adapted_params += param.numel()
-                # Also check for direct attn.proj naming
-                if ".proj" in name and ".attn" in name and isinstance(module, nn.Linear):
+    def _enable_attn_proj_params(
+        self,
+        adapted_layer_types: list[str],
+    ) -> int:
+        """Enable attention projection parameters for TTA."""
+        count = 0
+        for name, module in self.model.named_modules():
+            proj = self._extract_attn_proj(name, module)
+            if proj is not None and isinstance(proj, nn.Linear):
+                for param in proj.parameters():
+                    if not param.requires_grad:
+                        param.requires_grad = True
+                        count += param.numel()
+        adapted_layer_types.append("Attention.proj")
+        return count
+
+    def _extract_attn_proj(self, name: str, module: nn.Module) -> nn.Module | None:
+        """Extract attention projection module from name or module."""
+        if name.endswith(".attn.proj") or (name.endswith(".attn") and hasattr(module, "proj")):
+            return module.proj if hasattr(module, "proj") else module
+        if ".proj" in name and ".attn" in name and isinstance(module, nn.Linear):
+            return module
+        return None
+
+    def _enable_bias_params(
+        self,
+        adapted_layer_types: list[str],
+    ) -> int:
+        """Enable all bias parameters for TTA."""
+        count = 0
+        for name, param in self.model.named_parameters():
+            if "bias" in name and not param.requires_grad:
+                param.requires_grad = True
+                count += param.numel()
+        adapted_layer_types.append("All biases")
+        return count
+
+    def _enable_mlp_out_params(
+        self,
+        adapted_layer_types: list[str],
+    ) -> int:
+        """Enable MLP output layer parameters for TTA."""
+        count = 0
+        for name, module in self.model.named_modules():
+            if name.endswith(".mlp.fc2") or name.endswith(".mlp.fc3"):
+                if isinstance(module, nn.Linear):
                     for param in module.parameters():
-                        if not param.requires_grad:  # Avoid double counting
+                        if not param.requires_grad:
                             param.requires_grad = True
-                            num_adapted_params += param.numel()
-            adapted_layer_types.append("Attention.proj")
-
-        if "bias" in self.tta_adapt_layers and "attn" not in self.tta_adapt_layers:
-            # Unfreeze all bias terms (excluding already unfrozen)
-            for name, param in self.model.named_parameters():
-                if "bias" in name and not param.requires_grad:
-                    param.requires_grad = True
-                    num_adapted_params += param.numel()
-            adapted_layer_types.append("All biases")
-
-        if "mlp_out" in self.tta_adapt_layers:
-            # Unfreeze MLP output layers (fc2 or fc3 for SwiGLU)
-            for name, module in self.model.named_modules():
-                if name.endswith(".mlp.fc2") or name.endswith(".mlp.fc3"):
-                    if isinstance(module, nn.Linear):
-                        for param in module.parameters():
-                            if not param.requires_grad:
-                                param.requires_grad = True
-                                num_adapted_params += param.numel()
-            adapted_layer_types.append("MLP output")
-
-        total_params = sum(p.numel() for p in self.model.parameters())
-
-        import logging
-        log = logging.getLogger(__name__)
-        log.info(
-            f"[TTA] Configured: {num_adapted_params:,} / {total_params:,} params trainable "
-            f"({100*num_adapted_params/total_params:.2f}%) - Layers: {', '.join(adapted_layer_types)}"
-        )
+                            count += param.numel()
+        adapted_layer_types.append("MLP output")
+        return count
 
     def _tta_get_ln_params(self) -> list[nn.Parameter]:
-        """Get list of all trainable TTA parameters (not just LayerNorm despite the name)."""
-        # Return ALL parameters with requires_grad=True (set by _tta_configure_params)
+        """Get list of all trainable TTA parameters."""
         return [p for p in self.model.parameters() if p.requires_grad]
 
     def _tta_save_ln_state(self) -> dict[str, Tensor]:
         """Save current state of all adapted parameters."""
-        state = {}
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                state[name] = param.data.clone()
-        return state
+        return {name: param.data.clone() for name, param in self.model.named_parameters() if param.requires_grad}
 
     def _tta_restore_ln_state(self, state: dict[str, Tensor]) -> None:
         """Restore adapted parameters from saved dict."""
@@ -199,10 +234,10 @@ class TTAMixin:
         """Set LayerNorm modules to train/eval mode.
 
         Args:
-            training: Whether to set train mode (True) or eval mode (False)
+            training: Whether to set train mode (True) or eval mode (False).
 
         Returns:
-            Dict mapping module names to their previous training state
+            Dict mapping module names to their previous training state.
         """
         prev_states = {}
         for name, module in self.model.named_modules():
@@ -215,12 +250,11 @@ class TTAMixin:
         """Restore LayerNorm modules to their previous training state.
 
         Args:
-            states: Dict mapping module names to their training state
+            states: Dict mapping module names to their training state.
         """
         for name, module in self.model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                if name in states:
-                    module.train(states[name])
+            if isinstance(module, nn.LayerNorm) and name in states:
+                module.train(states[name])
 
     def _tta_is_mps_device(self) -> bool:
         """Check if the model is on an MPS (Apple Metal) device.
@@ -229,7 +263,6 @@ class TTAMixin:
         so we need to fall back to CPU during TTA adaptation.
         """
         try:
-            # Check first parameter's device
             for param in self.model.parameters():
                 return param.device.type == "mps"
         except StopIteration:
@@ -244,46 +277,43 @@ class TTAMixin:
         saves and reloads the model state dict to create fresh non-inference tensors.
         Only LayerNorm parameters are made trainable for TTA.
         """
-        # Save current state dict
         state_dict = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-        # Exit inference mode completely by using the internal API
-        # This is necessary because nested inference_mode(False) doesn't fully work
         inference_mode_was_enabled = torch.is_inference_mode_enabled()
 
         if inference_mode_was_enabled:
-            # Temporarily disable inference mode at the C++ level
-            torch._C._set_grad_enabled(True)
+            with torch._C._DisableFuncTorch():
+                torch._C._set_grad_enabled(True)
 
+        self.model.load_state_dict(state_dict, strict=True)
+        self._clone_non_buffer_tensors()
+        self._set_layernorm_trainable()
+
+    def _clone_non_buffer_tensors(self) -> None:
+        """Clone non-parameter, non-buffer tensors to escape inference mode."""
+        for name, module in self.model.named_modules():
+            for attr_name in dir(module):
+                if attr_name.startswith("_"):
+                    continue
+                self._clone_tensor_if_needed(module, attr_name)
+
+    def _clone_tensor_if_needed(self, module: nn.Module, attr_name: str) -> None:
+        """Clone a tensor attribute if it's not a buffer or parameter."""
         try:
-            # Reload state dict - this creates fresh non-inference tensors
-            self.model.load_state_dict(state_dict, strict=True)
+            attr = getattr(module, attr_name)
+            if isinstance(attr, torch.Tensor) and not isinstance(attr, nn.Parameter):
+                if attr_name not in module._buffers:
+                    setattr(module, attr_name, attr.clone())
+        except (AttributeError, RuntimeError):
+            pass
 
-            # Clone any non-parameter/buffer tensors (like attn_mask if it's a regular attribute)
-            for name, module in self.model.named_modules():
-                for attr_name in list(dir(module)):
-                    if attr_name.startswith('_'):
-                        continue
-                    try:
-                        attr = getattr(module, attr_name)
-                        if isinstance(attr, torch.Tensor) and not isinstance(attr, nn.Parameter):
-                            # Check if it's not a buffer (buffers are handled by load_state_dict)
-                            if attr_name not in module._buffers:
-                                setattr(module, attr_name, attr.clone())
-                    except (AttributeError, RuntimeError):
-                        pass
-
-            # Now set requires_grad appropriately
-            self.model.requires_grad_(False)
-            for module in self.model.modules():
-                if isinstance(module, nn.LayerNorm):
-                    for param in module.parameters():
-                        param.requires_grad = True
-        finally:
-            if inference_mode_was_enabled:
-                # Re-enable inference mode if it was enabled before
-                # (Note: we stay in grad-enabled mode for TTA)
-                pass
+    def _set_layernorm_trainable(self) -> None:
+        """Set LayerNorm parameters as trainable."""
+        self.model.requires_grad_(False)
+        for module in self.model.modules():
+            if isinstance(module, nn.LayerNorm):
+                for param in module.parameters():
+                    param.requires_grad = True
 
     def _tta_create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer for TTA."""
@@ -295,26 +325,21 @@ class TTAMixin:
                 lr=self.tta_lr,
                 betas=self.tta_optimizer_betas,
             )
-        else:
-            return torch.optim.Adam(
-                ln_params,
-                lr=self.tta_lr,
-                betas=self.tta_optimizer_betas,
-            )
+        return torch.optim.Adam(
+            ln_params,
+            lr=self.tta_lr,
+            betas=self.tta_optimizer_betas,
+        )
 
     def _tta_reset_for_clip(self) -> None:
         """Reset TTA state for a new clip."""
         if not self.tta_enabled:
             return
 
-        # Restore original LayerNorm parameters
         if self._tta_original_ln_state is not None:
             self._tta_restore_ln_state(self._tta_original_ln_state)
 
-        # Reset optimizer
         self._tta_optimizer = self._tta_create_optimizer()
-
-        # Reset clip statistics
         self._tta_clip_stats = {
             "adaptation_losses": [],
             "num_adaptations": 0,
@@ -324,56 +349,62 @@ class TTAMixin:
         """Perform single TTA adaptation step.
 
         Args:
-            pred: Predicted features (with gradients)
-            target: Ground-truth features (will be detached)
+            pred: Predicted features (with gradients).
+            target: Ground-truth features (will be detached).
 
         Returns:
-            Loss value for logging
+            Loss value for logging.
         """
         if self._tta_optimizer is None:
-            raise RuntimeError("TTA optimizer not initialized. Call _tta_reset_for_clip first.")
+            msg = "TTA optimizer not initialized. Call _tta_reset_for_clip first."
+            raise RuntimeError(msg)
 
-        # Save pre-update parameters for delta computation
         ln_params = self._tta_get_ln_params()
         pre_update_params = [p.data.clone() for p in ln_params]
 
-        # L1 loss with detached target
         loss = F.l1_loss(pred, target.detach())
 
-        # Backward pass
         self._tta_optimizer.zero_grad()
         loss.backward()
 
-        # Compute gradient norm BEFORE clipping (diagnostic)
         grad_norm_before = torch.nn.utils.clip_grad_norm_(
             ln_params,
-            max_norm=float('inf'),  # Just compute norm, don't clip
+            max_norm=float("inf"),
         ).item()
 
-        # Actually clip gradients
         grad_norm_after = torch.nn.utils.clip_grad_norm_(
             ln_params,
             max_norm=self.tta_grad_clip,
         ).item()
 
-        # Optimizer step
         self._tta_optimizer.step()
 
-        # Compute parameter delta norm (how much parameters changed)
+        param_delta_norm = self._compute_param_delta_norm(pre_update_params, ln_params)
+
+        self._update_adaptation_stats(loss.item(), grad_norm_before, grad_norm_after, param_delta_norm)
+
+        return loss.item()
+
+    def _compute_param_delta_norm(self, pre_update_params: list[Tensor], ln_params: list[nn.Parameter]) -> float:
+        """Compute the L2 norm of parameter changes."""
         param_delta_norm = 0.0
         for pre_param, param in zip(pre_update_params, ln_params):
             param_delta_norm += (param.data - pre_param).norm().item() ** 2
-        param_delta_norm = param_delta_norm ** 0.5
+        return param_delta_norm**0.5
 
-        # Track metrics
-        loss_val = loss.item()
+    def _update_adaptation_stats(
+        self,
+        loss_val: float,
+        grad_norm_before: float,
+        grad_norm_after: float,
+        param_delta_norm: float,
+    ) -> None:
+        """Update adaptation statistics."""
         self._tta_clip_stats["adaptation_losses"].append(loss_val)
         self._tta_clip_stats["num_adaptations"] += 1
         self._tta_clip_stats["grad_norm_before_clip"] = grad_norm_before
         self._tta_clip_stats["grad_norm_after_clip"] = grad_norm_after
         self._tta_clip_stats["param_delta_norm"] = param_delta_norm
-
-        return loss_val
 
     def _tta_full_rollout(
         self,
@@ -386,63 +417,57 @@ class TTAMixin:
         """Perform full autoregressive rollout.
 
         Args:
-            features: [B, T+1, N, D] - Full sequence features
-            actions: [B, T, action_dim] - Actions
-            states: [B, T, action_dim] - States
-            extrinsics: [B, T, action_dim-1] - Optional
-            detach: Whether to detach predictions (for evaluation)
+            features: [B, T+1, N, D] - Full sequence features.
+            actions: [B, T, action_dim] - Actions.
+            states: [B, T, action_dim] - States.
+            extrinsics: [B, T, action_dim-1] - Optional extrinsics.
+            detach: Whether to detach predictions (for evaluation).
 
         Returns:
-            Tuple of:
-                - predictions: [B, T_pred*N, D] - Autoregressive predictions
-                - targets: [B, T_pred*N, D] - Ground-truth targets
+            Tuple of (predictions, targets) where:
+                - predictions: [B, T_pred*N, D] - Autoregressive predictions.
+                - targets: [B, T_pred*N, D] - Ground-truth targets.
         """
         B, T_plus_1, N, D = features.shape
         C = self.context_frames
         T_pred = min(T_plus_1 - C, self.T_rollout)
 
-        # Normalize features if enabled
-        h = features
-        if self.normalize_reps:
-            h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(
-                B, T_plus_1, N, D
-            )
+        h = self._normalize_features(features, B, T_plus_1, N, D)
 
-        # Initialize context with ground-truth frames
         z_ar = h[:, :C, :, :].reshape(B, C * N, D)
+        predictions_list = []
 
-        # Store predictions
-        predictions_list: list[Tensor] = []
-
-        # Autoregressive rollout
         for step in range(T_pred):
             num_action_steps = C + step
-
             step_actions = actions[:, :num_action_steps, :]
             step_states = states[:, :num_action_steps, :]
-            step_extrinsics = (
-                extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
-            )
+            step_extrinsics = extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
 
-            # Forward pass
-            z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                z_ar, step_actions, step_states, step_extrinsics
-            )
-            z_pred = z_pred_full[:, -N:, :]  # Last frame only
-
+            z_pred_full = self._step_predictor(z_ar, step_actions, step_states, step_extrinsics)  # type: ignore[attr-defined]
+            z_pred = z_pred_full[:, -N:, :]
             predictions_list.append(z_pred)
-
-            # Update context (autoregressive) - detach to prevent graph explosion
             z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
 
-        # Stack predictions
-        predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
-        targets = h[:, C:C + T_pred, :, :].reshape(B, T_pred * N, D)
+        predictions = torch.cat(predictions_list, dim=1)
+        targets = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)
 
         if detach:
             predictions = predictions.detach()
 
         return predictions, targets
+
+    def _normalize_features(
+        self,
+        features: Tensor,
+        B: int,
+        T_plus_1: int,
+        N: int,
+        D: int,
+    ) -> Tensor:
+        """Normalize features if enabled."""
+        if self.normalize_reps:
+            return F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(B, T_plus_1, N, D)
+        return features
 
     def _tta_process_clip_full_rollout(
         self,
@@ -455,40 +480,33 @@ class TTAMixin:
         """Process a clip with full-rollout TTA adaptation.
 
         This is the recommended TTA approach:
-        1. Perform full autoregressive rollout (z₁→z₇)
-        2. Compute rollout loss against ground-truth
-        3. Update LayerNorm parameters
-        4. (Optionally repeat for multiple adaptation steps)
-        5. Evaluate with adapted model
+        1. Perform full autoregressive rollout (z₁→z₇).
+        2. Compute rollout loss against ground-truth.
+        3. Update LayerNorm parameters.
+        4. (Optionally repeat for multiple adaptation steps).
+        5. Evaluate with adapted model.
 
         Args:
-            features: [B, T+1, N, D] - Full sequence features
-            actions: [B, T, action_dim] - Actions
-            states: [B, T, action_dim] - States
-            extrinsics: [B, T, action_dim-1] - Optional
-            num_adaptation_steps: Number of TTA update iterations (default: 1)
+            features: [B, T+1, N, D] - Full sequence features.
+            actions: [B, T, action_dim] - Actions.
+            states: [B, T, action_dim] - States.
+            extrinsics: [B, T, action_dim-1] - Optional extrinsics.
+            num_adaptation_steps: Number of TTA update iterations.
 
         Returns:
-            Tuple of:
-                - final_predictions: [B, T_pred*N, D] - Predictions after TTA
-                - targets: [B, T_pred*N, D] - Ground-truth targets
-                - stats: Dict with adaptation statistics
+            Tuple of (final_predictions, targets, stats).
         """
-        # Reset for new clip
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
 
-        # Always initialize clip stats structure (even if not resetting parameters)
         self._tta_clip_stats = {
             "adaptation_losses": [],
             "num_adaptations": 0,
         }
 
-        # Store original device for MPS workaround
         original_device = features.device
-        use_cpu_for_tta = str(original_device).startswith('mps')
+        use_cpu_for_tta = str(original_device).startswith("mps")
 
-        # Store pre-adaptation loss for comparison (outside inference_mode(False))
         with torch.no_grad():
             pre_adapt_pred, targets = self._tta_full_rollout(
                 features, actions, states, extrinsics, detach=True
@@ -497,53 +515,40 @@ class TTAMixin:
 
         self._tta_clip_stats["pre_adapt_loss"] = pre_adapt_loss
 
-        # TTA adaptation loop
-        # NOTE: PyTorch Lightning uses inference_mode during testing, which creates
-        # "inference tensors" that cannot be used for backward passes.
-        # We MUST use torch.inference_mode(False) to escape this and enable gradients.
-        # Everything that needs gradients must happen INSIDE this context.
         with torch.inference_mode(False):
-            # Determine target device for TTA (CPU if on MPS to avoid NaN gradients)
-            target_device = 'cpu' if use_cpu_for_tta else original_device
+            target_device = "cpu" if use_cpu_for_tta else original_device
 
-            # Clone inputs INSIDE inference_mode(False) context to create non-inference tensors
             features_for_tta = features.detach().clone().to(target_device)
             actions_for_tta = actions.detach().clone().to(target_device)
             states_for_tta = states.detach().clone().to(target_device)
-            extrinsics_for_tta = extrinsics.detach().clone().to(target_device) if extrinsics is not None else None
+            extrinsics_for_tta = (
+                extrinsics.detach().clone().to(target_device) if extrinsics is not None else None
+            )
 
-            # Move model to CPU if using MPS workaround
             if use_cpu_for_tta:
-                import logging
-                log = logging.getLogger(__name__)
-                log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
-                self.model.to('cpu')
-                # Recreate optimizer with CPU parameters
+                logger.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
+                self.model.to("cpu")
                 self._tta_optimizer = self._tta_create_optimizer()
 
             try:
-                for adapt_step in range(num_adaptation_steps):
-                    # Set LayerNorms to train mode for adaptation
+                for _ in range(num_adaptation_steps):
                     prev_ln_states = self._tta_set_ln_train_mode(True)
                     try:
-                        # Forward pass (no detach - we need gradients)
                         predictions, targets_tta = self._tta_full_rollout(
-                            features_for_tta, actions_for_tta, states_for_tta, extrinsics_for_tta, detach=False
+                            features_for_tta,
+                            actions_for_tta,
+                            states_for_tta,
+                            extrinsics_for_tta,
+                            detach=False,
                         )
-
-                        # Perform TTA update using full rollout loss
                         self._tta_adapt(predictions, targets_tta)
                     finally:
-                        # Restore LayerNorm training states
                         self._tta_restore_ln_train_mode(prev_ln_states)
             finally:
-                # Move model back to original device if we used CPU workaround
                 if use_cpu_for_tta:
                     self.model.to(original_device)
-                    # Recreate optimizer with original device parameters
                     self._tta_optimizer = self._tta_create_optimizer()
 
-        # Final evaluation with adapted model (outside inference_mode(False), no gradients needed)
         with torch.no_grad():
             final_predictions, targets = self._tta_full_rollout(
                 features, actions, states, extrinsics, detach=True
@@ -553,7 +558,6 @@ class TTAMixin:
         self._tta_clip_stats["post_adapt_loss"] = post_adapt_loss
         self._tta_clip_stats["improvement"] = pre_adapt_loss - post_adapt_loss
 
-        # Compute statistics
         stats = self._tta_get_clip_stats()
         self._tta_all_clip_stats.append(stats)
 
@@ -569,139 +573,172 @@ class TTAMixin:
         """Process a clip with sequential TTA adaptation.
 
         Implements the look-back adaptation scheme where we:
-        1. Predict next frame
-        2. Wait for ground-truth
-        3. Adapt
-        4. Predict next frame with updated model
+        1. Predict next frame.
+        2. Wait for ground-truth.
+        3. Adapt.
+        4. Predict next frame with updated model.
 
         Args:
-            features: [B, T+1, N, D] - Full sequence features
-            actions: [B, T, action_dim] - Actions
-            states: [B, T, action_dim] - States
-            extrinsics: [B, T, action_dim-1] - Optional
+            features: [B, T+1, N, D] - Full sequence features.
+            actions: [B, T, action_dim] - Actions.
+            states: [B, T, action_dim] - States.
+            extrinsics: [B, T, action_dim-1] - Optional extrinsics.
 
         Returns:
-            Tuple of:
-                - adapted_predictions: [B, T_pred*N, D] - Predictions with TTA
-                - targets: [B, T_pred*N, D] - Ground-truth targets
-                - stats: Dict with adaptation statistics
+            Tuple of (adapted_predictions, targets, stats).
         """
         B, T_plus_1, N, D = features.shape
         C = self.context_frames
         T_pred = min(T_plus_1 - C, self.T_rollout)
 
-        # Reset for new clip
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
 
-        # Clone ALL model parameters and buffers to escape inference mode
-        # This is critical: model parameters loaded in inference_mode cannot be used for backward
         self._tta_make_model_params_non_inference()
-
-        # Recreate optimizer with the new (non-inference) parameters
         self._tta_optimizer = self._tta_create_optimizer()
 
-        # Escape inference mode and create clean copies of inputs for TTA
-        # Clone inputs - must be done after _tta_make_model_params_non_inference
-        # which enables grad mode internally
-        features_for_tta = features.detach().clone().requires_grad_(False)
-        actions_for_tta = actions.detach().clone().requires_grad_(False)
-        states_for_tta = states.detach().clone().requires_grad_(False)
-        extrinsics_for_tta = extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None
+        (
+            features_for_tta,
+            actions_for_tta,
+            states_for_tta,
+            extrinsics_for_tta,
+        ) = self._prepare_inputs_for_tta(features, actions, states, extrinsics)
 
-        # MPS fallback: Move to CPU if on MPS to avoid NaN gradients from LayerNorm backward bug
-        use_mps_fallback = self._tta_is_mps_device()
-        original_device = None
-        if use_mps_fallback:
-            import logging
-            log = logging.getLogger(__name__)
-            log.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
-            original_device = next(self.model.parameters()).device
-            self.model.to("cpu")
-            features_for_tta = features_for_tta.to("cpu")
-            actions_for_tta = actions_for_tta.to("cpu")
-            states_for_tta = states_for_tta.to("cpu")
-            if extrinsics_for_tta is not None:
-                extrinsics_for_tta = extrinsics_for_tta.to("cpu")
-            # Recreate optimizer with CPU parameters
-            self._tta_optimizer = self._tta_create_optimizer()
+        mps_result = self._handle_mps_fallback(
+            features_for_tta,
+            actions_for_tta,
+            states_for_tta,
+            extrinsics_for_tta,
+        )
 
         try:
-            # Normalize features if enabled
-            h = features_for_tta
-            if self.normalize_reps:
-                h = F.layer_norm(features_for_tta.reshape(B, -1, D), (D,), eps=1e-6).reshape(
-                    B, T_plus_1, N, D
-                )
-
-            # Initialize context
-            z_ar = h[:, :C, :, :].reshape(B, C * N, D)
-
-            # Store predictions
-            predictions_list: list[Tensor] = []
-            prev_pred: Tensor | None = None
-
-            # Sequential processing with TTA
-            for step in range(T_pred):
-                target_idx = C + step
-                num_action_steps = C + step
-
-                step_actions = actions_for_tta[:, :num_action_steps, :]
-                step_states = states_for_tta[:, :num_action_steps, :]
-                step_extrinsics = (
-                    extrinsics_for_tta[:, :num_action_steps, :] if extrinsics_for_tta is not None else None
-                )
-
-                # Look-back adaptation (skip first step - no previous prediction)
-                # Grad mode was enabled in _tta_make_model_params_non_inference
-                if prev_pred is not None and step > 0:
-                    prev_target = h[:, target_idx - 1, :, :]  # Ground-truth for prev prediction
-                    self._tta_adapt(prev_pred, prev_target)
-
-                # Forward pass with gradients enabled for next adaptation
-                # Set LayerNorms to train mode for gradient flow
-                prev_ln_states = self._tta_set_ln_train_mode(True)
-                try:
-                    z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
-                        z_ar, step_actions, step_states, step_extrinsics
-                    )
-                    z_pred = z_pred_full[:, -N:, :]  # Last frame only
-                finally:
-                    self._tta_restore_ln_train_mode(prev_ln_states)
-
-                # Store for next adaptation
-                prev_pred = z_pred
-                predictions_list.append(z_pred.detach())
-
-                # Update context (autoregressive)
-                z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
-
-            # Final adaptation with last ground-truth
-            if prev_pred is not None and T_pred > 0:
-                final_target = h[:, C + T_pred - 1, :, :]
-                self._tta_adapt(prev_pred, final_target)
-
-            # Stack predictions and targets
-            predictions = torch.cat(predictions_list, dim=1)  # [B, T_pred*N, D]
-            targets = h[:, C:C + T_pred, :, :].reshape(B, T_pred * N, D)
+            predictions, targets = self._run_sequential_adaptation(
+                mps_result.features,
+                mps_result.actions,
+                mps_result.states,
+                mps_result.extrinsics,
+                B,
+                T_plus_1,
+                N,
+                D,
+                C,
+                T_pred,
+            )
         finally:
-            # Move back to MPS if we used the fallback
-            if use_mps_fallback and original_device is not None:
-                self.model.to(original_device)
-                # Recreate optimizer with MPS parameters
+            if mps_result.use_fallback and mps_result.original_device is not None:
+                self.model.to(mps_result.original_device)
                 self._tta_optimizer = self._tta_create_optimizer()
 
-        # Compute statistics
         stats = self._tta_get_clip_stats()
         self._tta_all_clip_stats.append(stats)
 
         return predictions, targets, stats
 
+    def _prepare_inputs_for_tta(
+        self,
+        features: Tensor,
+        actions: Tensor,
+        states: Tensor,
+        extrinsics: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Clone inputs for TTA to escape inference mode."""
+        return (
+            features.detach().clone().requires_grad_(False),
+            actions.detach().clone().requires_grad_(False),
+            states.detach().clone().requires_grad_(False),
+            extrinsics.detach().clone().requires_grad_(False) if extrinsics is not None else None,
+        )
+
+    def _handle_mps_fallback(
+        self,
+        features_for_tta: Tensor,
+        actions_for_tta: Tensor,
+        states_for_tta: Tensor,
+        extrinsics_for_tta: Tensor | None,
+    ) -> MPSFallbackResult:
+        """Handle MPS device fallback to CPU for TTA.
+
+        Returns:
+            MPSFallbackResult with fallback flag, original device, and tensors.
+        """
+        if not self._tta_is_mps_device():
+            return MPSFallbackResult(
+                use_fallback=False,
+                original_device=None,
+                features=features_for_tta,
+                actions=actions_for_tta,
+                states=states_for_tta,
+                extrinsics=extrinsics_for_tta,
+            )
+
+        logger.debug("[TTA] MPS detected - moving to CPU for adaptation to avoid NaN gradients")
+        original_device = next(self.model.parameters()).device
+        self.model.to("cpu")
+        self._tta_optimizer = self._tta_create_optimizer()
+
+        return MPSFallbackResult(
+            use_fallback=True,
+            original_device=original_device,
+            features=features_for_tta.to("cpu"),
+            actions=actions_for_tta.to("cpu"),
+            states=states_for_tta.to("cpu"),
+            extrinsics=extrinsics_for_tta.to("cpu") if extrinsics_for_tta is not None else None,
+        )
+
+    def _run_sequential_adaptation(
+        self,
+        features: Tensor,
+        actions: Tensor,
+        states: Tensor,
+        extrinsics: Tensor | None,
+        B: int,
+        T_plus_1: int,
+        N: int,
+        D: int,
+        C: int,
+        T_pred: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Run sequential adaptation loop."""
+        h = self._normalize_features(features, B, T_plus_1, N, D)
+        z_ar = h[:, :C, :, :].reshape(B, C * N, D)
+        predictions_list = []
+        prev_pred = None
+
+        for step in range(T_pred):
+            target_idx = C + step
+            num_action_steps = C + step
+
+            step_actions = actions[:, :num_action_steps, :]
+            step_states = states[:, :num_action_steps, :]
+            step_extrinsics = extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
+
+            if prev_pred is not None and step > 0:
+                prev_target = h[:, target_idx - 1, :, :]
+                self._tta_adapt(prev_pred, prev_target)
+
+            prev_ln_states = self._tta_set_ln_train_mode(True)
+            try:
+                z_pred_full = self._step_predictor(z_ar, step_actions, step_states, step_extrinsics)  # type: ignore[attr-defined]
+                z_pred = z_pred_full[:, -N:, :]
+            finally:
+                self._tta_restore_ln_train_mode(prev_ln_states)
+
+            prev_pred = z_pred
+            predictions_list.append(z_pred.detach())
+            z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
+
+        if prev_pred is not None and T_pred > 0:
+            final_target = h[:, C + T_pred - 1, :, :]
+            self._tta_adapt(prev_pred, final_target)
+
+        predictions = torch.cat(predictions_list, dim=1)
+        targets = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)
+
+        return predictions, targets
+
     def _tta_get_clip_stats(self) -> dict[str, Any]:
         """Get statistics for current clip."""
         losses = self._tta_clip_stats.get("adaptation_losses", [])
-
-        # For full-rollout mode, use pre/post adapt losses if available
         pre_adapt = self._tta_clip_stats.get("pre_adapt_loss", 0.0)
         post_adapt = self._tta_clip_stats.get("post_adapt_loss", 0.0)
         improvement = self._tta_clip_stats.get("improvement", 0.0)
@@ -724,7 +761,11 @@ class TTAMixin:
             "last_loss": losses[-1] if losses else post_adapt,
             "pre_adapt_loss": pre_adapt,
             "post_adapt_loss": post_adapt,
-            "improvement": improvement if improvement != 0.0 else (losses[0] - losses[-1] if len(losses) > 1 else 0.0),
+            "improvement": (
+                improvement
+                if improvement != 0.0
+                else (losses[0] - losses[-1] if len(losses) > 1 else 0.0)
+            ),
         }
 
     def _tta_get_epoch_stats(self) -> dict[str, Any]:
@@ -732,19 +773,19 @@ class TTAMixin:
         if not self._tta_all_clip_stats:
             return {}
 
+        total_clips = len(self._tta_all_clip_stats)
         total_adaptations = sum(s["num_adaptations"] for s in self._tta_all_clip_stats)
-        mean_improvement = sum(s["improvement"] for s in self._tta_all_clip_stats) / len(self._tta_all_clip_stats)
+        mean_improvement = sum(s["improvement"] for s in self._tta_all_clip_stats) / total_clips
 
-        # Handle both sequential and full-rollout modes
         if "pre_adapt_loss" in self._tta_all_clip_stats[0]:
-            mean_pre_adapt = sum(s["pre_adapt_loss"] for s in self._tta_all_clip_stats) / len(self._tta_all_clip_stats)
-            mean_post_adapt = sum(s["post_adapt_loss"] for s in self._tta_all_clip_stats) / len(self._tta_all_clip_stats)
+            mean_pre_adapt = sum(s["pre_adapt_loss"] for s in self._tta_all_clip_stats) / total_clips
+            mean_post_adapt = sum(s["post_adapt_loss"] for s in self._tta_all_clip_stats) / total_clips
         else:
-            mean_pre_adapt = sum(s["first_loss"] for s in self._tta_all_clip_stats) / len(self._tta_all_clip_stats)
-            mean_post_adapt = sum(s["last_loss"] for s in self._tta_all_clip_stats) / len(self._tta_all_clip_stats)
+            mean_pre_adapt = sum(s["first_loss"] for s in self._tta_all_clip_stats) / total_clips
+            mean_post_adapt = sum(s["last_loss"] for s in self._tta_all_clip_stats) / total_clips
 
         return {
-            "total_clips": len(self._tta_all_clip_stats),
+            "total_clips": total_clips,
             "total_adaptations": total_adaptations,
             "mean_improvement": mean_improvement,
             "mean_pre_adapt_loss": mean_pre_adapt,

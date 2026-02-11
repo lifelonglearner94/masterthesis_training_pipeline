@@ -1,6 +1,7 @@
-from typing import Any, Optional
-import time
 import logging
+import time
+from typing import Any, Final
+
 import torch
 import torch.nn as nn
 import lightning as L
@@ -14,12 +15,30 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+# Constants
+DEFAULT_LOG_EVERY_N_BATCHES: Final = 1
+DEFAULT_MAX_LAYERS_TO_LOG: Final = 50
+PARAM_SAMPLE_LIMIT_BEFORE_OPTIMIZER: Final = 10
+PARAM_SAMPLE_LIMIT_AFTER_OPTIMIZER: Final = 5
+GRAD_LOG_INITIAL: Final = 20
+GRAD_LOG_PERIOD: Final = 50
+WEIGHT_LOG_PERIOD: Final = 100
+
 
 class TensorStats:
     """Helper to compute and format tensor statistics."""
 
     @staticmethod
     def stats(t: torch.Tensor, name: str = "tensor") -> str:
+        """Compute and format tensor statistics as a string.
+
+        Args:
+            t: The tensor to analyze.
+            name: Name prefix for the stats output.
+
+        Returns:
+            Formatted string with tensor statistics.
+        """
         if t is None:
             return f"{name}: None"
         if not isinstance(t, torch.Tensor):
@@ -40,10 +59,22 @@ class TensorStats:
 class ForwardHookLogger:
     """Logs forward pass details for each layer."""
 
-    def __init__(self, module_name: str):
+    def __init__(self, module_name: str) -> None:
+        """Initialize the forward hook logger.
+
+        Args:
+            module_name: Name of the module being hooked.
+        """
         self.module_name = module_name
 
     def __call__(self, module: nn.Module, input_tuple: tuple, output: Any) -> None:
+        """Log forward pass information.
+
+        Args:
+            module: The module being called.
+            input_tuple: Tuple of input tensors.
+            output: Output tensor(s) from the forward pass.
+        """
         log.info(f"  [FWD] {self.module_name}")
 
         # Log input shapes and stats
@@ -63,10 +94,22 @@ class ForwardHookLogger:
 class BackwardHookLogger:
     """Logs backward pass gradient details for each layer."""
 
-    def __init__(self, module_name: str):
+    def __init__(self, module_name: str) -> None:
+        """Initialize the backward hook logger.
+
+        Args:
+            module_name: Name of the module being hooked.
+        """
         self.module_name = module_name
 
     def __call__(self, module: nn.Module, grad_input: tuple, grad_output: tuple) -> None:
+        """Log backward pass gradient information.
+
+        Args:
+            module: The module being called.
+            grad_input: Tuple of input gradients (dL/dx).
+            grad_output: Tuple of output gradients (dL/dy).
+        """
         log.info(f"  [BWD] {self.module_name}")
 
         # Log gradient outputs (dL/dy)
@@ -91,9 +134,21 @@ class VerboseLoggingCallback(Callback):
         log_backward_pass: bool = True,
         log_gradients: bool = True,
         log_weights: bool = True,
-        log_every_n_batches: int = 1,  # Log every N batches (1 = every batch)
-        max_layers_to_log: int = 50,  # Limit number of layers to avoid extreme spam
-    ):
+        log_every_n_batches: int = DEFAULT_LOG_EVERY_N_BATCHES,
+        max_layers_to_log: int = DEFAULT_MAX_LAYERS_TO_LOG,
+    ) -> None:
+        """Initialize the verbose logging callback.
+
+        Args:
+            log_memory: Whether to log memory usage.
+            log_data: Whether to log input data statistics.
+            log_forward_pass: Whether to log forward pass details.
+            log_backward_pass: Whether to log backward pass details.
+            log_gradients: Whether to log gradient statistics.
+            log_weights: Whether to log weight statistics.
+            log_every_n_batches: Log every N batches (1 = every batch).
+            max_layers_to_log: Limit number of layers to avoid extreme spam.
+        """
         super().__init__()
         self.log_memory = log_memory
         self.log_data = log_data
@@ -103,12 +158,16 @@ class VerboseLoggingCallback(Callback):
         self.log_weights = log_weights
         self.log_every_n_batches = log_every_n_batches
         self.max_layers_to_log = max_layers_to_log
-        self.forward_hooks = []
-        self.backward_hooks = []
-        self.epoch_start_time = time.time()
+        self.forward_hooks: list[Any] = []
+        self.backward_hooks: list[Any] = []
+        self.epoch_start_time: float = time.time()
 
     def _is_any_logging_enabled(self) -> bool:
-        """Check if any logging option is enabled."""
+        """Check if any logging option is enabled.
+
+        Returns:
+            True if any logging option is enabled, False otherwise.
+        """
         return any([
             self.log_memory,
             self.log_data,
@@ -119,10 +178,22 @@ class VerboseLoggingCallback(Callback):
         ])
 
     def _should_log_batch(self, batch_idx: int) -> bool:
+        """Determine if the current batch should be logged.
+
+        Args:
+            batch_idx: The batch index.
+
+        Returns:
+            True if the batch should be logged, False otherwise.
+        """
         return self._is_any_logging_enabled() and batch_idx % self.log_every_n_batches == 0
 
     def _register_hooks(self, model: nn.Module) -> None:
-        """Register forward and backward hooks on model layers."""
+        """Register forward and backward hooks on model layers.
+
+        Args:
+            model: The PyTorch model to attach hooks to.
+        """
         if not self.log_forward_pass and not self.log_backward_pass:
             return
 
@@ -158,6 +229,12 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_train_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Called when training starts.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+        """
         if not self._is_any_logging_enabled():
             return
 
@@ -203,6 +280,12 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_train_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Called when training ends.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+        """
         self._remove_hooks()
         if not self._is_any_logging_enabled():
             return
@@ -213,6 +296,12 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Called at the start of each training epoch.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+        """
         self.epoch_start_time = time.time()
         if not self._is_any_logging_enabled():
             return
@@ -222,7 +311,21 @@ class VerboseLoggingCallback(Callback):
             self._log_memory_usage("Epoch Start")
 
     @rank_zero_only
-    def on_train_batch_start(self, trainer: L.Trainer, pl_module: L.LightningModule, batch: Any, batch_idx: int) -> None:
+    def on_train_batch_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Called at the start of each training batch.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+            batch: The current batch of data.
+            batch_idx: The batch index.
+        """
         if not self._should_log_batch(batch_idx):
             return
 
@@ -240,7 +343,19 @@ class VerboseLoggingCallback(Callback):
             self._log_memory_usage("Before Forward")
 
     @rank_zero_only
-    def on_before_backward(self, trainer: L.Trainer, pl_module: L.LightningModule, loss: torch.Tensor) -> None:
+    def on_before_backward(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        loss: torch.Tensor,
+    ) -> None:
+        """Called before the backward pass.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+            loss: The computed loss tensor.
+        """
         batch_idx = trainer.global_step
         if not self._should_log_batch(batch_idx):
             return
@@ -257,6 +372,12 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_after_backward(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Called after the backward pass.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+        """
         batch_idx = trainer.global_step
         if not self._should_log_batch(batch_idx):
             return
@@ -273,7 +394,7 @@ class VerboseLoggingCallback(Callback):
                     grad_count += 1
 
                     # Log individual gradient stats (sample every 10th param to reduce spam)
-                    if grad_count <= 20 or grad_count % 50 == 0:
+                    if grad_count <= GRAD_LOG_INITIAL or grad_count % GRAD_LOG_PERIOD == 0:
                         log.info(f"  {name}: {TensorStats.stats(param.grad, 'grad')}")
 
             total_grad_norm = total_grad_norm ** 0.5
@@ -283,7 +404,19 @@ class VerboseLoggingCallback(Callback):
             self._log_memory_usage("After Backward")
 
     @rank_zero_only
-    def on_before_optimizer_step(self, trainer: L.Trainer, pl_module: L.LightningModule, optimizer) -> None:
+    def on_before_optimizer_step(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        optimizer: Any,
+    ) -> None:
+        """Called before the optimizer step.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+            optimizer: The optimizer being used.
+        """
         batch_idx = trainer.global_step
         if not self._should_log_batch(batch_idx):
             return
@@ -296,11 +429,27 @@ class VerboseLoggingCallback(Callback):
             for name, param in pl_module.named_parameters():
                 if param.requires_grad:
                     param_count += 1
-                    if param_count <= 10 or param_count % 100 == 0:
+                    if param_count <= PARAM_SAMPLE_LIMIT_BEFORE_OPTIMIZER or param_count % WEIGHT_LOG_PERIOD == 0:
                         log.info(f"  {name}: {TensorStats.stats(param.data, 'weight')}")
 
     @rank_zero_only
-    def on_train_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Called at the end of each training batch.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+            outputs: The outputs from the training step.
+            batch: The current batch of data.
+            batch_idx: The batch index.
+        """
         if not self._should_log_batch(batch_idx):
             return
 
@@ -310,7 +459,7 @@ class VerboseLoggingCallback(Callback):
             for name, param in pl_module.named_parameters():
                 if param.requires_grad:
                     param_count += 1
-                    if param_count <= 5:  # Just a sample
+                    if param_count <= PARAM_SAMPLE_LIMIT_AFTER_OPTIMIZER:  # Just a sample
                         log.info(f"  {name}: {TensorStats.stats(param.data, 'weight')}")
 
         if self.log_memory:
@@ -318,6 +467,12 @@ class VerboseLoggingCallback(Callback):
 
     @rank_zero_only
     def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Called at the end of each training epoch.
+
+        Args:
+            trainer: The Lightning Trainer instance.
+            pl_module: The LightningModule being trained.
+        """
         if not self._is_any_logging_enabled():
             return
 
@@ -335,7 +490,12 @@ class VerboseLoggingCallback(Callback):
                 if param.requires_grad:
                     log.info(f"  {name}: {TensorStats.stats(param.data, 'weight')}")
 
-    def _log_memory_usage(self, prefix: str):
+    def _log_memory_usage(self, prefix: str) -> None:
+        """Log memory usage information.
+
+        Args:
+            prefix: Prefix for the log message.
+        """
         msg = f"[MEMORY] {prefix} | "
 
         # System Memory
@@ -346,18 +506,22 @@ class VerboseLoggingCallback(Callback):
             # Fallback for Linux
             try:
                 import resource
+
                 usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                 msg += f"Proc Mem: {usage / 1024 / 1024:.2f}GB | "
 
                 with open('/proc/meminfo', 'r') as f:
-                    meminfo = {line.split(':')[0]: int(line.split(':')[1].strip().split()[0]) for line in f}
+                    meminfo = {
+                        line.split(':')[0]: int(line.split(':')[1].strip().split()[0])
+                        for line in f
+                    }
                 if 'MemTotal' in meminfo and 'MemAvailable' in meminfo:
                     total = meminfo['MemTotal']
                     avail = meminfo['MemAvailable']
                     used = total - avail
                     percent = (used / total) * 100
                     msg += f"Sys RAM: {percent:.1f}% ({used / 1024 / 1024:.2f}GB used) | "
-            except Exception:
+            except (ImportError, ImportError, FileNotFoundError, OSError, KeyError, ValueError, IndexError):
                 msg += "Mem: N/A | "
 
         # GPU Memory

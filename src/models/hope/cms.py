@@ -20,7 +20,7 @@ which is critical for robotics video prediction.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -29,15 +29,36 @@ from torch import Tensor
 log = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class LevelSpec:
-    """Specification for a single CMS frequency level."""
+    """Immutable specification for a single CMS frequency level.
+
+    Attributes:
+        name: Human-readable identifier (e.g., 'fast', 'medium', 'slow').
+        update_period: Tokens between updates (1=fastest, updates every token).
+        warmup_steps: Number of training steps before level starts updating.
+        jitter: Random variation in update period for regularization.
+        hidden_multiplier: Hidden dimension multiplier (dim * multiplier).
+
+    Raises:
+        ValueError: If update_period < 1 or hidden_multiplier <= 0.
+    """
 
     name: str = "fast"
-    update_period: int = 1  # Update every N tokens (1=fastest)
-    warmup_steps: int = 0  # Steps before this level starts updating
-    jitter: float = 0.0  # Random jitter on update period (0=deterministic)
-    hidden_multiplier: float = 4.0  # MLP hidden dim = dim * multiplier
+    update_period: int = 1
+    warmup_steps: int = 0
+    jitter: float = 0.0
+    hidden_multiplier: float = 4.0
+
+    def __post_init__(self) -> None:
+        if self.update_period < 1:
+            raise ValueError(
+                f"update_period must be >= 1, got {self.update_period}"
+            )
+        if self.hidden_multiplier <= 0:
+            raise ValueError(
+                f"hidden_multiplier must be > 0, got {self.hidden_multiplier}"
+            )
 
 
 class CMSBlock(nn.Module):
@@ -45,11 +66,14 @@ class CMSBlock(nn.Module):
 
     Structure: x → LayerNorm → Linear → Act → Linear → + x
 
+    The block uses zero-initialization for the output layer bias and small
+    normal initialization for weights to stabilize residual learning.
+
     Args:
         dim: Input/output dimension.
         hidden_multiplier: Hidden dimension = dim * hidden_multiplier.
-        act_layer: Activation function class.
-        drop: Dropout rate.
+        act_layer: Activation function class (defaults to GELU).
+        drop: Dropout rate applied after both linear layers.
         grad_clip: Maximum gradient norm for clipping through this block.
     """
 
@@ -82,7 +106,7 @@ class CMSBlock(nn.Module):
             x: [B, N, D] input tokens.
 
         Returns:
-            [B, N, D] output tokens.
+            [B, N, D] output tokens with residual connection applied.
         """
         residual = x
         x = self.norm(x)
@@ -103,15 +127,16 @@ class CMS(nn.Module):
 
     In standard mode (no chunk scheduling), all levels process every token.
     When chunk scheduling is enabled, slower levels only process every
-    `update_period`-th chunk of tokens.
+    `update_period`-th chunk of tokens based on global temporal position.
 
     Args:
-        dim: Input/output dimension.
-        levels: List of LevelSpec defining each frequency level.
-        act_layer: Activation function class.
-        drop: Dropout rate.
-        grad_clip: Gradient clipping for CMS blocks.
-        use_chunk_scheduling: Whether to use frequency-based chunk scheduling.
+        dim: Input/output dimension for all levels.
+        levels: List of LevelSpec defining each frequency level. If None,
+            uses default three-level hierarchy (fast, medium, slow).
+        act_layer: Activation function class for all levels.
+        drop: Dropout rate applied in all CMS blocks.
+        grad_clip: Gradient clipping norm for all CMS blocks.
+        use_chunk_scheduling: Enable frequency-based temporal scheduling.
     """
 
     def __init__(
@@ -149,11 +174,12 @@ class CMS(nn.Module):
         # Step counter for chunk scheduling
         self.register_buffer("_global_step", torch.tensor(0, dtype=torch.long), persistent=False)
 
-        # Chunk accumulators for each level (used in chunk scheduling mode)
+        # Chunk accumulators for each level (reserved for future use)
         self._chunk_accumulators: list[list[Tensor]] = [[] for _ in levels]
 
     @property
     def num_levels(self) -> int:
+        """Return the number of frequency levels."""
         return len(self.blocks)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -178,18 +204,17 @@ class CMS(nn.Module):
                 x = block(x)
             return x
 
-        # ─── Chunk-scheduling mode: per-token temporal frequency gating ───
+        # Chunk-scheduling mode: per-token temporal frequency gating
         B, N, D = x.shape
         base_step = self._global_step.item()
 
         for block, spec in zip(self.blocks, self.levels_spec):
+            # Fast level with warmup complete: process all tokens
             if spec.update_period <= 1 and base_step >= spec.warmup_steps:
-                # Fast level: process all tokens (no filtering needed)
                 x = block(x)
                 continue
 
-            # Build a mask of which tokens should be processed by this level
-            # based on their temporal index within the sequence
+            # Build update mask based on temporal position
             token_steps = torch.arange(N, device=x.device) + base_step
             update_mask = (
                 (token_steps >= spec.warmup_steps)
@@ -197,16 +222,16 @@ class CMS(nn.Module):
             )
 
             if not update_mask.any():
-                continue  # No tokens need this level at current steps
+                continue
 
             if update_mask.all():
-                x = block(x)  # All tokens qualify — skip masking overhead
+                x = block(x)
             else:
-                # Process only qualifying tokens, leave others unchanged
-                indices = update_mask.nonzero(as_tuple=True)[0]  # [K]
-                x_sub = x[:, indices, :]       # [B, K, D]
-                x_sub = block(x_sub)           # [B, K, D]
-                x = x.clone()  # Avoid in-place modification on autograd graph
+                # Process only qualifying tokens
+                indices = update_mask.nonzero(as_tuple=True)[0]
+                x_sub = x[:, indices, :]
+                x_sub = block(x_sub)
+                x = x.clone()
                 x[:, indices, :] = x_sub
 
         # Advance step counter by the number of tokens processed
@@ -214,7 +239,11 @@ class CMS(nn.Module):
         return x
 
     def reset_step_counter(self) -> None:
-        """Reset the global step counter (call at start of each sequence)."""
+        """Reset the global step counter and clear accumulators.
+
+        Call this method at the start of each new sequence to ensure
+        correct temporal indexing.
+        """
         self._global_step.zero_()
         self._chunk_accumulators = [[] for _ in self.levels_spec]
 
@@ -222,7 +251,8 @@ class CMS(nn.Module):
         """Get parameters grouped by CMS level (for per-level optimizers).
 
         Returns:
-            List of (level_name, params) tuples.
+            List of (level_name, params) tuples where params is a list
+            of learnable parameters for that level.
         """
         result = []
         for spec, block in zip(self.levels_spec, self.blocks):

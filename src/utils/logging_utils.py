@@ -1,9 +1,8 @@
 """Logging utilities."""
 
 import logging
-from typing import Optional
 
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from rich.logging import RichHandler
 
 from src.utils.pylogger import get_pylogger
@@ -23,7 +22,7 @@ def log_hyperparameters(object_dict: dict) -> None:
             - model: PyTorch Lightning model
             - trainer: PyTorch Lightning trainer
     """
-    hparams = {}
+    hparams: dict = {}
 
     cfg = object_dict.get("cfg")
     if cfg:
