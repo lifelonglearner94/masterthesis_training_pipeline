@@ -119,6 +119,7 @@ multirun/
 Thumbs.db
 
 temp/
+tmp/
 
 .env
 
