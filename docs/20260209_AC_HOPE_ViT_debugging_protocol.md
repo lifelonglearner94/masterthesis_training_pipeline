@@ -1,9 +1,9 @@
 # Scientific Debugging Protocol: AC-HOPE-ViT Training Pipeline
 
-**Date:** 2026-02-09  
-**Author:** Debugging Session (AI-assisted)  
-**System:** Apple Silicon (MPS), macOS, PyTorch Lightning, Hydra  
-**Model:** AC-HOPE-ViT (~41.6M parameters)  
+**Date:** 2026-02-09
+**Author:** Debugging Session (AI-assisted)
+**System:** Apple Silicon (MPS), macOS, PyTorch Lightning, Hydra
+**Model:** AC-HOPE-ViT (~41.6M parameters)
 **Reference Paper:** Behrouz (2025) — *HOPE: A Self-Referential Learning Module* (see `docs/20260206_HOPE_ Self-Referential Learning Module.md`)
 
 ---
@@ -37,7 +37,7 @@ uv run src/train.py experiment=ac_hope_vit_param_matched \
 | Total parameters | 41,572,480 (~41.6M) |
 
 Each HOPE block contains:
-- **Phase A (Self-Modifying Titan):** 5 memories (M_k, M_v, M_η, M_α, M_memory), each a 2-layer MLP updated via Descending-with-Gradient Descent (DGD)
+- **Phase A (Self-Modifying Titan):** 5 memories (M_k, M_v, M_η, M_α, M_memory), each a 2-layer MLP updated via Delta Gradient Descent (DGD)
 - **Phase B (CMS):** 3-level multi-frequency MLP with surprise-gated writing
 
 ### 2.2 Data Format
@@ -86,14 +86,14 @@ During validation, `self.training = False`, so `not self.training = True`, which
 
 This is **by design** — the HOPE paper explicitly states:
 
-> *"There is no distinction between training and test time."*  
+> *"There is no distinction between training and test time."*
 > — Behrouz (2025), Section 8
 
 The DGD self-modification **must** run during inference. The error is that PyTorch's gradient context is disabled, not that the code path is wrong.
 
 #### 3.1.3 Fix
 
-**File:** `src/models/hope/titan_memory.py`  
+**File:** `src/models/hope/titan_memory.py`
 **Location:** `compute_and_apply_update()` method
 
 Wrapped the inner-loop gradient computation in a `torch.enable_grad()` context manager:
@@ -207,10 +207,10 @@ $$w_{\text{new}} = w_{\text{old}} \cdot \underbrace{(\alpha - \eta \cdot k^2)}_{
 
 Two compounding issues:
 
-**Issue A — Unbounded preconditioner:**  
+**Issue A — Unbounded preconditioner:**
 The preconditioner $p = \alpha - \eta \cdot k^2$ can take any value. If $k$ is large, $p$ becomes a large negative number. Since it multiplies the old weights, this causes exponential growth or sign oscillation across timesteps.
 
-**Issue B — Deep gradient chains:**  
+**Issue B — Deep gradient chains:**
 With `detach_interval=4`, the gradient graph chains through 4 consecutive DGD updates per memory. With:
 - 7 timesteps per sequence
 - 5 memories per block
@@ -224,7 +224,7 @@ With `detach_interval=1`, the gradient graph is truncated after every single DGD
 
 **Fix A — Clamp the preconditioner**
 
-**File:** `src/models/hope/titan_memory.py`  
+**File:** `src/models/hope/titan_memory.py`
 **Location:** `compute_and_apply_update()`, after computing preconditioner
 
 ```python

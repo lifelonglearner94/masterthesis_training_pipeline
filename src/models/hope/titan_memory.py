@@ -2,7 +2,7 @@
 
 Implements the Deep Self-Referential Titan memory from the Nested Learning paper.
 The memory is a 2-layer MLP whose weights are updated *during the forward pass*
-via Descending-with-Gradient Descent (DGD).
+via Delta Gradient Descent (DGD).
 
 Key equations (from Behrouz 2025, Section 8.1):
     Retrieval:     o_t = M_{t-1}(q_t)

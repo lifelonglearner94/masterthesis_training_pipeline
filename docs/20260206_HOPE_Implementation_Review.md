@@ -37,7 +37,7 @@ $$\hat{v}_{\Box,t} = \mathcal{M}_{\Box,t-1}(v_t) \quad \text{(Eq. 83 — self-ge
 
 Only $q_t = x_t W_q$ is static. **Every other component is self-modifying.**
 
-### Pillar 2 — DGD (Descending-with-Gradient Descent) Update Rule
+### Pillar 2 — DGD (Delta Gradient Descent) Update Rule
 
 $$\mathcal{M}_{\Box,t} = \mathcal{M}_{\Box,t-1}\bigl(\alpha_t I - \eta_t\, k_t k_t^\top\bigr) - \eta_t \nabla\mathcal{L}(\mathcal{M}_{\Box,t-1};\, k_t,\, \hat{v}_{\Box,t}) \quad \text{(Eq. 88)}$$
 
