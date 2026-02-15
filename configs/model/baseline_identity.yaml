@@ -1,0 +1,27 @@
+# @package _global_
+
+# Identity Baseline Model Configuration ("Last Frame Copy")
+# Predicts every future frame as a copy of the last observed frame.
+# No learnable parameters — actions are completely ignored.
+#
+# This is the simplest possible baseline. Any useful predictor MUST beat it.
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.baseline_identity.IdentityBaselineLitModule
+
+  # Model architecture
+  input_dim: 1024         # V-JEPA2 feature dimension
+  spatial_size: 16        # 16×16 spatial grid (256 patches)
+  num_timesteps: 8        # Encoded timesteps (must match data)
+
+  # Loss settings (same interface as other models for fair comparison)
+  T_teacher: 7            # Teacher-forcing prediction steps
+  T_rollout: 7            # Rollout prediction steps (autoregressive)
+  context_frames: 1       # Number of ground-truth context frames for rollout
+  loss_weight_teacher: 0.0  # Disable teacher loss (not meaningful for identity)
+  loss_weight_rollout: 1.0
+  normalize_reps: true    # Apply layer norm (matching other models)
+  loss_exp: 1.0           # L1 loss

@@ -1,0 +1,91 @@
+# @package _global_
+# =============================================================================
+# Identity Baseline ("Last Frame Copy") - TEST CONFIGURATION
+# =============================================================================
+# Use as: uv run src/eval.py experiment=test_baseline_identity paths.data_dir=/path/to/clips
+#
+# This experiment evaluates the identity baseline on a specified clip range.
+# NO training or checkpoint needed — the model has zero learnable parameters.
+#
+# The identity baseline predicts every future frame as a copy of the last
+# observed context frame, completely ignoring actions. This establishes a
+# trivial lower bound that any useful predictor must beat.
+#
+# TEMPORAL DIMENSIONS:
+#   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
+#   - Context frames: 1 (ground-truth z₀)
+#   - Prediction steps: 7 (autoregressive z₁→z₇, all copies of z₀)
+#
+# Custom clip range:
+#   uv run src/eval.py experiment=test_baseline_identity \
+#       paths.data_dir=/path/to/clips data.clip_start=15000 data.clip_end=16000
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: baseline_identity
+  - override /trainer: default
+  - override /callbacks: null
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "test_baseline_identity"
+tags: ["baseline", "identity", "last-frame-copy", "evaluation"]
+seed: 42
+train: False
+test: True
+
+# =============================================================================
+# CALLBACKS: Minimal (progress bar only)
+# =============================================================================
+callbacks:
+  rich_progress:
+    _target_: lightning.pytorch.callbacks.RichProgressBar
+
+# =============================================================================
+# DATA: Test clip range (same default as test_ac_predictor)
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  clip_start: 17000
+  clip_end: 22000
+  val_split: 0.0
+
+# =============================================================================
+# MODEL: Identity baseline specific settings
+# =============================================================================
+model:
+  T_rollout: 7
+  context_frames: 1
+  T_teacher: 7
+  loss_weight_teacher: 0.0
+  loss_weight_rollout: 1.0
+
+# =============================================================================
+# TRAINER: Test mode
+# =============================================================================
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: 32
+  max_epochs: 0
+  enable_checkpointing: false
+  enable_progress_bar: true
+
+# =============================================================================
+# NO CHECKPOINT NEEDED (zero learnable parameters)
+# =============================================================================
+ckpt_path: null
+
+# =============================================================================
+# TEST OUTPUT SETTINGS
+# =============================================================================
+test_output:
+  export_results: true
+  output_dir: null
+  per_timestep_breakdown: true
+  num_worst_clips: 10

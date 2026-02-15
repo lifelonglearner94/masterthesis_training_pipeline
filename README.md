@@ -33,6 +33,10 @@ data_dir/
 
 V-JEPA 2 uses tubelet_size=2, so 16 RGB frames → 8 encoded timesteps → 7 action steps.
 
+## Baseline Identity
+```bash
+uv run src/eval.py experiment=test_baseline_identity paths.data_dir=/path/to/clips
+```
 ## Training
 
 ### ViT-AC Predictor (baseline)
