@@ -155,6 +155,6 @@ model:
 # TRAINER SETTINGS (adapted for HOPE bi-level optimization)
 # =============================================================================
 trainer:
-  max_epochs: 60                   # ↑ from 30 (meta-learning converges slower)
+  max_epochs: 30                   # ↑ from 30 (meta-learning converges slower)
   gradient_clip_val: 3.0           # ↑ from 1.01 (allow meta-gradient signal through)
   gradient_clip_algorithm: norm
