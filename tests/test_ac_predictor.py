@@ -37,7 +37,7 @@ class TestACPredictorModule:
             T_teacher=7,
             T_rollout=2,
             context_frames=1,
-            loss_exp=1.0,
+            loss_type="l1",
             normalize_reps=True,
         )
 
@@ -62,43 +62,48 @@ class TestACPredictorModule:
         assert default_module.model is not None
         assert default_module.T_teacher == 7
         assert default_module.T_rollout == 2
-        assert default_module.loss_exp == 1.0
+        assert default_module.loss_type == "l1"
 
-    def test_loss_exp_validation_zero(self):
-        """Test that loss_exp=0 raises ValueError."""
-        with pytest.raises(ValueError, match="loss_exp must be positive"):
+    def test_loss_type_validation_invalid(self):
+        """Test that invalid loss_type raises ValueError."""
+        with pytest.raises(ValueError, match="loss_type must be one of"):
             ACPredictorModule(
                 depth=1,
-                loss_exp=0.0,
-            )
-
-    def test_loss_exp_validation_negative(self):
-        """Test that negative loss_exp raises ValueError."""
-        with pytest.raises(ValueError, match="loss_exp must be positive"):
-            ACPredictorModule(
-                depth=1,
-                loss_exp=-1.0,
+                loss_type="invalid",
             )
 
     def test_compute_loss_l1(self, default_module):
-        """Test L1 loss computation (loss_exp=1.0)."""
+        """Test L1 loss computation (loss_type='l1')."""
         pred = torch.tensor([1.0, 2.0, 3.0])
         target = torch.tensor([1.5, 2.5, 3.5])
 
-        # L1 loss: mean(|pred - target|) / 1.0 = mean(0.5) = 0.5
+        # L1 loss: mean(|pred - target|) = mean(0.5) = 0.5
         loss = default_module._compute_loss(pred, target)
         expected = torch.tensor(0.5)
 
         assert torch.allclose(loss, expected, atol=1e-6)
 
     def test_compute_loss_l2(self):
-        """Test L2 loss computation (loss_exp=2.0)."""
-        module = ACPredictorModule(depth=1, loss_exp=2.0)
+        """Test L2 loss computation (loss_type='l2')."""
+        module = ACPredictorModule(depth=1, loss_type="l2")
 
         pred = torch.tensor([1.0, 2.0, 3.0])
         target = torch.tensor([1.5, 2.5, 3.5])
 
-        # L2 loss: mean(|pred - target|^2) / 2.0 = mean(0.25) / 2 = 0.125
+        # MSE loss: mean((pred - target)^2) = mean(0.25) = 0.25
+        loss = module._compute_loss(pred, target)
+        expected = torch.tensor(0.25)
+
+        assert torch.allclose(loss, expected, atol=1e-6)
+
+    def test_compute_loss_huber(self):
+        """Test Huber loss computation (loss_type='huber')."""
+        module = ACPredictorModule(depth=1, loss_type="huber", huber_delta=1.0)
+
+        pred = torch.tensor([1.0, 2.0, 3.0])
+        target = torch.tensor([1.5, 2.5, 3.5])
+
+        # Huber with delta=1.0, |diff|=0.5 < delta → 0.5 * diff^2 = 0.5*0.25 = 0.125
         loss = module._compute_loss(pred, target)
         expected = torch.tensor(0.125)
 

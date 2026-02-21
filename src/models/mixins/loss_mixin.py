@@ -13,12 +13,18 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 
+# Valid loss type names
+VALID_LOSS_TYPES = ("l1", "l2", "huber")
+DEFAULT_HUBER_DELTA = 1.0
+
+
 class ACPredictorLossMixin:
     """Mixin providing loss computation methods for AC predictors.
 
     This mixin expects the following attributes to be set by the inheriting class:
         - normalize_reps: bool - Whether to apply layer normalization
-        - loss_exp: float - Loss exponent (1.0 for L1, 2.0 for L2)
+        - loss_type: str - Loss function type: "l1", "l2", or "huber"
+        - huber_delta: float - Delta parameter for Huber loss (only used when loss_type="huber")
         - T_teacher: int - Number of teacher-forcing steps
         - T_rollout: int - Number of rollout prediction steps
         - context_frames: int - Number of ground-truth context frames for rollout
@@ -31,7 +37,8 @@ class ACPredictorLossMixin:
 
     # Type hints for expected attributes (set by inheriting class)
     normalize_reps: bool
-    loss_exp: float
+    loss_type: str
+    huber_delta: float
     T_teacher: int
     T_rollout: int
     context_frames: int
@@ -44,12 +51,12 @@ class ACPredictorLossMixin:
         pred: Tensor,
         target: Tensor,
     ) -> Tensor:
-        """Compute loss with configurable exponent.
+        """Compute loss with configurable loss type.
 
-        loss = mean(|pred - target|^loss_exp) / loss_exp
-
-        When loss_exp=1.0, this is equivalent to L1 loss.
-        When loss_exp=2.0, this is equivalent to 0.5 * L2 loss.
+        Supports:
+            - "l1": L1 / Mean Absolute Error
+            - "l2": L2 / Mean Squared Error
+            - "huber": Huber loss (smooth L1), controlled by self.huber_delta
 
         Args:
             pred: Predicted features
@@ -58,27 +65,23 @@ class ACPredictorLossMixin:
         Returns:
             Scalar loss tensor
         """
-        # Compute element-wise absolute difference
-        diff = torch.abs(pred - target)
         logger.debug(
             f"    [LOSS] pred shape: {pred.shape}, target shape: {target.shape}"
         )
-        logger.debug(
-            f"    [LOSS] |pred - target|: min={diff.min().item():.6f}, "
-            f"max={diff.max().item():.6f}, mean={diff.mean().item():.6f}"
-        )
 
-        # Apply exponent
-        diff_exp = diff**self.loss_exp
-        logger.debug(
-            f"    [LOSS] |diff|^{self.loss_exp}: min={diff_exp.min().item():.6f}, "
-            f"max={diff_exp.max().item():.6f}, mean={diff_exp.mean().item():.6f}"
-        )
+        if self.loss_type == "l1":
+            loss = F.l1_loss(pred, target)
+        elif self.loss_type == "l2":
+            loss = F.mse_loss(pred, target)
+        elif self.loss_type == "huber":
+            loss = F.huber_loss(pred, target, delta=self.huber_delta)
+        else:
+            raise ValueError(
+                f"Unknown loss_type '{self.loss_type}'. "
+                f"Must be one of {VALID_LOSS_TYPES}."
+            )
 
-        # Compute final loss
-        loss = torch.mean(diff_exp) / self.loss_exp
-        logger.debug(f"    [LOSS] Final loss: {loss.item():.8f}")
-
+        logger.debug(f"    [LOSS] {self.loss_type} loss: {loss.item():.8f}")
         return loss
 
     def _normalize_features(self, features: Tensor) -> Tensor:
@@ -108,7 +111,7 @@ class ACPredictorLossMixin:
 
         This matches the original paper's implementation:
             z_tf = predictor(z[:, :-tokens_per_frame], actions, states, extrinsics)
-            loss = mean(|z_tf - h[:, tokens_per_frame:]|^loss_exp) / loss_exp
+            loss = loss_fn(z_tf, h[:, tokens_per_frame:])
 
         Args:
             features: [B, T+1, N, D] - Features for T+1 frames (T inputs + 1 target)
@@ -342,10 +345,18 @@ class ACPredictorLossMixin:
             # Target for this step: frame C + step
             target_frame = h[:, C + step, :, :]  # [B, N, D]
 
-            # Per-sample loss for this timestep
-            diff = torch.abs(pred - target_frame)  # [B, N, D]
-            diff_exp = diff**self.loss_exp
-            per_sample_loss = diff_exp.mean(dim=(1, 2)) / self.loss_exp  # [B]
+            # Per-sample loss for this timestep using configured loss type
+            if self.loss_type == "l1":
+                per_sample_loss = torch.abs(pred - target_frame).mean(dim=(1, 2))  # [B]
+            elif self.loss_type == "l2":
+                per_sample_loss = ((pred - target_frame) ** 2).mean(dim=(1, 2))  # [B]
+            elif self.loss_type == "huber":
+                # Huber per-sample: use reduction='none' then average over (N, D)
+                per_sample_loss = F.huber_loss(
+                    pred, target_frame, delta=self.huber_delta, reduction="none"
+                ).mean(dim=(1, 2))  # [B]
+            else:
+                raise ValueError(f"Unknown loss_type '{self.loss_type}'")
 
             per_timestep_losses.append(per_sample_loss)
             per_sample_total_losses += per_sample_loss

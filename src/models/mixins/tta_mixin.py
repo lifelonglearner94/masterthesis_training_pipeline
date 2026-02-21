@@ -35,7 +35,8 @@ class TTAMixin:
         - T_rollout: int - Number of rollout steps
         - patches_per_frame: int - Number of patches per frame
         - normalize_reps: bool - Whether to normalize representations
-        - loss_exp: float - Loss exponent (typically 1.0 for L1)
+        - loss_type: str - Loss function type: "l1", "l2", or "huber"
+        - huber_delta: float - Delta for Huber loss
 
     TTA Configuration (set via __init__ or config):
         - tta_enabled: bool - Whether TTA is enabled
@@ -51,7 +52,8 @@ class TTAMixin:
     T_rollout: int
     patches_per_frame: int
     normalize_reps: bool
-    loss_exp: float
+    loss_type: str
+    huber_delta: float
 
     # TTA configuration attributes
     tta_enabled: bool
@@ -362,7 +364,7 @@ class TTAMixin:
         ln_params = self._tta_get_ln_params()
         pre_update_params = [p.data.clone() for p in ln_params]
 
-        loss = F.l1_loss(pred, target.detach())
+        loss = self._compute_loss(pred, target.detach())
 
         self._tta_optimizer.zero_grad()
         loss.backward()
@@ -511,7 +513,7 @@ class TTAMixin:
             pre_adapt_pred, targets = self._tta_full_rollout(
                 features, actions, states, extrinsics, detach=True
             )
-            pre_adapt_loss = F.l1_loss(pre_adapt_pred, targets).item()
+            pre_adapt_loss = self._compute_loss(pre_adapt_pred, targets).item()
 
         self._tta_clip_stats["pre_adapt_loss"] = pre_adapt_loss
 
@@ -553,7 +555,7 @@ class TTAMixin:
             final_predictions, targets = self._tta_full_rollout(
                 features, actions, states, extrinsics, detach=True
             )
-            post_adapt_loss = F.l1_loss(final_predictions, targets).item()
+            post_adapt_loss = self._compute_loss(final_predictions, targets).item()
 
         self._tta_clip_stats["post_adapt_loss"] = post_adapt_loss
         self._tta_clip_stats["improvement"] = pre_adapt_loss - post_adapt_loss

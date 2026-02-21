@@ -34,7 +34,8 @@ DEFAULT_T_ROLLOUT: Final = 7
 DEFAULT_CONTEXT_FRAMES: Final = 1
 DEFAULT_LOSS_WEIGHT_TEACHER: Final = 0.0
 DEFAULT_LOSS_WEIGHT_ROLLOUT: Final = 1.0
-DEFAULT_LOSS_EXP: Final = 1.0
+DEFAULT_LOSS_TYPE: Final = "l1"
+DEFAULT_HUBER_DELTA: Final = 1.0
 LAYER_NORM_EPS: Final = 1e-6
 
 # Type aliases
@@ -127,7 +128,8 @@ class IdentityBaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         loss_weight_teacher: float = DEFAULT_LOSS_WEIGHT_TEACHER,
         loss_weight_rollout: float = DEFAULT_LOSS_WEIGHT_ROLLOUT,
         normalize_reps: bool = True,
-        loss_exp: float = DEFAULT_LOSS_EXP,
+        loss_type: str = DEFAULT_LOSS_TYPE,
+        huber_delta: float = DEFAULT_HUBER_DELTA,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -147,9 +149,14 @@ class IdentityBaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         self.loss_weight_rollout = loss_weight_rollout
         self.normalize_reps = normalize_reps
 
-        if loss_exp <= 0:
-            raise ValueError(f"loss_exp must be positive (got {loss_exp})")
-        self.loss_exp = loss_exp
+        # Validate and store loss type
+        from src.models.mixins.loss_mixin import VALID_LOSS_TYPES
+        if loss_type not in VALID_LOSS_TYPES:
+            raise ValueError(
+                f"loss_type must be one of {VALID_LOSS_TYPES} (got '{loss_type}')."
+            )
+        self.loss_type = loss_type
+        self.huber_delta = huber_delta
 
         # Test results storage
         self._test_results: list[TestResult] = []

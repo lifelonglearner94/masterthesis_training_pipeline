@@ -94,7 +94,8 @@ model:
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
   normalize_reps: true            # Layer norm after predictor steps (V-JEPA2 paper)
-  loss_exp: 1.0                   # 1.0=L1, 2.0=L2
+  loss_type: "l1"                   # "l1" (MAE), "l2" (MSE), or "huber"
+  huber_delta: 1.0                  # Delta for Huber loss (only used when loss_type="huber")
 
   # Curriculum learning (null = disabled)
   curriculum_schedule: null

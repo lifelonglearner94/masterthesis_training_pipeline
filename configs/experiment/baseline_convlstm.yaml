@@ -75,6 +75,10 @@ model:
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
 
+  # --- Loss function (SAME as vjepa2_ac.yaml for fair comparison) ---
+  loss_type: "l2"
+  # huber_delta: 1.0  # Uncomment when loss_type="huber"
+
   # --- Curriculum Learning Schedule (SAME as vjepa2_ac.yaml) ---
   # Progressively reduces teacher-forcing weight, shifting focus to rollout
   curriculum_schedule:

@@ -24,4 +24,5 @@ model:
   loss_weight_teacher: 0.0  # Disable teacher loss (not meaningful for identity)
   loss_weight_rollout: 1.0
   normalize_reps: true    # Apply layer norm (matching other models)
-  loss_exp: 1.0           # L1 loss
+  loss_type: "l1"         # Loss function: "l1", "l2", or "huber"
+  huber_delta: 1.0        # Delta for Huber loss (only used when loss_type="huber")

@@ -8,16 +8,14 @@
 Implements teacher-forcing and rollout losses for training the action-conditioned
 vision transformer predictor, matching the V-JEPA2 paper implementation.
 
-Loss formulations (with configurable loss_exp, default=1.0 for L1):
-- Teacher-Forcing: L_tf = mean(|P_φ(z_{0:T-1}, a, s) - z_{1:T}|^exp) / exp
-  Single forward pass with full context, predicts all frames in parallel.
-- Rollout: L_ar = mean(|z_ar - z_{1:T}|^exp) / exp
-  Autoregressive rollout seeded with ground-truth z_0 + first TF prediction.
+Loss formulations (configurable via loss_type: "l1", "l2", or "huber"):
+- Teacher-Forcing: L_tf computed over single forward pass with full context.
+- Rollout: L_ar computed over autoregressive multi-step predictions.
 - Combined: L = w_tf * L_tf + w_ar * L_ar
 
 Key features matching original paper:
 - Optional layer normalization after each predictor step (normalize_reps)
-- Configurable loss exponent (loss_exp=1.0 for L1, loss_exp=2.0 for L2)
+- Configurable loss type: "l1" (MAE), "l2" (MSE), or "huber" (smooth L1)
 - Cumulative action/state context for autoregressive rollout
 - TF-seeded initialization for rollout stability
 """
@@ -104,7 +102,8 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         loss_weight_teacher: float = 1.0,
         loss_weight_rollout: float = 1.0,
         normalize_reps: bool = True,
-        loss_exp: float = 1.0,
+        loss_type: str = "l1",
+        huber_delta: float = 1.0,
         # Optimizer settings
         learning_rate: float = 4.25e-4,
         weight_decay: float = 0.04,
@@ -198,13 +197,14 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.loss_weight_rollout = loss_weight_rollout
         self.normalize_reps = normalize_reps
 
-        # Validate loss_exp to prevent division by zero
-        if loss_exp <= 0:
+        # Validate and store loss type
+        from src.models.mixins.loss_mixin import VALID_LOSS_TYPES
+        if loss_type not in VALID_LOSS_TYPES:
             raise ValueError(
-                f"loss_exp must be positive (got {loss_exp}). "
-                "Use loss_exp=1.0 for L1 loss, loss_exp=2.0 for L2 loss."
+                f"loss_type must be one of {VALID_LOSS_TYPES} (got '{loss_type}')."
             )
-        self.loss_exp = loss_exp
+        self.loss_type = loss_type
+        self.huber_delta = huber_delta
 
         # Optimizer hyperparameters
         self.learning_rate = learning_rate

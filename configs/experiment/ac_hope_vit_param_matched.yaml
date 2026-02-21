@@ -113,6 +113,10 @@ model:
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
 
+  # --- Loss function (see docs/20260221_L1_vs_L2_Loss.md) ---
+  loss_type: "l2"
+  # huber_delta: 1.0  # Uncomment when loss_type="huber"
+
   # --- Curriculum Learning Schedule (adapted for HOPE: delayed phases) ---
   # HOPE's meta-learning needs longer teacher-forcing stabilization.
   # Never go below 0.5 — teacher signal is the primary stable gradient for meta-learning.

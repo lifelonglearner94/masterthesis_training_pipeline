@@ -239,6 +239,7 @@ class RolloutTTAAgent(nn.Module):
             The adaptation loss value (for logging).
         """
         # Compute L1 loss with detached ground-truth (stop gradient into encoder)
+        # Note: TTA wrapper always uses L1 loss for adaptation signal stability
         loss = F.l1_loss(prediction, ground_truth.detach())
 
         # Backward pass

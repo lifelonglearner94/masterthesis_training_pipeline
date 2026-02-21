@@ -108,7 +108,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         loss_weight_teacher: float = 1.0,
         loss_weight_rollout: float = 1.0,
         normalize_reps: bool = True,
-        loss_exp: float = 1.0,
+        loss_type: str = "l1",
+        huber_delta: float = 1.0,
         # Optimizer settings (same as ACPredictorModule)
         learning_rate: float = 4.25e-4,
         weight_decay: float = 0.04,
@@ -190,12 +191,14 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.loss_weight_rollout = loss_weight_rollout
         self.normalize_reps = normalize_reps
 
-        if loss_exp <= 0:
+        # Validate and store loss type
+        from src.models.mixins.loss_mixin import VALID_LOSS_TYPES
+        if loss_type not in VALID_LOSS_TYPES:
             raise InvalidConfigurationError(
-                f"loss_exp must be positive (got {loss_exp}). "
-                "Use 1.0 for L1, 2.0 for L2."
+                f"loss_type must be one of {VALID_LOSS_TYPES} (got '{loss_type}')."
             )
-        self.loss_exp = loss_exp
+        self.loss_type = loss_type
+        self.huber_delta = huber_delta
 
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay

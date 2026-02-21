@@ -79,6 +79,13 @@ model:
   loss_weight_teacher: 1.0
   loss_weight_rollout: 1.0
 
+  # --- Loss function (see docs/20260221_L1_vs_L2_Loss.md) ---
+  # "l1" = MAE (paper default, robust to outliers)
+  # "l2" = MSE (better for noise-free physics sim, smooth convergence)
+  # "huber" = Huber loss (compromise: L2 near zero, L1 for large errors)
+  loss_type: "l2"
+  # huber_delta: 1.0  # Uncomment when loss_type="huber"
+
   # --- Curriculum Learning Schedule ---
   # Dynamically adjusts loss_weight_teacher during training.
   # T_rollout and context_frames are now FIXED (1 context → 7 predictions).
