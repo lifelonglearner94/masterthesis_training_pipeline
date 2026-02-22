@@ -1,0 +1,122 @@
+# @package _global_
+# =============================================================================
+# SANITY CHECK: Tiny ViT on CPU with verbose jump loss logging
+# =============================================================================
+# Run with:
+#   uv run src/train.py experiment=sanity_tiny_cpu
+#
+# Purpose: Local sanity check for the full architecture (3D RoPE, frame-causal
+# attention, teacher-forcing + jump prediction loss, curriculum schedule).
+# Uses a minimal ViT so it fits on CPU with only a few clips.
+#
+# ARCHITECTURE NOTES:
+#   - embed_dim=1024 is FIXED (must match precomputed V-JEPA2 ViT-L features)
+#   - predictor_embed_dim=64, depth=2, num_heads=4 → ~0.5M params (vs ~100M full)
+#   - All architectural features enabled: 3D RoPE, frame-causal mask, etc.
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: null              # ← NO wandb, local only
+
+# =============================================================================
+# VERBOSE LOGGING — especially for jump loss debugging
+# =============================================================================
+callbacks:
+  verbose_logging:
+    _target_: src.callbacks.verbose_logging.VerboseLoggingCallback
+    log_memory: True
+    log_data: True
+    log_forward_pass: True
+    log_backward_pass: True
+    log_gradients: True
+    log_weights: False
+    log_every_n_batches: 1     # Log EVERY batch
+    max_layers_to_log: 30
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "sanity_tiny_cpu"
+tags: ["sanity", "tiny", "cpu", "jump_loss"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA — use ALL clips in data/ (just 2 clips on this machine)
+# =============================================================================
+data:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  clip_start: 0                  # Include clip_00000
+  clip_end: 15102                # Include clip_15101 (exclusive upper bound)
+  val_split: 0.5                 # 1 clip train, 1 clip val (we only have 2)
+
+# =============================================================================
+# MODEL — tiny ViT, full architecture
+# =============================================================================
+model:
+  # --- Architecture (TINY) ---
+  embed_dim: 1024                # FIXED: must match precomputed features
+  predictor_embed_dim: 64        # Tiny internal dimension (full=384)
+  depth: 2                       # Tiny depth (full=24)
+  num_heads: 4                   # 64/4=16 head_dim (full=16 heads)
+  mlp_ratio: 2.0                 # Smaller MLP (full=4.0)
+  action_embed_dim: 2            # 2D actions in this dataset
+
+  # --- Keep full architecture features ---
+  use_rope: true                 # 3D RoPE positional encoding
+  is_frame_causal: true          # Frame-causal attention mask
+  use_activation_checkpointing: false  # Not needed for tiny model
+  drop_path_rate: 0.0            # No stochastic depth for tiny model
+
+  # --- Loss settings ---
+  T_teacher: 7                   # Full teacher-forcing range
+  jump_k: 3                      # Jump targets from last 3 frames
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  normalize_reps: true
+  loss_type: "l2"
+
+  # --- Curriculum schedule (exercise the full pipeline) ---
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 2
+      loss_weight_teacher: 0.5
+    - epoch: 4
+      loss_weight_teacher: 0.2
+
+  # --- Optimizer (smaller LR for tiny model) ---
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+  # --- LR schedule ---
+  use_iteration_scheduler: true
+  warmup_pct: 0.1
+  constant_pct: 0.8
+  decay_pct: 0.1
+  warmup_start_lr: 1.0e-4
+
+# =============================================================================
+# TRAINER — CPU, few epochs, verbose
+# =============================================================================
+trainer:
+  max_epochs: 50
+  accelerator: cpu
+  devices: 1
+  precision: 32                  # Full precision on CPU
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  log_every_n_steps: 1           # Log every single step
+  enable_progress_bar: true
+  enable_model_summary: true
+  num_sanity_val_steps: 1
+  check_val_every_n_epoch: 1
