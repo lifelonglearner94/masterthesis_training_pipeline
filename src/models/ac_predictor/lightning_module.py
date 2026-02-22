@@ -5,19 +5,19 @@
 
 """Lightning Module wrapper for AC Predictor.
 
-Implements teacher-forcing and rollout losses for training the action-conditioned
-vision transformer predictor, matching the V-JEPA2 paper implementation.
+Implements teacher-forcing and jump prediction losses for training the action-conditioned
+vision transformer predictor.
 
 Loss formulations (configurable via loss_type: "l1", "l2", or "huber"):
 - Teacher-Forcing: L_tf computed over single forward pass with full context.
-- Rollout: L_ar computed over autoregressive multi-step predictions.
-- Combined: L = w_tf * L_tf + w_ar * L_ar
+- Jump Prediction: L_jump — single forward pass from z₀ + a₀ with RoPE(τ) to predict z_τ.
+- Combined: L = (1 - λ) * L_tf + λ * L_jump
 
-Key features matching original paper:
+Key features:
 - Optional layer normalization after each predictor step (normalize_reps)
 - Configurable loss type: "l1" (MAE), "l2" (MSE), or "huber" (smooth L1)
-- Cumulative action/state context for autoregressive rollout
-- TF-seeded initialization for rollout stability
+- RoPE-conditioned jump prediction replacing jump prediction
+- Stochastic target frame sampling for jump loss
 """
 
 import json
@@ -51,8 +51,8 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
     This module wraps the VisionTransformerPredictorAC and implements:
     - Teacher-forcing loss: predicts next latent from context, averaged over T steps
-    - Rollout loss: enforces consistency over multiple recurrent prediction steps
-    - Test Time Adaptation (TTA): online adaptation using rollout prediction error
+    - Jump prediction loss: predicts future frame z_τ from z₀ + a₀ via RoPE conditioning
+    - Test Time Adaptation (TTA): online adaptation using jump prediction error
 
     Inherits loss computation methods from ACPredictorLossMixin for code reuse
     with baseline models. TTAMixin provides TTA capabilities for test-time adaptation.
@@ -69,7 +69,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
     TTA Mode (enabled via tta_enabled=True):
         - Adapts LayerNorm parameters online during testing
-        - Uses single-step rollout loss as self-supervised signal
+        - Uses jump prediction loss as self-supervised signal
         - Per-clip reset restores original weights between clips
 
     Note: num_timesteps refers to the ENCODED temporal dimension of precomputed features,
@@ -97,10 +97,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         drop_path_rate: float = 0.0,
         # Loss settings
         T_teacher: int = 7,
-        T_rollout: int = 2,
-        context_frames: int = 1,  # Number of ground-truth context frames for rollout
+        jump_k: int = 3,
         loss_weight_teacher: float = 1.0,
-        loss_weight_rollout: float = 1.0,
+        loss_weight_jump: float = 1.0,
         normalize_reps: bool = True,
         loss_type: str = "l1",
         huber_delta: float = 1.0,
@@ -127,7 +126,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         tta_adaptation_horizon: int = 1,
         tta_optimizer_type: str = "adam",
         tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
-        tta_mode: str = "full_rollout",
+        tta_mode: str = "jump",
         tta_num_adaptation_steps: int = 1,
         tta_adapt_layers: str = "layernorm",  # Which layers to adapt
         **kwargs: Any,
@@ -174,10 +173,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         # Loss hyperparameters
         self.T_teacher = T_teacher
-        self.T_rollout = T_rollout
-        self.context_frames = context_frames
+        self.jump_k = jump_k
 
-        # Validate T_teacher and T_rollout against available timesteps
+        # Validate T_teacher and jump_k against available timesteps
         max_prediction_steps = num_timesteps - 1  # Need at least 1 context + 1 target
         if T_teacher > max_prediction_steps:
             warnings.warn(
@@ -186,15 +184,15 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 UserWarning,
                 stacklevel=2,
             )
-        if T_rollout > max_prediction_steps:
+        if jump_k > num_timesteps:
             warnings.warn(
-                f"T_rollout ({T_rollout}) exceeds available prediction steps ({max_prediction_steps}) "
-                f"for num_timesteps={num_timesteps}. Will be clamped to {max_prediction_steps} at runtime.",
+                f"jump_k ({jump_k}) exceeds num_timesteps ({num_timesteps}). "
+                f"Will be clamped at runtime.",
                 UserWarning,
                 stacklevel=2,
             )
         self.loss_weight_teacher = loss_weight_teacher
-        self.loss_weight_rollout = loss_weight_rollout
+        self.loss_weight_jump = loss_weight_jump
         self.normalize_reps = normalize_reps
 
         # Validate and store loss type
@@ -225,8 +223,8 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.grid_width = img_size[1] // patch_size
         self.patches_per_frame = self.grid_height * self.grid_width
 
-        # Curriculum learning: schedule for dynamic T_rollout and loss_weight_teacher
-        # Format: [{"epoch": 0, "T_rollout": 2, "loss_weight_teacher": 1.0}, ...]
+        # Curriculum learning: schedule for dynamic jump_k and loss weights
+        # Format: [{"epoch": 0, "jump_k": 3, "loss_weight_jump": 0.2}, ...]
         self.curriculum_schedule = curriculum_schedule
         if curriculum_schedule:
             self._validate_curriculum_schedule(curriculum_schedule)
@@ -241,16 +239,14 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         """Validate curriculum schedule format and values.
 
         Args:
-            schedule: List of dicts with keys: epoch, T_rollout (optional),
-                     loss_weight_teacher (optional), loss_weight_rollout (optional)
+            schedule: List of dicts with keys: epoch, jump_k (optional),
+                     loss_weight_teacher (optional), loss_weight_jump (optional)
 
         Raises:
             ValueError: If schedule is invalid
         """
         if not isinstance(schedule, Sequence) or isinstance(schedule, str) or len(schedule) == 0:
             raise ValueError("curriculum_schedule must be a non-empty list")
-
-        max_prediction_steps = self.num_timesteps - 1
 
         for i, phase in enumerate(schedule):
             if not isinstance(phase, Mapping):
@@ -260,12 +256,12 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             if not isinstance(phase["epoch"], int) or phase["epoch"] < 0:
                 raise ValueError(f"Phase {i} 'epoch' must be a non-negative integer")
 
-            # Validate T_rollout if present
-            if "T_rollout" in phase:
-                if phase["T_rollout"] > max_prediction_steps:
+            # Validate jump_k if present
+            if "jump_k" in phase:
+                if phase["jump_k"] > self.num_timesteps:
                     raise ValueError(
-                        f"Phase {i}: T_rollout ({phase['T_rollout']}) exceeds "
-                        f"max prediction steps ({max_prediction_steps})"
+                        f"Phase {i}: jump_k ({phase['jump_k']}) exceeds "
+                        f"num_timesteps ({self.num_timesteps})"
                     )
 
         # Ensure phases are sorted by epoch
@@ -282,7 +278,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             epoch: Current training epoch
 
         Returns:
-            Dict with T_rollout, loss_weight_teacher, loss_weight_rollout
+            Dict with jump_k, loss_weight_teacher, loss_weight_jump
         """
         if not self.curriculum_schedule:
             return {}
@@ -315,29 +311,29 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         # Track if anything changed for logging
         changes = []
 
-        if "T_rollout" in params and params["T_rollout"] != self.T_rollout:
-            old_val = self.T_rollout
-            self.T_rollout = params["T_rollout"]
-            changes.append(f"T_rollout: {old_val} → {self.T_rollout}")
+        if "jump_k" in params and params["jump_k"] != self.jump_k:
+            old_val = self.jump_k
+            self.jump_k = params["jump_k"]
+            changes.append(f"jump_k: {old_val} → {self.jump_k}")
 
         if "loss_weight_teacher" in params and params["loss_weight_teacher"] != self.loss_weight_teacher:
             old_val = self.loss_weight_teacher
             self.loss_weight_teacher = params["loss_weight_teacher"]
             changes.append(f"loss_weight_teacher: {old_val} → {self.loss_weight_teacher}")
 
-        if "loss_weight_rollout" in params and params["loss_weight_rollout"] != self.loss_weight_rollout:
-            old_val = self.loss_weight_rollout
-            self.loss_weight_rollout = params["loss_weight_rollout"]
-            changes.append(f"loss_weight_rollout: {old_val} → {self.loss_weight_rollout}")
+        if "loss_weight_jump" in params and params["loss_weight_jump"] != self.loss_weight_jump:
+            old_val = self.loss_weight_jump
+            self.loss_weight_jump = params["loss_weight_jump"]
+            changes.append(f"loss_weight_jump: {old_val} → {self.loss_weight_jump}")
 
         # Log changes
         if changes:
             self._log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
 
         # Log current curriculum state for tracking
-        self.log("curriculum/T_rollout", float(self.T_rollout), sync_dist=True)
+        self.log("curriculum/jump_k", float(self.jump_k), sync_dist=True)
         self.log("curriculum/loss_weight_teacher", self.loss_weight_teacher, sync_dist=True)
-        self.log("curriculum/loss_weight_rollout", self.loss_weight_rollout, sync_dist=True)
+        self.log("curriculum/loss_weight_jump", self.loss_weight_jump, sync_dist=True)
 
     def forward(
         self,
@@ -365,6 +361,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Single predictor step with optional layer normalization.
 
@@ -373,11 +370,13 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             actions: Actions [B, T, action_dim]
             states: States [B, T, action_dim]
             extrinsics: Optional extrinsics [B, T, action_dim-1]
+            target_timestep: Optional target frame index for jump prediction.
+                When set, RoPE positions are overridden to encode this target.
 
         Returns:
             Predicted features [B, T*N, D], optionally normalized
         """
-        z_pred = self.model(z, actions, states, extrinsics)
+        z_pred = self.model(z, actions, states, extrinsics, target_timestep=target_timestep)
         if self.normalize_reps:
             z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=DEFAULT_LAYER_NORM_EPS)
         return z_pred
@@ -385,8 +384,8 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     # Loss computation methods are inherited from ACPredictorLossMixin:
     # - _compute_loss
     # - _compute_teacher_forcing_loss
-    # - _compute_rollout_loss
-    # - _compute_rollout_loss_per_timestep
+    # - _compute_jump_loss
+    # - _compute_jump_loss_per_timestep
     # - _shared_step
 
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
@@ -400,7 +399,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     def _log_test_metrics(
         self,
         loss_teacher: Tensor,
-        loss_rollout: Tensor,
+        loss_jump: Tensor,
         loss: Tensor,
         per_timestep_losses: list[Tensor],
     ) -> None:
@@ -408,19 +407,22 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         Args:
             loss_teacher: Teacher-forcing loss
-            loss_rollout: Rollout loss
+            loss_jump: Jump prediction loss
             loss: Combined loss
             per_timestep_losses: Per-timestep loss breakdown
         """
         # Log aggregate metrics
         self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True)
         self.log("test/loss", loss, prog_bar=True, sync_dist=True)
 
-        # Log per-timestep losses
+        # Log per-timestep losses (target frames in the jump range)
+        T = self.num_timesteps
+        k = min(self.jump_k, T)
+        tau_min = T + 1 - k
         for step, step_loss in enumerate(per_timestep_losses):
-            predicted_frame = self.context_frames + step  # e.g., 3, 4, 5, 6
-            self.log(f"test/loss_step_{predicted_frame}", step_loss.mean(), sync_dist=True)
+            target_frame = tau_min + step
+            self.log(f"test/loss_jump_tau_{target_frame}", step_loss.mean(), sync_dist=True)
 
     def _store_test_results(
         self,
@@ -437,18 +439,21 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             clip_names: List of clip identifiers
             batch_idx: Batch index
             B: Batch size
-            per_sample_losses: Per-sample rollout losses
+            per_sample_losses: Per-sample jump prediction losses
             per_timestep_losses: Per-timestep losses
             loss_teacher: Teacher-forcing loss
         """
-        per_sample_rollout_losses = per_sample_losses[0]  # [B]
+        T = self.num_timesteps
+        k = min(self.jump_k, T)
+        tau_min = T + 1 - k
+        per_sample_jump_losses = per_sample_losses[0]  # [B]
         for i in range(B):
             clip_result: TestResultsDict = {
                 "clip_name": clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}",
-                "loss_rollout": per_sample_rollout_losses[i].item(),
+                "loss_jump": per_sample_jump_losses[i].item(),
                 "loss_teacher": loss_teacher.item(),  # Note: this is batch-level for teacher
                 "per_timestep_losses": {
-                    f"step_{self.context_frames + s}": per_timestep_losses[s][i].item()
+                    f"tau_{tau_min + s}": per_timestep_losses[s][i].item()
                     for s in range(len(per_timestep_losses))
                 },
             }
@@ -457,7 +462,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     def test_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         """Test step with detailed per-clip and per-timestep analysis.
 
-        Computes rollout losses with per-timestep breakdown and stores results
+        Computes jump losses with per-timestep breakdown and stores results
         for aggregation in on_test_epoch_end.
 
         If TTA is enabled (tta_enabled=True), performs online adaptation using
@@ -487,15 +492,15 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         # Compute teacher forcing loss (for comparison)
         loss_teacher = self._compute_teacher_forcing_loss(features, actions, states, extrinsics)
 
-        # Compute rollout loss with per-timestep breakdown
-        loss_rollout, per_timestep_losses, per_sample_losses = self._compute_rollout_loss_per_timestep(
+        # Compute jump prediction loss with per-timestep breakdown
+        loss_jump, per_timestep_losses, per_sample_losses = self._compute_jump_loss_per_timestep(
             features, actions, states, extrinsics
         )
 
         # Combined loss
-        loss = self.loss_weight_teacher * loss_teacher + self.loss_weight_rollout * loss_rollout
+        loss = self.loss_weight_teacher * loss_teacher + self.loss_weight_jump * loss_jump
 
-        self._log_test_metrics(loss_teacher, loss_rollout, loss, per_timestep_losses)
+        self._log_test_metrics(loss_teacher, loss_jump, loss, per_timestep_losses)
         self._store_test_results(
             clip_names, batch_idx, B, per_sample_losses, per_timestep_losses, loss_teacher
         )
@@ -525,16 +530,16 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             clip_name: Clip identifier
             batch_idx: Batch index for logging
             sample_idx: Sample index within batch
-            T_pred: Number of prediction steps
-            C: Context frames
+            T_pred: Number of target frames (jump_k)
+            C: Not used (kept for interface compat)
             N: Patches per frame
 
         Returns:
             Tuple of (sample_loss, per_step_losses, tta_stats)
         """
         # Process with TTA (from TTAMixin)
-        if self.tta_mode == "full_rollout":
-            predictions, targets, tta_stats = self._tta_process_clip_full_rollout(
+        if self.tta_mode == "jump":
+            predictions, targets, tta_stats = self._tta_process_clip_jump(
                 sample_features, sample_actions, sample_states, sample_extrinsics,
                 num_adaptation_steps=self.tta_num_adaptation_steps,
             )
@@ -572,7 +577,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             sample_idx: Sample index within batch
         """
         # Core per-clip metrics (logged every clip)
-        self.log("test/tta_loss_rollout", sample_loss, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+        self.log("test/tta_loss_jump", sample_loss, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
         self.log("test/tta_improvement", tta_stats.get("improvement", 0.0), on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
 
         # Track cumulative statistics for adaptation trend
@@ -619,8 +624,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             Combined loss tensor
         """
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames
-        T_pred = min(T_plus_1 - C, self.T_rollout)
+        T = T_plus_1 - 1
+        k = min(self.jump_k, T)
+        T_pred = k  # Number of target frames in jump range
 
         all_losses: list[float] = []
         all_per_timestep_losses: list[list[float]] = [[] for _ in range(T_pred)]
@@ -637,20 +643,20 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             # Process single sample with TTA
             sample_loss, per_step_losses, tta_stats = self._process_single_sample_tta(
                 sample_features, sample_actions, sample_states, sample_extrinsics,
-                clip_name, batch_idx, i, T_pred, C, N,
+                clip_name, batch_idx, i, T_pred, 0, N,
             )
 
             all_losses.append(sample_loss)
 
             # Collect per-timestep losses
-            for step, step_loss in per_step_losses.items():
-                step_idx = int(step.split("_")[1]) - C
-                all_per_timestep_losses[step_idx].append(step_loss)
+            for step_idx, (step_key, step_loss) in enumerate(per_step_losses.items()):
+                if step_idx < T_pred:
+                    all_per_timestep_losses[step_idx].append(step_loss)
 
             # Store result
             clip_result: TestResultsDict = {
                 "clip_name": clip_name,
-                "loss_rollout": sample_loss,
+                "loss_jump": sample_loss,
                 "loss_teacher": 0.0,  # Not computed in TTA mode
                 "per_timestep_losses": per_step_losses,
                 "tta_stats": tta_stats,
@@ -661,19 +667,20 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             self._log_tta_sample_metrics(sample_loss, tta_stats, batch_idx, i)
 
         # Compute batch-level metrics
-        loss_rollout = sum(all_losses) / len(all_losses)
+        loss_jump = sum(all_losses) / len(all_losses)
 
-        # Log metrics - only essential ones, remove tta_enabled/tta_mode noise
-        self.log("test/loss_rollout", loss_rollout, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("test/loss", loss_rollout, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        # Log metrics
+        self.log("test/loss_jump", loss_jump, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("test/loss", loss_jump, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
 
-        # Log per-timestep losses (epoch-level aggregation is fine for these)
+        # Log per-timestep losses
+        tau_min = T + 1 - k
         for step in range(T_pred):
             if all_per_timestep_losses[step]:
                 step_mean = sum(all_per_timestep_losses[step]) / len(all_per_timestep_losses[step])
-                self.log(f"test/loss_step_{C + step + 1}", step_mean, on_step=False, on_epoch=True, sync_dist=True)
+                self.log(f"test/loss_jump_tau_{tau_min + step}", step_mean, on_step=False, on_epoch=True, sync_dist=True)
 
-        return torch.tensor(loss_rollout, device=features.device)
+        return torch.tensor(loss_jump, device=features.device)
 
     def on_test_epoch_start(self) -> None:
         """Clear test results and configure TTA at the start of test epoch."""
@@ -709,14 +716,14 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             Dictionary containing mean, median, std, min, max, and per-timestep stats
         """
         num_clips = len(self._test_results)
-        rollout_losses = [r["loss_rollout"] for r in self._test_results]
+        jump_losses = [r["loss_jump"] for r in self._test_results]
 
-        mean_loss = sum(rollout_losses) / num_clips
-        sorted_losses = sorted(rollout_losses)
+        mean_loss = sum(jump_losses) / num_clips
+        sorted_losses = sorted(jump_losses)
         median_loss = sorted_losses[num_clips // 2]
-        min_loss = min(rollout_losses)
-        max_loss = max(rollout_losses)
-        std_loss = (sum((x - mean_loss) ** 2 for x in rollout_losses) / num_clips) ** 0.5
+        min_loss = min(jump_losses)
+        max_loss = max(jump_losses)
+        std_loss = (sum((x - mean_loss) ** 2 for x in jump_losses) / num_clips) ** 0.5
 
         # Compute per-timestep statistics
         num_timesteps = len(self._test_results[0]["per_timestep_losses"])
@@ -730,8 +737,8 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             }
 
         # Find worst-performing and best-performing clips
-        worst_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"], reverse=True)[:NUM_WORST_CLIPS]
-        best_clips = sorted(self._test_results, key=lambda x: x["loss_rollout"])[:NUM_BEST_CLIPS]
+        worst_clips = sorted(self._test_results, key=lambda x: x["loss_jump"], reverse=True)[:NUM_WORST_CLIPS]
+        best_clips = sorted(self._test_results, key=lambda x: x["loss_jump"])[:NUM_BEST_CLIPS]
 
         return {
             "num_clips": num_clips,
@@ -766,30 +773,30 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         print("=" * 70)
         print(f"\n📊 AGGREGATE STATISTICS (over {num_clips} clips)")
         print("-" * 50)
-        print(f"  Rollout Loss (L1):")
+        print(f"  Jump Prediction Loss ({self.loss_type}):")
         print(f"    Mean:   {mean_loss:.6f}")
         print(f"    Median: {median_loss:.6f}")
         print(f"    Std:    {std_loss:.6f}")
         print(f"    Min:    {min_loss:.6f}")
         print(f"    Max:    {max_loss:.6f}")
 
-        print(f"\n📈 PER-TIMESTEP BREAKDOWN (Context: {self.context_frames} frames)")
+        print(f"\n📈 PER-TARGET-FRAME BREAKDOWN (jump_k={self.jump_k})")
         print("-" * 50)
-        print(f"  {'Frame':<10} {'Mean Loss':<12} {'Min':<12} {'Max':<12}")
+        print(f"  {'Target τ':<10} {'Mean Loss':<12} {'Min':<12} {'Max':<12}")
         print(f"  {'-'*10} {'-'*12} {'-'*12} {'-'*12}")
         for step_key, step_stats in per_timestep_stats.items():
-            frame_num = step_key.replace("step_", "z_")
-            print(f"  {frame_num:<10} {step_stats['mean']:<12.6f} {step_stats['min']:<12.6f} {step_stats['max']:<12.6f}")
+            frame_label = step_key.replace("tau_", "z_")
+            print(f"  {frame_label:<10} {step_stats['mean']:<12.6f} {step_stats['min']:<12.6f} {step_stats['max']:<12.6f}")
 
         print(f"\n🔴 WORST-PERFORMING CLIPS (top {NUM_WORST_CLIPS})")
         print("-" * 50)
         for i, clip in enumerate(worst_clips, 1):
-            print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
+            print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_jump']:.6f}")
 
         print(f"\n🟢 BEST-PERFORMING CLIPS (top {NUM_BEST_CLIPS})")
         print("-" * 50)
         for i, clip in enumerate(best_clips, 1):
-            print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}")
+            print(f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_jump']:.6f}")
 
         # Print TTA statistics if enabled
         if self.tta_enabled:
@@ -826,10 +833,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         export_data = {
             "summary": {
                 "num_clips": stats["num_clips"],
-                "context_frames": self.context_frames,
-                "T_rollout": self.T_rollout,
+                "jump_k": self.jump_k,
                 "tta_enabled": self.tta_enabled,
-                "rollout_loss": {
+                "jump_loss": {
                     "mean": stats["mean_loss"],
                     "median": stats["median_loss"],
                     "std": stats["std_loss"],
@@ -878,8 +884,8 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self._print_test_summary(stats)
 
         # Log final metrics
-        self.log("test/final_mean_loss_rollout", stats["mean_loss"], sync_dist=True)
-        self.log("test/final_median_loss_rollout", stats["median_loss"], sync_dist=True)
+        self.log("test/final_mean_loss_jump", stats["mean_loss"], sync_dist=True)
+        self.log("test/final_median_loss_jump", stats["median_loss"], sync_dist=True)
 
         # Export to JSON
         output_dir = Path(self.trainer.log_dir) if self.trainer and self.trainer.log_dir else Path(".")

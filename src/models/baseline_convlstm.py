@@ -33,10 +33,9 @@ DEFAULT_KERNEL_SIZE: Final = 3
 DEFAULT_INPUT_DIM: Final = 1024
 DEFAULT_NUM_TIMESTEPS: Final = 8
 DEFAULT_T_TEACHER: Final = 7
-DEFAULT_T_ROLLOUT: Final = 7
-DEFAULT_CONTEXT_FRAMES: Final = 1
+DEFAULT_JUMP_K: Final = 7
 DEFAULT_LOSS_WEIGHT_TEACHER: Final = 1.0
-DEFAULT_LOSS_WEIGHT_ROLLOUT: Final = 1.0
+DEFAULT_LOSS_WEIGHT_JUMP: Final = 1.0
 DEFAULT_LOSS_TYPE: Final = "l1"
 DEFAULT_HUBER_DELTA: Final = 1.0
 DEFAULT_LEARNING_RATE: Final = 4.25e-4
@@ -217,7 +216,7 @@ class ConvLSTMBaseline(nn.Module):
 
         This method handles both:
         1. Teacher-forcing: full sequence input, parallel prediction
-        2. Single-step: for autoregressive rollout
+        2. Single-step: for jump prediction
 
         Args:
             z: Context features [B, T*N, D] where N = spatial_size^2, D = input_dim
@@ -316,10 +315,9 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         num_timesteps: int = DEFAULT_NUM_TIMESTEPS,
         # Loss settings (same as ACPredictorModule)
         T_teacher: int = DEFAULT_T_TEACHER,
-        T_rollout: int = DEFAULT_T_ROLLOUT,
-        context_frames: int = DEFAULT_CONTEXT_FRAMES,
+        jump_k: int = DEFAULT_JUMP_K,
         loss_weight_teacher: float = DEFAULT_LOSS_WEIGHT_TEACHER,
-        loss_weight_rollout: float = DEFAULT_LOSS_WEIGHT_ROLLOUT,
+        loss_weight_jump: float = DEFAULT_LOSS_WEIGHT_JUMP,
         normalize_reps: bool = True,
         loss_type: str = DEFAULT_LOSS_TYPE,
         huber_delta: float = DEFAULT_HUBER_DELTA,
@@ -355,10 +353,9 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
 
         # Loss hyperparameters (required by mixin)
         self.T_teacher = T_teacher
-        self.T_rollout = T_rollout
-        self.context_frames = context_frames
+        self.jump_k = jump_k
         self.loss_weight_teacher = loss_weight_teacher
-        self.loss_weight_rollout = loss_weight_rollout
+        self.loss_weight_jump = loss_weight_jump
         self.normalize_reps = normalize_reps
 
         # Validate and store loss type
@@ -404,8 +401,6 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         ):
             raise ValueError("curriculum_schedule must be a non-empty list")
 
-        max_prediction_steps = self.num_timesteps - 1
-
         for i, phase in enumerate(schedule):
             if not isinstance(phase, Mapping):
                 raise ValueError(f"Phase {i} must be a dict, got {type(phase)}")
@@ -416,10 +411,10 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
                     f"Phase {i} 'epoch' must be a non-negative integer"
                 )
 
-            if "T_rollout" in phase and phase["T_rollout"] > max_prediction_steps:
+            if "jump_k" in phase and phase["jump_k"] > self.num_timesteps:
                 raise ValueError(
-                    f"Phase {i}: T_rollout ({phase['T_rollout']}) exceeds "
-                    f"max prediction steps ({max_prediction_steps})"
+                    f"Phase {i}: jump_k ({phase['jump_k']}) exceeds "
+                    f"num_timesteps ({self.num_timesteps})"
                 )
 
         epochs = [p["epoch"] for p in schedule]
@@ -456,10 +451,10 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
 
         changes = []
 
-        if "T_rollout" in params and params["T_rollout"] != self.T_rollout:
-            old_val = self.T_rollout
-            self.T_rollout = int(params["T_rollout"])
-            changes.append(f"T_rollout: {old_val} → {self.T_rollout}")
+        if "jump_k" in params and params["jump_k"] != self.jump_k:
+            old_val = self.jump_k
+            self.jump_k = int(params["jump_k"])
+            changes.append(f"jump_k: {old_val} → {self.jump_k}")
 
         if (
             "loss_weight_teacher" in params
@@ -470,22 +465,22 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
             changes.append(f"loss_weight_teacher: {old_val} → {self.loss_weight_teacher}")
 
         if (
-            "loss_weight_rollout" in params
-            and params["loss_weight_rollout"] != self.loss_weight_rollout
+            "loss_weight_jump" in params
+            and params["loss_weight_jump"] != self.loss_weight_jump
         ):
-            old_val = self.loss_weight_rollout
-            self.loss_weight_rollout = float(params["loss_weight_rollout"])
-            changes.append(f"loss_weight_rollout: {old_val} → {self.loss_weight_rollout}")
+            old_val = self.loss_weight_jump
+            self.loss_weight_jump = float(params["loss_weight_jump"])
+            changes.append(f"loss_weight_jump: {old_val} → {self.loss_weight_jump}")
 
         if changes:
             log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
 
-        self.log("curriculum/T_rollout", float(self.T_rollout), sync_dist=True)
+        self.log("curriculum/jump_k", float(self.jump_k), sync_dist=True)
         self.log(
             "curriculum/loss_weight_teacher", self.loss_weight_teacher, sync_dist=True
         )
         self.log(
-            "curriculum/loss_weight_rollout", self.loss_weight_rollout, sync_dist=True
+            "curriculum/loss_weight_jump", self.loss_weight_jump, sync_dist=True
         )
 
     def forward(
@@ -514,16 +509,20 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Single predictor step with optional layer normalization.
 
         Required by ACPredictorLossMixin.
+        Note: target_timestep is accepted for interface compatibility but
+        ignored by ConvLSTM (no RoPE).
 
         Args:
             z: Input features [B, T*N, D]
             actions: Actions [B, T, action_dim]
             states: States [B, T, action_dim]
             extrinsics: Optional extrinsics
+            target_timestep: Ignored (no RoPE in ConvLSTM)
 
         Returns:
             Predicted features [B, T*N, D], optionally normalized
@@ -536,8 +535,8 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
     # Loss methods are inherited from ACPredictorLossMixin:
     # - _compute_loss
     # - _compute_teacher_forcing_loss
-    # - _compute_rollout_loss
-    # - _compute_rollout_loss_per_timestep
+    # - _compute_jump_loss
+    # - _compute_jump_loss_per_timestep
     # - _shared_step
 
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
@@ -570,35 +569,41 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         loss_teacher = self._compute_teacher_forcing_loss(
             features, actions, states, extrinsics
         )
-        loss_rollout, per_timestep_losses, per_sample_losses = (
-            self._compute_rollout_loss_per_timestep(
+        loss_jump, per_timestep_losses, per_sample_losses = (
+            self._compute_jump_loss_per_timestep(
                 features, actions, states, extrinsics
             )
         )
 
         loss = (
             self.loss_weight_teacher * loss_teacher
-            + self.loss_weight_rollout * loss_rollout
+            + self.loss_weight_jump * loss_jump
         )
 
         # Log metrics
         self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True)
         self.log("test/loss", loss, prog_bar=True, sync_dist=True)
 
         for step, step_loss in enumerate(per_timestep_losses):
-            predicted_frame = self.context_frames + step
-            self.log(f"test/loss_step_{predicted_frame}", step_loss.mean(), sync_dist=True)
+            T = self.num_timesteps
+            k = min(self.jump_k, T)
+            tau_min = T + 1 - k
+            target_frame = tau_min + step
+            self.log(f"test/loss_jump_tau_{target_frame}", step_loss.mean(), sync_dist=True)
 
         # Store per-clip results
-        per_sample_rollout_losses = per_sample_losses[0]
+        per_sample_jump_losses = per_sample_losses[0]
+        T = self.num_timesteps
+        k = min(self.jump_k, T)
+        tau_min = T + 1 - k
         for i in range(B):
             clip_result = {
                 "clip_name": clip_names[i] if i < len(clip_names) else f"unknown_{batch_idx}_{i}",
-                "loss_rollout": per_sample_rollout_losses[i].item(),
+                "loss_jump": per_sample_jump_losses[i].item(),
                 "loss_teacher": loss_teacher.item(),
                 "per_timestep_losses": {
-                    f"step_{self.context_frames + s}": per_timestep_losses[s][i].item()
+                    f"tau_{tau_min + s}": per_timestep_losses[s][i].item()
                     for s in range(len(per_timestep_losses))
                 },
             }
@@ -617,21 +622,21 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
             return
 
         num_clips = len(self._test_results)
-        rollout_losses = [r["loss_rollout"] for r in self._test_results]
+        jump_losses = [r["loss_jump"] for r in self._test_results]
 
-        mean_loss = sum(rollout_losses) / num_clips
-        sorted_losses = sorted(rollout_losses)
+        mean_loss = sum(jump_losses) / num_clips
+        sorted_losses = sorted(jump_losses)
         median_loss = sorted_losses[num_clips // 2]
-        min_loss = min(rollout_losses)
-        max_loss = max(rollout_losses)
-        std_loss = (sum((x - mean_loss) ** 2 for x in rollout_losses) / num_clips) ** 0.5
+        min_loss = min(jump_losses)
+        max_loss = max(jump_losses)
+        std_loss = (sum((x - mean_loss) ** 2 for x in jump_losses) / num_clips) ** 0.5
 
         print("\n" + "=" * 70)
         print("            BASELINE TEST RESULTS SUMMARY")
         print("=" * 70)
         print(f"\n📊 AGGREGATE STATISTICS (over {num_clips} clips)")
         print("-" * 50)
-        print(f"  Rollout Loss (L1):")
+        print(f"  Jump Prediction Loss ({self.loss_type}):")
         print(f"    Mean:   {mean_loss:.6f}")
         print(f"    Median: {median_loss:.6f}")
         print(f"    Std:    {std_loss:.6f}")
@@ -639,8 +644,8 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         print(f"    Max:    {max_loss:.6f}")
         print("=" * 70)
 
-        self.log("test/final_mean_loss_rollout", mean_loss, sync_dist=True)
-        self.log("test/final_median_loss_rollout", median_loss, sync_dist=True)
+        self.log("test/final_mean_loss_jump", mean_loss, sync_dist=True)
+        self.log("test/final_median_loss_jump", median_loss, sync_dist=True)
 
     def configure_optimizers(self) -> dict:
         """Configure optimizer and learning rate scheduler.

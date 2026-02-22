@@ -191,6 +191,7 @@ class HOPEBlock(nn.Module):
         H: int | None = None,
         W: int | None = None,
         action_tokens: int = 0,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Forward pass through the HOPE block.
 
@@ -206,13 +207,14 @@ class HOPEBlock(nn.Module):
             H: Grid height (patches).
             W: Grid width (patches).
             action_tokens: Number of conditioning tokens per frame (usually 2).
+            target_timestep: Target frame index for jump prediction.
 
         Returns:
             [B, N_total, D] output tokens.
         """
         # ─── Phase A: Self-Modifying Titan ───
         y = self.norm1(x)
-        y = self._titan_forward(y, T=T, H=H, W=W, action_tokens=action_tokens)
+        y = self._titan_forward(y, T=T, H=H, W=W, action_tokens=action_tokens, target_timestep=target_timestep)
         x = x + self.drop_path(y)
 
         # ─── Phase B: CMS ───
@@ -229,6 +231,7 @@ class HOPEBlock(nn.Module):
         H: int | None = None,
         W: int | None = None,
         action_tokens: int = 0,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Phase A: Self-Modifying Titan with optional 3D RoPE and chunking.
 
@@ -259,7 +262,7 @@ class HOPEBlock(nn.Module):
         # If no chunking or T is unknown, process all tokens at once
         if chunk_size <= 0 or T is None or chunk_size >= T:
             return self._titan_forward_chunk(
-                x, T=T, H=H, W=W, action_tokens=action_tokens
+                x, T=T, H=H, W=W, action_tokens=action_tokens, target_timestep=target_timestep
             )
 
         # ─── Chunk-wise processing along temporal dimension ───
@@ -279,7 +282,7 @@ class HOPEBlock(nn.Module):
 
             # Process chunk with current memory state
             out_chunk = self._titan_forward_chunk(
-                x_chunk, T=chunk_T, H=H, W=W, action_tokens=action_tokens
+                x_chunk, T=chunk_T, H=H, W=W, action_tokens=action_tokens, target_timestep=target_timestep
             )
             output_chunks.append(out_chunk)
 
@@ -293,6 +296,7 @@ class HOPEBlock(nn.Module):
         H: int | None = None,
         W: int | None = None,
         action_tokens: int = 0,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Process a single chunk through the Titan memory.
 
@@ -326,7 +330,7 @@ class HOPEBlock(nn.Module):
 
         # Step 2: Optional 3D RoPE on Q and K (Criticism §2: configurable)
         if self.config.use_rope and T is not None and H is not None and W is not None:
-            q, k = self._apply_rope(q, k, T, H, W, action_tokens)
+            q, k = self._apply_rope(q, k, T, H, W, action_tokens, target_timestep=target_timestep)
 
         # Step 3: Retrieve from main memory
         output = self.M_memory(q)  # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
@@ -362,6 +366,7 @@ class HOPEBlock(nn.Module):
         H: int,
         W: int,
         action_tokens: int,
+        target_timestep: int | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Apply 3D RoPE rotation to Q and K tensors.
 
@@ -379,6 +384,7 @@ class HOPEBlock(nn.Module):
             H: Grid height.
             W: Grid width.
             action_tokens: Number of conditioning tokens per frame.
+            target_timestep: Target frame index for jump prediction.
 
         Returns:
             Tuple of rotated (q, k), each [B, N_total, D].
@@ -408,13 +414,20 @@ class HOPEBlock(nn.Module):
             k_act = k_act.view(B, T * action_tokens, num_heads, head_dim).transpose(1, 2)
 
             # Temporal positions for action tokens
-            act_time_pos = (
-                torch.arange(T, device=q.device)
-                .unsqueeze(1)
-                .expand(T, action_tokens)
-                .reshape(-1)
-                .float()
-            )
+            if target_timestep is not None:
+                act_time_pos = (
+                    torch.full((T, action_tokens), target_timestep - 1, device=q.device)
+                    .reshape(-1)
+                    .float()
+                )
+            else:
+                act_time_pos = (
+                    torch.arange(T, device=q.device)
+                    .unsqueeze(1)
+                    .expand(T, action_tokens)
+                    .reshape(-1)
+                    .float()
+                )
 
             # Rotate only depth dimension for action tokens
             qd_act = rotate_queries_or_keys(q_act[..., : self.d_dim], pos=act_time_pos)
@@ -436,7 +449,15 @@ class HOPEBlock(nn.Module):
             k_frame = k
 
         # Compute 3D positions for frame tokens
-        frame_ids = torch.arange(T * H * W, device=q.device)
+        if target_timestep is not None:
+            # Jump prediction: all tokens at temporal position (target_timestep - 1)
+            base_spatial = torch.arange(H * W, device=q.device)
+            frame_ids = (target_timestep - 1) * H * W + base_spatial
+            # Repeat for T timesteps (T should be 1 in jump mode but handle gracefully)
+            if T > 1:
+                frame_ids = frame_ids.repeat(T)
+        else:
+            frame_ids = torch.arange(T * H * W, device=q.device)
         tokens_per_frame = H * W
         d_pos = (frame_ids // tokens_per_frame).float()
         h_pos = ((frame_ids % tokens_per_frame) // W).float()

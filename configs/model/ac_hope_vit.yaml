@@ -89,10 +89,9 @@ model:
 
   # ─── Loss settings (same as AC predictor for comparability) ───
   T_teacher: 7                   # Teacher-forcing prediction steps
-  T_rollout: 2                   # Rollout prediction steps
-  context_frames: 1              # Ground-truth context frames for rollout
+  jump_k: 3                   # Number of candidate jump targets
   loss_weight_teacher: 1.0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
   normalize_reps: true            # Layer norm after predictor steps (V-JEPA2 paper)
   loss_type: "l1"                   # "l1" (MAE), "l2" (MSE), or "huber"
   huber_delta: 1.0                  # Delta for Huber loss (only used when loss_type="huber")

@@ -5,7 +5,7 @@ Tests cover:
 2. Loss computation correctness
 3. Numerical stability guards
 4. Edge cases (single timestep, batch size 1)
-5. Rollout logic with shape assertions
+5. Jump prediction logic with shape assertions
 """
 
 import pytest
@@ -35,8 +35,8 @@ class TestACPredictorModule:
             use_rope=True,
             is_frame_causal=True,
             T_teacher=7,
-            T_rollout=2,
-            context_frames=1,
+            jump_k=2,
+
             loss_type="l1",
             normalize_reps=True,
         )
@@ -61,7 +61,7 @@ class TestACPredictorModule:
         assert default_module is not None
         assert default_module.model is not None
         assert default_module.T_teacher == 7
-        assert default_module.T_rollout == 2
+        assert default_module.jump_k == 2
         assert default_module.loss_type == "l1"
 
     def test_loss_type_validation_invalid(self):
@@ -136,9 +136,9 @@ class TestACPredictorModule:
         assert not torch.isinf(loss), "Loss should not be infinite"
         assert loss >= 0, "Loss should be non-negative"
 
-    def test_rollout_loss_runs(self, default_module, sample_batch):
-        """Test that rollout loss can be computed."""
-        loss = default_module._compute_rollout_loss(
+    def test_jump_loss_runs(self, default_module, sample_batch):
+        """Test that jump loss can be computed."""
+        loss = default_module._compute_jump_loss(
             sample_batch["features"],
             sample_batch["actions"],
             sample_batch["states"],
@@ -181,8 +181,8 @@ class TestACPredictorModule:
             num_timesteps=2,
             depth=1,
             T_teacher=1,
-            T_rollout=1,
-            context_frames=1,
+            jump_k=1,
+
         )
 
         B, T_plus_1, N, D = 2, 2, 256, 768
@@ -248,23 +248,23 @@ class TestNumericalStability:
         assert not torch.isnan(result).any(), "LayerNorm should not produce NaN for zero input"
 
 
-class TestRolloutLogic:
-    """Tests for autoregressive rollout logic."""
+class TestJumpPredictionLogic:
+    """Tests for stochastic jump prediction logic."""
 
     @pytest.fixture
-    def module_for_rollout(self):
-        """Create module configured for rollout testing."""
+    def module_for_jump(self):
+        """Create module configured for jump prediction testing."""
         return ACPredictorModule(
             num_timesteps=8,
             depth=1,  # Minimal depth for speed
             T_teacher=7,
-            T_rollout=3,
-            context_frames=2,
+            jump_k=3,
+
             normalize_reps=True,
         )
 
-    def test_rollout_context_frames_respected(self, module_for_rollout):
-        """Test that rollout uses correct number of context frames."""
+    def test_jump_loss_runs(self, module_for_jump):
+        """Test that jump loss can be computed."""
         B, T_plus_1, N, D = 2, 8, 256, 768
         action_dim = 7
 
@@ -275,7 +275,7 @@ class TestRolloutLogic:
         }
 
         # This should run without errors
-        loss = module_for_rollout._compute_rollout_loss(
+        loss = module_for_jump._compute_jump_loss(
             batch["features"],
             batch["actions"],
             batch["states"],
@@ -283,13 +283,13 @@ class TestRolloutLogic:
 
         assert not torch.isnan(loss)
 
-    def test_rollout_with_extrinsics(self):
-        """Test rollout with optional extrinsics."""
+    def test_jump_with_extrinsics(self):
+        """Test jump prediction with optional extrinsics."""
         module = ACPredictorModule(
             num_timesteps=8,
             depth=1,
-            T_rollout=2,
-            context_frames=1,
+            jump_k=2,
+
             use_extrinsics=True,
         )
 
@@ -303,7 +303,7 @@ class TestRolloutLogic:
             "extrinsics": torch.randn(B, T_plus_1 - 1, action_dim - 1),
         }
 
-        loss = module._compute_rollout_loss(
+        loss = module._compute_jump_loss(
             batch["features"],
             batch["actions"],
             batch["states"],
@@ -319,15 +319,15 @@ class TestCurriculumLearning:
     def test_valid_curriculum_schedule(self):
         """Test that valid curriculum schedule is accepted."""
         schedule = [
-            {"epoch": 0, "T_rollout": 1, "loss_weight_teacher": 1.0},
-            {"epoch": 10, "T_rollout": 2, "loss_weight_teacher": 0.5},
-            {"epoch": 20, "T_rollout": 3, "loss_weight_teacher": 0.0},
+            {"epoch": 0, "jump_k": 1, "loss_weight_teacher": 1.0},
+            {"epoch": 10, "jump_k": 2, "loss_weight_teacher": 0.5},
+            {"epoch": 20, "jump_k": 3, "loss_weight_teacher": 0.0},
         ]
 
         module = ACPredictorModule(
             num_timesteps=8,
             depth=1,
-            T_rollout=1,
+            jump_k=1,
             curriculum_schedule=schedule,
         )
 
@@ -336,7 +336,7 @@ class TestCurriculumLearning:
     def test_curriculum_schedule_missing_epoch_raises(self):
         """Test that schedule without 'epoch' key raises error."""
         schedule = [
-            {"T_rollout": 1},  # Missing 'epoch'
+            {"jump_k": 1},  # Missing 'epoch'
         ]
 
         with pytest.raises(ValueError, match="must have 'epoch' key"):
@@ -349,8 +349,8 @@ class TestCurriculumLearning:
     def test_curriculum_schedule_unsorted_raises(self):
         """Test that unsorted schedule raises error."""
         schedule = [
-            {"epoch": 10, "T_rollout": 2},
-            {"epoch": 0, "T_rollout": 1},  # Out of order
+            {"epoch": 10, "jump_k": 2},
+            {"epoch": 0, "jump_k": 1},  # Out of order
         ]
 
         with pytest.raises(ValueError, match="must be sorted by epoch"):

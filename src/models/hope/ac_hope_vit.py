@@ -288,6 +288,7 @@ class ACHOPEViT(nn.Module):
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Forward pass through AC-HOPE-ViT predictor.
 
@@ -298,6 +299,7 @@ class ACHOPEViT(nn.Module):
             actions: Action sequences [B, T, action_dim].
             states: State sequences [B, T, action_dim].
             extrinsics: Optional extrinsic parameters [B, T, action_dim-1].
+            target_timestep: Target frame index for jump prediction.
 
         Returns:
             Predicted features [B, T*N, D].
@@ -342,7 +344,7 @@ class ACHOPEViT(nn.Module):
         attn_mask = self._prepare_attention_mask(x)
 
         # ─── Stage 2: HOPE Backbone ───
-        x = self._process_hope_blocks(x, attn_mask, T, cond_tokens)
+        x = self._process_hope_blocks(x, attn_mask, T, cond_tokens, target_timestep=target_timestep)
 
         # ─── Stage 3: Decode ───
         x = self._decode_output(x, B, T, D, cond_tokens)
@@ -401,7 +403,8 @@ class ACHOPEViT(nn.Module):
         ).clone()
 
     def _process_hope_blocks(
-        self, x: Tensor, attn_mask: Tensor, T: int, cond_tokens: int
+        self, x: Tensor, attn_mask: Tensor, T: int, cond_tokens: int,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Process tokens through HOPE backbone blocks.
 
@@ -410,6 +413,7 @@ class ACHOPEViT(nn.Module):
             attn_mask: Attention mask.
             T: Number of timesteps.
             cond_tokens: Number of conditioning tokens.
+            target_timestep: Target frame index for jump prediction.
 
         Returns:
             Processed tokens after all HOPE blocks.
@@ -427,6 +431,7 @@ class ACHOPEViT(nn.Module):
                     self.grid_height,
                     self.grid_width,
                     cond_tokens,
+                    target_timestep,
                     use_reentrant=False,
                 )
             else:
@@ -438,6 +443,7 @@ class ACHOPEViT(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    target_timestep=target_timestep,
                 )
             log.debug(
                 f"    [AC_HOPE_ViT] Block {i} output: shape={x.shape}, "

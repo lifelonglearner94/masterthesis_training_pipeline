@@ -54,8 +54,7 @@ data:
 # =============================================================================
 model:
   # --- Rollout configuration for testing ---
-  T_rollout: 7                     # Predict 7 timesteps autoregressively (z₁→z₇)
-  context_frames: 1                # Use 1 ground-truth context frame (z₀)
+  jump_k: 7                     # Number of candidate jump targets (τ sampled from last k frames)
   T_teacher: 7                     # Teacher forcing for comparison
   use_activation_checkpointing: false
 
@@ -64,7 +63,7 @@ model:
 
   # --- Loss weights (for test metrics) ---
   loss_weight_teacher: 0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
 
   # --- Curriculum disabled for testing ---
   curriculum_schedule: null

@@ -2,6 +2,13 @@
 
 Provides reusable loss computation methods for both the ViT AC Predictor
 and baseline models, ensuring scientific comparability.
+
+Loss formulations:
+- Teacher-Forcing: L_tf — single forward pass with full context, predicts next frame.
+- Jump Prediction: L_jump — single forward pass from z₀ + a₀ directly to z_τ,
+  where τ is sampled uniformly from the last k frames. RoPE encodes the target
+  position so the model knows which frame to predict.
+- Combined: L = (1 - λ) * L_tf + λ * L_jump  (λ ramps up via curriculum)
 """
 
 import logging
@@ -26,13 +33,15 @@ class ACPredictorLossMixin:
         - loss_type: str - Loss function type: "l1", "l2", or "huber"
         - huber_delta: float - Delta parameter for Huber loss (only used when loss_type="huber")
         - T_teacher: int - Number of teacher-forcing steps
-        - T_rollout: int - Number of rollout prediction steps
-        - context_frames: int - Number of ground-truth context frames for rollout
+        - jump_k: int - Number of candidate target frames for jump prediction
         - patches_per_frame: int - Number of patches (tokens) per frame (N = H*W)
+        - num_timesteps: int - Total encoded timesteps (T)
 
     The inheriting class must also implement:
-        - _step_predictor(z, actions, states, extrinsics) -> Tensor
-            Forward pass through the model with optional normalization
+        - _step_predictor(z, actions, states, extrinsics, target_timestep=None) -> Tensor
+            Forward pass through the model with optional normalization.
+            When target_timestep is provided, RoPE positions are overridden
+            for jump prediction.
     """
 
     # Type hints for expected attributes (set by inheriting class)
@@ -40,11 +49,11 @@ class ACPredictorLossMixin:
     loss_type: str
     huber_delta: float
     T_teacher: int
-    T_rollout: int
-    context_frames: int
+    jump_k: int
     patches_per_frame: int
+    num_timesteps: int
     loss_weight_teacher: float
-    loss_weight_rollout: float
+    loss_weight_jump: float
 
     def _compute_loss(
         self,
@@ -137,71 +146,51 @@ class ACPredictorLossMixin:
         logger.debug(
             f"  [TEACHER FORCING] Context features reshaped to: {context_features.shape}"
         )
-        logger.debug(
-            f"  [TEACHER FORCING] Context stats: min={context_features.min().item():.6f}, "
-            f"max={context_features.max().item():.6f}, mean={context_features.mean().item():.6f}"
-        )
 
         # Apply layer norm to input if enabled (matching paper)
         if self.normalize_reps:
             context_features = F.layer_norm(
                 context_features, (context_features.size(-1),), eps=1e-6
             )
-            logger.debug(
-                f"  [TEACHER FORCING] After LayerNorm: min={context_features.min().item():.6f}, "
-                f"max={context_features.max().item():.6f}, mean={context_features.mean().item():.6f}"
-            )
 
         # Actions/states for T steps
         context_actions = actions[:, :T, :]
         context_states = states[:, :T, :]
         context_extrinsics = extrinsics[:, :T, :] if extrinsics is not None else None
-        logger.debug(
-            f"  [TEACHER FORCING] Actions shape: {context_actions.shape}, "
-            f"States shape: {context_states.shape}"
-        )
 
-        # Single forward pass - predicts all T frames
-        logger.debug("  [TEACHER FORCING] >>> Calling predictor forward pass >>>")
+        # Single forward pass - predicts all T frames (no target_timestep override)
         z_tf = self._step_predictor(
             context_features, context_actions, context_states, context_extrinsics
-        )
-        logger.debug(
-            f"  [TEACHER FORCING] <<< Predictor output: shape={z_tf.shape}, "
-            f"min={z_tf.min().item():.6f}, max={z_tf.max().item():.6f}, "
-            f"mean={z_tf.mean().item():.6f}"
         )
 
         # Target: frames 1 to T (shifted by one from context)
         # Shape: [B, T*N, D]
         target = features[:, 1 : T + 1, :, :].reshape(B, T * N, D)
-        logger.debug(f"  [TEACHER FORCING] Target features: shape={target.shape}")
         if self.normalize_reps:
             target = F.layer_norm(target, (target.size(-1),), eps=1e-6)
-            logger.debug(
-                f"  [TEACHER FORCING] Target after LayerNorm: "
-                f"min={target.min().item():.6f}, max={target.max().item():.6f}"
-            )
 
-        logger.debug("  [TEACHER FORCING] Computing loss between prediction and target...")
         return self._compute_loss(z_tf, target)
 
-    def _compute_rollout_loss(
+    def _compute_jump_loss(
         self,
         features: Tensor,
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> Tensor:
-        """Compute rollout loss with fixed context frames.
+        """Compute stochastic jump prediction loss.
 
-        Autoregressive rollout seeded with `context_frames` ground-truth frames,
-        then predicts `T_rollout` steps autoregressively.
+        Instead of jump prediction, the model directly predicts a
+        randomly chosen future frame τ from the initial state z₀ and action a₀.
+        The target frame position is communicated via 3D RoPE conditioning.
 
-        Example with context_frames=3, T_rollout=5:
-            - Context: z_0, z_1, z_2 (ground-truth)
-            - Predict: z_3, z_4, z_5, z_6, z_7 (autoregressive)
-            - Loss computed on predictions vs ground-truth frames 3-7
+        Samples τ uniformly from the last ``jump_k`` frames of the sequence:
+            τ ∈ {T+1-k, T+1-k+1, ..., T}  (indices into features tensor)
+
+        For T=8, k=3: τ ∈ {6, 7, 8}
+
+        The loss is:
+            L_jump = E_τ [ || P(z₀, a₀, p_τ) - z_τ ||₁ ]
 
         Args:
             features: [B, T+1, N, D] - Features for T+1 frames
@@ -213,82 +202,50 @@ class ACPredictorLossMixin:
             Scalar loss tensor
         """
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames  # Number of ground-truth context frames
-        T_pred = min(T_plus_1 - C, self.T_rollout)  # Number of steps to predict
-        logger.debug(f"  [ROLLOUT] Input: B={B}, T+1={T_plus_1}, N={N}, D={D}")
+        T = T_plus_1 - 1  # Number of encoded timesteps (e.g. 8)
+        k = min(self.jump_k, T)  # Clamp k to available frames
+
+        # Sample target timestep τ uniformly from last k frames
+        # τ ranges from (T+1-k) to T inclusive (0-indexed into features tensor)
+        tau_min = T + 1 - k  # e.g. 6 for T=8, k=3
+        tau = torch.randint(tau_min, T + 1, (1,), device=features.device).item()
         logger.debug(
-            f"  [ROLLOUT] Context frames C={C}, Prediction steps T_pred={T_pred}"
+            f"  [JUMP] Sampled τ={tau} from [{tau_min}, {T}], k={k}"
         )
 
-        # Normalize ground-truth features if enabled
+        # Normalize features if enabled
         h = features
         if self.normalize_reps:
             h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(
                 B, T_plus_1, N, D
             )
-            logger.debug("  [ROLLOUT] Features normalized")
 
-        # Step 1: Initialize with C ground-truth context frames
-        # z_ar contains frames 0, 1, ..., C-1
-        z_ar = h[:, :C, :, :].reshape(B, C * N, D)  # [B, C*N, D]
-        logger.debug(f"  [ROLLOUT] Initial context z_ar shape: {z_ar.shape}")
+        # Input: z₀ (frame 0) with a₀, s₀
+        z_0 = h[:, 0:1, :, :].reshape(B, 1 * N, D)  # [B, N, D]
+        a_0 = actions[:, 0:1, :]  # [B, 1, action_dim]
+        s_0 = states[:, 0:1, :]  # [B, 1, action_dim]
+        ext_0 = extrinsics[:, 0:1, :] if extrinsics is not None else None
 
-        # Step 2: Autoregressive rollout for T_pred steps
-        # First prediction is frame C, using actions/states 0 to C-1
-        for step in range(T_pred):
-            logger.debug(f"  [ROLLOUT] >>> Autoregressive step {step+1}/{T_pred} >>>")
-            # Current prediction target is frame (C + step)
-            # Use actions/states from 0 to (C + step - 1)
-            num_action_steps = C + step
-            ar_actions = actions[:, :num_action_steps, :]
-            ar_states = states[:, :num_action_steps, :]
-            ar_extrinsics = (
-                extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
-            )
-            logger.debug(
-                f"  [ROLLOUT] Step {step+1}: Using {num_action_steps} action steps, "
-                f"z_ar shape: {z_ar.shape}"
-            )
+        # Forward pass with target_timestep conditioning via RoPE
+        z_pred = self._step_predictor(z_0, a_0, s_0, ext_0, target_timestep=tau)
 
-            # Predict next frame using full context
-            z_nxt = self._step_predictor(z_ar, ar_actions, ar_states, ar_extrinsics)
-            logger.debug(
-                f"  [ROLLOUT] Step {step+1}: Predictor output shape: {z_nxt.shape}"
-            )
-            # Extract only the last frame prediction
-            z_nxt = z_nxt[:, -N:, :]  # [B, N, D]
-            logger.debug(
-                f"  [ROLLOUT] Step {step+1}: Extracted last frame: shape={z_nxt.shape}, "
-                f"mean={z_nxt.mean().item():.6f}"
-            )
+        # Target: ground-truth features at frame τ
+        target = h[:, tau, :, :].reshape(B, N, D)  # [B, N, D]
 
-            # Append to autoregressive context
-            z_ar = torch.cat([z_ar, z_nxt], dim=1)  # [B, (C+step+1)*N, D]
-            logger.debug(f"  [ROLLOUT] Step {step+1}: Updated z_ar shape: {z_ar.shape}")
+        # z_pred has shape [B, N, D] (single frame output)
+        return self._compute_loss(z_pred, target)
 
-        # Step 3: Compare autoregressive predictions with targets
-        # z_ar[:, C*N:] contains predictions for frames C, C+1, ..., C+T_pred-1
-        # Target: h[:, C:C+T_pred] contains ground-truth for same frames
-        z_ar_pred = z_ar[:, C * N :]  # [B, T_pred*N, D]
-        target = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)  # [B, T_pred*N, D]
-        logger.debug(
-            f"  [ROLLOUT] Final prediction shape: {z_ar_pred.shape}, "
-            f"target shape: {target.shape}"
-        )
-        logger.debug("  [ROLLOUT] Computing rollout loss...")
-
-        return self._compute_loss(z_ar_pred, target)
-
-    def _compute_rollout_loss_per_timestep(
+    def _compute_jump_loss_per_timestep(
         self,
         features: Tensor,
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> tuple[Tensor, list[Tensor], list[Tensor]]:
-        """Compute rollout loss with per-timestep breakdown for detailed analysis.
+        """Compute jump prediction loss with per-timestep breakdown for analysis.
 
-        Same as _compute_rollout_loss, but returns per-timestep losses for analysis.
+        Evaluates the model at each possible target frame in the jump range
+        {T+1-k, ..., T} and returns per-timestep and per-sample losses.
 
         Args:
             features: [B, T+1, N, D] - Features for T+1 frames
@@ -298,79 +255,65 @@ class ACPredictorLossMixin:
 
         Returns:
             Tuple of:
-                - total_loss: Scalar loss tensor (average over all timesteps)
-                - per_timestep_losses: List of [B] tensors, one per predicted timestep
-                - per_sample_losses: List of [B] tensors with per-sample total rollout loss
+                - total_loss: Scalar loss tensor (average over all target frames)
+                - per_timestep_losses: List of [B] tensors, one per target frame
+                - per_sample_losses: List of [B] tensors with per-sample average loss
         """
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames  # Number of ground-truth context frames
-        T_pred = min(T_plus_1 - C, self.T_rollout)  # Number of steps to predict
+        T = T_plus_1 - 1
+        k = min(self.jump_k, T)
+        tau_min = T + 1 - k
 
-        # Normalize ground-truth features if enabled
+        # Normalize features if enabled
         h = features
         if self.normalize_reps:
             h = F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(
                 B, T_plus_1, N, D
             )
 
-        # Initialize with C ground-truth context frames
-        z_ar = h[:, :C, :, :].reshape(B, C * N, D)  # [B, C*N, D]
+        # Input: z₀ with a₀, s₀
+        z_0 = h[:, 0:1, :, :].reshape(B, 1 * N, D)
+        a_0 = actions[:, 0:1, :]
+        s_0 = states[:, 0:1, :]
+        ext_0 = extrinsics[:, 0:1, :] if extrinsics is not None else None
 
-        # Store per-timestep predictions
-        predictions_per_step: list[Tensor] = []
-
-        # Autoregressive rollout for T_pred steps
-        for step in range(T_pred):
-            num_action_steps = C + step
-            ar_actions = actions[:, :num_action_steps, :]
-            ar_states = states[:, :num_action_steps, :]
-            ar_extrinsics = (
-                extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
-            )
-
-            # Predict next frame
-            z_nxt = self._step_predictor(z_ar, ar_actions, ar_states, ar_extrinsics)
-            z_nxt = z_nxt[:, -N:, :]  # [B, N, D] - last frame only
-
-            predictions_per_step.append(z_nxt)
-
-            # Append to autoregressive context
-            z_ar = torch.cat([z_ar, z_nxt], dim=1)
-
-        # Compute per-timestep losses
         per_timestep_losses: list[Tensor] = []
         per_sample_total_losses = torch.zeros(B, device=features.device)
 
-        for step, pred in enumerate(predictions_per_step):
-            # Target for this step: frame C + step
-            target_frame = h[:, C + step, :, :]  # [B, N, D]
+        for tau in range(tau_min, T + 1):
+            # Forward pass with target_timestep conditioning
+            z_pred = self._step_predictor(z_0, a_0, s_0, ext_0, target_timestep=tau)
 
-            # Per-sample loss for this timestep using configured loss type
+            # Target: ground-truth at frame τ
+            target_frame = h[:, tau, :, :]  # [B, N, D]
+
+            # Per-sample loss for this target frame
             if self.loss_type == "l1":
-                per_sample_loss = torch.abs(pred - target_frame).mean(dim=(1, 2))  # [B]
+                per_sample_loss = torch.abs(z_pred - target_frame).mean(dim=(1, 2))
             elif self.loss_type == "l2":
-                per_sample_loss = ((pred - target_frame) ** 2).mean(dim=(1, 2))  # [B]
+                per_sample_loss = ((z_pred - target_frame) ** 2).mean(dim=(1, 2))
             elif self.loss_type == "huber":
-                # Huber per-sample: use reduction='none' then average over (N, D)
                 per_sample_loss = F.huber_loss(
-                    pred, target_frame, delta=self.huber_delta, reduction="none"
-                ).mean(dim=(1, 2))  # [B]
+                    z_pred, target_frame, delta=self.huber_delta, reduction="none"
+                ).mean(dim=(1, 2))
             else:
                 raise ValueError(f"Unknown loss_type '{self.loss_type}'")
 
             per_timestep_losses.append(per_sample_loss)
             per_sample_total_losses += per_sample_loss
 
-        # Average per-sample losses across timesteps
-        per_sample_total_losses = per_sample_total_losses / T_pred
-
-        # Total loss (scalar)
+        # Average across target frames
+        per_sample_total_losses = per_sample_total_losses / k
         total_loss = per_sample_total_losses.mean()
 
         return total_loss, per_timestep_losses, [per_sample_total_losses]
 
     def _shared_step(self, batch: dict[str, Tensor], stage: str) -> Tensor:
         """Shared step for training and validation.
+
+        Computes combined teacher-forcing + jump prediction loss:
+            L = (1 - λ) * L_teacher + λ * L_jump
+        where λ = loss_weight_jump (controlled by curriculum schedule).
 
         Args:
             batch: Dictionary containing:
@@ -391,9 +334,6 @@ class ACPredictorLossMixin:
         logger.debug(f"\n{'='*60}")
         logger.debug(f"[SHARED STEP] Stage: {stage}")
         logger.debug(f"[SHARED STEP] Input features shape: {features.shape}")
-        logger.debug(
-            f"[SHARED STEP] Actions shape: {actions.shape}, States shape: {states.shape}"
-        )
 
         # Reshape features if needed: [B, (T+1)*N, D] -> [B, T+1, N, D]
         if features.dim() == 3:
@@ -403,37 +343,31 @@ class ACPredictorLossMixin:
             logger.debug(f"[SHARED STEP] Reshaped features to: {features.shape}")
 
         logger.debug("\n--- COMPUTING TEACHER FORCING LOSS ---")
-        # Compute losses
         loss_teacher = self._compute_teacher_forcing_loss(
             features, actions, states, extrinsics
         )
         logger.debug(f"[SHARED STEP] Teacher forcing loss: {loss_teacher.item():.8f}")
 
-        logger.debug("\n--- COMPUTING ROLLOUT LOSS ---")
-        loss_rollout = self._compute_rollout_loss(
+        logger.debug("\n--- COMPUTING JUMP PREDICTION LOSS ---")
+        loss_jump = self._compute_jump_loss(
             features, actions, states, extrinsics
         )
-        logger.debug(f"[SHARED STEP] Rollout loss: {loss_rollout.item():.8f}")
+        logger.debug(f"[SHARED STEP] Jump prediction loss: {loss_jump.item():.8f}")
 
         # Combined loss
         loss = (
             self.loss_weight_teacher * loss_teacher
-            + self.loss_weight_rollout * loss_rollout
-        )
-        logger.debug("\n--- COMBINED LOSS ---")
-        logger.debug(
-            f"[SHARED STEP] weight_teacher={self.loss_weight_teacher}, "
-            f"weight_rollout={self.loss_weight_rollout}"
+            + self.loss_weight_jump * loss_jump
         )
         logger.debug(
             f"[SHARED STEP] Combined loss = {self.loss_weight_teacher} * "
-            f"{loss_teacher.item():.8f} + {self.loss_weight_rollout} * "
-            f"{loss_rollout.item():.8f} = {loss.item():.8f}"
+            f"{loss_teacher.item():.8f} + {self.loss_weight_jump} * "
+            f"{loss_jump.item():.8f} = {loss.item():.8f}"
         )
 
-        # Log metrics - using self.log which is expected to be provided by LightningModule
+        # Log metrics
         self.log(f"{stage}/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
-        self.log(f"{stage}/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
+        self.log(f"{stage}/loss_jump", loss_jump, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
         self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
 
         return loss

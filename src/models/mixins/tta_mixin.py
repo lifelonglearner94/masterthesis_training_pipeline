@@ -31,8 +31,8 @@ class TTAMixin:
 
     This mixin expects the following attributes from the inheriting class:
         - model: nn.Module - The predictor model
-        - context_frames: int - Number of ground-truth context frames
-        - T_rollout: int - Number of rollout steps
+        - jump_k: int - Number of candidate jump targets
+        - num_timesteps: int - Total number of timesteps T (features has T+1 frames)
         - patches_per_frame: int - Number of patches per frame
         - normalize_reps: bool - Whether to normalize representations
         - loss_type: str - Loss function type: "l1", "l2", or "huber"
@@ -48,8 +48,8 @@ class TTAMixin:
 
     # Type hints for expected attributes from inheriting class
     model: nn.Module
-    context_frames: int
-    T_rollout: int
+    jump_k: int
+    num_timesteps: int
     patches_per_frame: int
     normalize_reps: bool
     loss_type: str
@@ -82,7 +82,7 @@ class TTAMixin:
         tta_adaptation_horizon: int = 1,
         tta_optimizer_type: str = "adam",
         tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
-        tta_mode: str = "full_rollout",
+        tta_mode: str = "jump",
         tta_num_adaptation_steps: int = 1,
         tta_adapt_layers: str = "layernorm",
     ) -> None:
@@ -95,10 +95,10 @@ class TTAMixin:
             tta_lr: Learning rate for TTA updates.
             tta_grad_clip: Maximum gradient norm for clipping.
             tta_reset_per_clip: Whether to reset model state per clip.
-            tta_adaptation_horizon: Number of steps for adaptation (deprecated, use T_rollout).
+            tta_adaptation_horizon: Number of steps for adaptation.
             tta_optimizer_type: Type of optimizer ("adam" or "adamw").
             tta_optimizer_betas: Beta parameters for Adam.
-            tta_mode: TTA mode - "full_rollout" (recommended) or "sequential".
+            tta_mode: TTA mode - "jump" (recommended) or "sequential".
             tta_num_adaptation_steps: Number of TTA update iterations per clip.
             tta_adapt_layers: Which layers to adapt during TTA. Options:
                 - "layernorm": Only LayerNorm γ and β (default, ~0.1% params).
@@ -408,7 +408,7 @@ class TTAMixin:
         self._tta_clip_stats["grad_norm_after_clip"] = grad_norm_after
         self._tta_clip_stats["param_delta_norm"] = param_delta_norm
 
-    def _tta_full_rollout(
+    def _tta_jump_prediction(
         self,
         features: Tensor,
         actions: Tensor,
@@ -416,7 +416,10 @@ class TTAMixin:
         extrinsics: Tensor | None = None,
         detach: bool = False,
     ) -> tuple[Tensor, Tensor]:
-        """Perform full autoregressive rollout.
+        """Perform jump predictions for all target timesteps in the jump range.
+
+        For each τ in {T+1-k, ..., T}, predicts z_τ directly from z₀ + a₀
+        using RoPE conditioning on the target timestep.
 
         Args:
             features: [B, T+1, N, D] - Full sequence features.
@@ -427,31 +430,40 @@ class TTAMixin:
 
         Returns:
             Tuple of (predictions, targets) where:
-                - predictions: [B, T_pred*N, D] - Autoregressive predictions.
-                - targets: [B, T_pred*N, D] - Ground-truth targets.
+                - predictions: [B, k*N, D] - Jump predictions for all τ.
+                - targets: [B, k*N, D] - Ground-truth targets for all τ.
         """
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames
-        T_pred = min(T_plus_1 - C, self.T_rollout)
+        T = T_plus_1 - 1
 
         h = self._normalize_features(features, B, T_plus_1, N, D)
 
-        z_ar = h[:, :C, :, :].reshape(B, C * N, D)
+        # Initial state: first frame
+        z_input = h[:, :1, :, :].reshape(B, N, D)
+
         predictions_list = []
+        targets_list = []
 
-        for step in range(T_pred):
-            num_action_steps = C + step
-            step_actions = actions[:, :num_action_steps, :]
-            step_states = states[:, :num_action_steps, :]
-            step_extrinsics = extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
+        tau_min = T + 1 - self.jump_k
+        tau_max = T
 
-            z_pred_full = self._step_predictor(z_ar, step_actions, step_states, step_extrinsics)  # type: ignore[attr-defined]
+        for tau in range(tau_min, tau_max + 1):
+            # Single action/state for initial step
+            step_actions = actions[:, :1, :]
+            step_states = states[:, :1, :]
+            step_extrinsics = extrinsics[:, :1, :] if extrinsics is not None else None
+
+            z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
+                z_input, step_actions, step_states, step_extrinsics,
+                target_timestep=tau,
+            )
             z_pred = z_pred_full[:, -N:, :]
+
             predictions_list.append(z_pred)
-            z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
+            targets_list.append(h[:, tau, :, :].reshape(B, N, D))
 
         predictions = torch.cat(predictions_list, dim=1)
-        targets = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)
+        targets = torch.cat(targets_list, dim=1)
 
         if detach:
             predictions = predictions.detach()
@@ -471,7 +483,7 @@ class TTAMixin:
             return F.layer_norm(features.reshape(B, -1, D), (D,), eps=1e-6).reshape(B, T_plus_1, N, D)
         return features
 
-    def _tta_process_clip_full_rollout(
+    def _tta_process_clip_jump(
         self,
         features: Tensor,
         actions: Tensor,
@@ -479,11 +491,11 @@ class TTAMixin:
         extrinsics: Tensor | None = None,
         num_adaptation_steps: int = 1,
     ) -> tuple[Tensor, Tensor, dict[str, Any]]:
-        """Process a clip with full-rollout TTA adaptation.
+        """Process a clip with jump-prediction TTA adaptation.
 
         This is the recommended TTA approach:
-        1. Perform full autoregressive rollout (z₁→z₇).
-        2. Compute rollout loss against ground-truth.
+        1. For each τ in {T+1-k, ..., T}, jump-predict z_τ from z₀ + a₀.
+        2. Compute jump loss against ground-truth.
         3. Update LayerNorm parameters.
         4. (Optionally repeat for multiple adaptation steps).
         5. Evaluate with adapted model.
@@ -510,7 +522,7 @@ class TTAMixin:
         use_cpu_for_tta = str(original_device).startswith("mps")
 
         with torch.no_grad():
-            pre_adapt_pred, targets = self._tta_full_rollout(
+            pre_adapt_pred, targets = self._tta_jump_prediction(
                 features, actions, states, extrinsics, detach=True
             )
             pre_adapt_loss = self._compute_loss(pre_adapt_pred, targets).item()
@@ -536,7 +548,7 @@ class TTAMixin:
                 for _ in range(num_adaptation_steps):
                     prev_ln_states = self._tta_set_ln_train_mode(True)
                     try:
-                        predictions, targets_tta = self._tta_full_rollout(
+                        predictions, targets_tta = self._tta_jump_prediction(
                             features_for_tta,
                             actions_for_tta,
                             states_for_tta,
@@ -552,7 +564,7 @@ class TTAMixin:
                     self._tta_optimizer = self._tta_create_optimizer()
 
         with torch.no_grad():
-            final_predictions, targets = self._tta_full_rollout(
+            final_predictions, targets = self._tta_jump_prediction(
                 features, actions, states, extrinsics, detach=True
             )
             post_adapt_loss = self._compute_loss(final_predictions, targets).item()
@@ -572,13 +584,13 @@ class TTAMixin:
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Any]]:
-        """Process a clip with sequential TTA adaptation.
+        """Process a clip with sequential jump-based TTA adaptation.
 
-        Implements the look-back adaptation scheme where we:
-        1. Predict next frame.
-        2. Wait for ground-truth.
-        3. Adapt.
-        4. Predict next frame with updated model.
+        Implements a sequential adaptation scheme where for each target τ:
+        1. Jump-predict z_τ from z₀.
+        2. Compare with ground-truth z_τ.
+        3. Adapt LayerNorm parameters.
+        4. Jump-predict next τ with updated model.
 
         Args:
             features: [B, T+1, N, D] - Full sequence features.
@@ -590,8 +602,9 @@ class TTAMixin:
             Tuple of (adapted_predictions, targets, stats).
         """
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames
-        T_pred = min(T_plus_1 - C, self.T_rollout)
+        T = T_plus_1 - 1
+        tau_min = T + 1 - self.jump_k
+        tau_max = T
 
         if self.tta_reset_per_clip:
             self._tta_reset_for_clip()
@@ -614,7 +627,7 @@ class TTAMixin:
         )
 
         try:
-            predictions, targets = self._run_sequential_adaptation(
+            predictions, targets = self._run_sequential_jump_adaptation(
                 mps_result.features,
                 mps_result.actions,
                 mps_result.states,
@@ -623,8 +636,8 @@ class TTAMixin:
                 T_plus_1,
                 N,
                 D,
-                C,
-                T_pred,
+                tau_min,
+                tau_max,
             )
         finally:
             if mps_result.use_fallback and mps_result.original_device is not None:
@@ -687,7 +700,7 @@ class TTAMixin:
             extrinsics=extrinsics_for_tta.to("cpu") if extrinsics_for_tta is not None else None,
         )
 
-    def _run_sequential_adaptation(
+    def _run_sequential_jump_adaptation(
         self,
         features: Tensor,
         actions: Tensor,
@@ -697,44 +710,54 @@ class TTAMixin:
         T_plus_1: int,
         N: int,
         D: int,
-        C: int,
-        T_pred: int,
+        tau_min: int,
+        tau_max: int,
     ) -> tuple[Tensor, Tensor]:
-        """Run sequential adaptation loop."""
+        """Run sequential jump adaptation loop.
+
+        For each τ in [tau_min, tau_max], jump-predicts z_τ from z₀,
+        then adapts using the previous prediction's ground truth.
+        """
         h = self._normalize_features(features, B, T_plus_1, N, D)
-        z_ar = h[:, :C, :, :].reshape(B, C * N, D)
+        z_input = h[:, :1, :, :].reshape(B, N, D)
+
         predictions_list = []
+        targets_list = []
         prev_pred = None
+        prev_target = None
 
-        for step in range(T_pred):
-            target_idx = C + step
-            num_action_steps = C + step
+        for tau in range(tau_min, tau_max + 1):
+            target = h[:, tau, :, :].reshape(B, N, D)
 
-            step_actions = actions[:, :num_action_steps, :]
-            step_states = states[:, :num_action_steps, :]
-            step_extrinsics = extrinsics[:, :num_action_steps, :] if extrinsics is not None else None
-
-            if prev_pred is not None and step > 0:
-                prev_target = h[:, target_idx - 1, :, :]
+            # Adapt using previous jump prediction vs ground truth
+            if prev_pred is not None and prev_target is not None:
                 self._tta_adapt(prev_pred, prev_target)
+
+            step_actions = actions[:, :1, :]
+            step_states = states[:, :1, :]
+            step_extrinsics = extrinsics[:, :1, :] if extrinsics is not None else None
 
             prev_ln_states = self._tta_set_ln_train_mode(True)
             try:
-                z_pred_full = self._step_predictor(z_ar, step_actions, step_states, step_extrinsics)  # type: ignore[attr-defined]
+                z_pred_full = self._step_predictor(  # type: ignore[attr-defined]
+                    z_input, step_actions, step_states, step_extrinsics,
+                    target_timestep=tau,
+                )
                 z_pred = z_pred_full[:, -N:, :]
             finally:
                 self._tta_restore_ln_train_mode(prev_ln_states)
 
             prev_pred = z_pred
+            prev_target = target
             predictions_list.append(z_pred.detach())
-            z_ar = torch.cat([z_ar, z_pred.detach()], dim=1)
+            targets_list.append(target)
 
-        if prev_pred is not None and T_pred > 0:
-            final_target = h[:, C + T_pred - 1, :, :]
-            self._tta_adapt(prev_pred, final_target)
+        # Adapt on final prediction
+        if prev_pred is not None and prev_target is not None:
+            self._tta_adapt(prev_pred, prev_target)
 
         predictions = torch.cat(predictions_list, dim=1)
-        targets = h[:, C : C + T_pred, :, :].reshape(B, T_pred * N, D)
+        targets = torch.cat(targets_list, dim=1)
 
         return predictions, targets
 

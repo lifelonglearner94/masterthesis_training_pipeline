@@ -36,10 +36,9 @@ model:
 
   # Loss settings (max T_teacher = num_timesteps - 1 = 7)
   T_teacher: 7  # Teacher-forcing prediction steps
-  T_rollout: 7  # Rollout prediction steps (autoregressive)
-  context_frames: 1  # Number of ground-truth context frames for rollout
+  jump_k: 3  # Number of candidate jump targets
   loss_weight_teacher: 0.0  # Disable teacher forcing during TTA testing
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
   normalize_reps: true  # Apply layer norm after predictor steps (V-JEPA2 paper)
   loss_type: "l1"  # Loss function: "l1" (MAE), "l2" (MSE), or "huber"
   huber_delta: 1.0  # Delta for Huber loss (only used when loss_type="huber")
@@ -58,15 +57,15 @@ model:
   # TEST TIME ADAPTATION (TTA) SETTINGS
   # =============================================================================
   # TTA adapts only LayerNorm parameters online during testing
-  # Uses full rollout loss as self-supervised signal
+  # Uses full jump loss as self-supervised signal
 
   # Enable TTA for online adaptation
   tta_enabled: true
 
   # TTA MODE: How adaptation is performed
-  # - "full_rollout" (RECOMMENDED): Predict full sequence z₁→z₇, compute loss, adapt, then evaluate
+  # - "jump" (RECOMMENDED): Predict full sequence z₁→z₇, compute loss, adapt, then evaluate
   # - "sequential": Step-by-step look-back adaptation (original TENT-style)
-  tta_mode: "full_rollout"
+  tta_mode: "jump"
 
   # Number of TTA update iterations per clip
   # 1 = single adaptation pass (recommended for stability)
@@ -87,7 +86,7 @@ model:
   # false: Accumulate adaptations across all clips (experimental)
   tta_reset_per_clip: true
 
-  # Adaptation horizon (deprecated in full_rollout mode)
+  # Adaptation horizon (deprecated in jump mode)
   tta_adaptation_horizon: 1
 
   # Optimizer type for TTA

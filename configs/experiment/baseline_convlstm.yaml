@@ -7,10 +7,10 @@
 # This experiment is designed to be a fair baseline comparison to vjepa2_ac.yaml.
 # It uses the SAME:
 #   - Data pipeline (precomputed V-JEPA2 features)
-#   - Loss functions (L1 teacher-forcing + rollout)
+#   - Loss functions (L1 teacher-forcing + jump)
 #   - Curriculum schedule (progressive teacher weight reduction)
 #   - Training settings (batch size, optimizer, LR schedule)
-#   - Evaluation protocol (T_rollout=7, context_frames=1)
+#   - Evaluation protocol (jump_k=7, jump_k=7)
 #
 # The ONLY difference is the model architecture:
 #   - vjepa2_ac.yaml: 24-layer ViT with RoPE attention (~43M params)
@@ -68,19 +68,18 @@ model:
 
   # --- Loss settings (SAME as vjepa2_ac.yaml) ---
   T_teacher: 7                     # Teacher-forcing prediction steps
-  T_rollout: 7                     # Autoregressive prediction steps
-  context_frames: 1                # Ground-truth context frame (z₀)
+  jump_k: 7                     # Number of candidate jump targets
 
   # --- Loss weights (SAME as vjepa2_ac.yaml) ---
   loss_weight_teacher: 1.0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
 
   # --- Loss function (SAME as vjepa2_ac.yaml for fair comparison) ---
   loss_type: "l2"
   # huber_delta: 1.0  # Uncomment when loss_type="huber"
 
   # --- Curriculum Learning Schedule (SAME as vjepa2_ac.yaml) ---
-  # Progressively reduces teacher-forcing weight, shifting focus to rollout
+  # Progressively reduces teacher-forcing weight, shifting focus to jump
   curriculum_schedule:
     - epoch: 0
       loss_weight_teacher: 1.0

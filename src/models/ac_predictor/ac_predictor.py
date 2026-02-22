@@ -161,6 +161,7 @@ class VisionTransformerPredictorAC(nn.Module):
         actions: torch.Tensor,
         states: torch.Tensor,
         extrinsics: torch.Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> torch.Tensor:
         """Forward pass through the AC predictor.
 
@@ -169,6 +170,9 @@ class VisionTransformerPredictorAC(nn.Module):
             actions: Action sequences [B, T, action_dim]
             states: State sequences [B, T, action_dim]
             extrinsics: Optional extrinsic parameters [B, T, action_dim-1]
+            target_timestep: Target frame index for jump prediction (0-indexed
+                into the features tensor). When set, RoPE temporal positions
+                are overridden so the output predicts frame ``target_timestep``.
 
         Returns:
             Predicted features [B, T*N, D]
@@ -257,6 +261,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    target_timestep=target_timestep,
                     use_reentrant=False,
                 )
             else:
@@ -268,6 +273,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    target_timestep=target_timestep,
                 )
             logger.debug(
                 f"    [AC_PREDICTOR] Block {i} output: shape={x.shape}, "

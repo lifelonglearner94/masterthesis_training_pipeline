@@ -1,7 +1,7 @@
 """Lightning Module for the AC-HOPE-ViT architecture.
 
 Wraps ACHOPEViT with the same training / evaluation pipeline as ACPredictorModule:
-    - Teacher-forcing + rollout losses (via ACPredictorLossMixin)
+    - Teacher-forcing + jump prediction losses (via ACPredictorLossMixin)
     - Test Time Adaptation (via TTAMixin)
     - Curriculum learning schedule
     - Iteration-based LR scheduler (V-JEPA2 paper)
@@ -55,7 +55,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     Transformer blocks.
 
     Inherits:
-        - ACPredictorLossMixin: teacher-forcing + rollout loss computation
+        - ACPredictorLossMixin: teacher-forcing + jump prediction loss computation
         - TTAMixin: test-time adaptation with LayerNorm parameter tuning
 
     Args:
@@ -103,10 +103,9 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         aux_loss_weight: float = 0.1,
         # Loss settings (same as ACPredictorModule)
         T_teacher: int = 7,
-        T_rollout: int = 2,
-        context_frames: int = 1,
+        jump_k: int = 3,
         loss_weight_teacher: float = 1.0,
-        loss_weight_rollout: float = 1.0,
+        loss_weight_jump: float = 1.0,
         normalize_reps: bool = True,
         loss_type: str = "l1",
         huber_delta: float = 1.0,
@@ -131,7 +130,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         tta_adaptation_horizon: int = 1,
         tta_optimizer_type: str = "adam",
         tta_optimizer_betas: tuple[float, float] = (0.9, 0.999),
-        tta_mode: str = "full_rollout",
+        tta_mode: str = "jump",
         tta_num_adaptation_steps: int = 1,
         tta_adapt_layers: str = "layernorm",
         **kwargs: Any,
@@ -182,13 +181,12 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         )
 
         self.T_teacher = T_teacher
-        self.T_rollout = T_rollout
-        self.context_frames = context_frames
+        self.jump_k = jump_k
 
-        self._validate_temporal_dimensions(T_teacher, T_rollout)
+        self._validate_temporal_dimensions(T_teacher, jump_k)
 
         self.loss_weight_teacher = loss_weight_teacher
-        self.loss_weight_rollout = loss_weight_rollout
+        self.loss_weight_jump = loss_weight_jump
         self.normalize_reps = normalize_reps
 
         # Validate and store loss type
@@ -229,7 +227,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         self._test_results: list[TestResultsDict] = []
 
-    def _validate_temporal_dimensions(self, T_teacher: int, T_rollout: int) -> None:
+    def _validate_temporal_dimensions(self, T_teacher: int, jump_k: int) -> None:
         """Validate that temporal dimensions are within bounds."""
         max_prediction_steps = self.num_timesteps - 1
 
@@ -240,10 +238,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 UserWarning,
                 stacklevel=2,
             )
-        if T_rollout > max_prediction_steps:
+        if jump_k > self.num_timesteps:
             warnings.warn(
-                f"T_rollout ({T_rollout}) exceeds available prediction steps "
-                f"({max_prediction_steps}). Will be clamped at runtime.",
+                f"jump_k ({jump_k}) exceeds num_timesteps ({self.num_timesteps}). "
+                f"Will be clamped at runtime.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -266,9 +264,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         actions: Tensor,
         states: Tensor,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Single predictor step with optional layer normalization."""
-        z_pred = self.model(z, actions, states, extrinsics)
+        z_pred = self.model(z, actions, states, extrinsics, target_timestep=target_timestep)
         if self.normalize_reps:
             z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=self.LAYER_NORM_EPS)
         return z_pred
@@ -333,29 +332,32 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         loss_teacher = self._compute_teacher_forcing_loss(
             features, actions, states, extrinsics
         )
-        loss_rollout, per_timestep_losses, per_sample_losses = (
-            self._compute_rollout_loss_per_timestep(
+        loss_jump, per_timestep_losses, per_sample_losses = (
+            self._compute_jump_loss_per_timestep(
                 features, actions, states, extrinsics
             )
         )
         loss = (
             self.loss_weight_teacher * loss_teacher
-            + self.loss_weight_rollout * loss_rollout
+            + self.loss_weight_jump * loss_jump
         )
 
         self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_rollout", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True)
         self.log("test/loss", loss, prog_bar=True, sync_dist=True)
 
+        T = self.num_timesteps
+        k = min(self.jump_k, T)
+        tau_min = T + 1 - k
         for step, step_loss in enumerate(per_timestep_losses):
-            predicted_frame = self.context_frames + step
+            target_frame = tau_min + step
             self.log(
-                f"test/loss_step_{predicted_frame}",
+                f"test/loss_jump_tau_{target_frame}",
                 step_loss.mean(),
                 sync_dist=True,
             )
 
-        per_sample_rollout_losses = per_sample_losses[0]
+        per_sample_jump_losses = per_sample_losses[0]
         for i in range(B):
             clip_result: TestResultsDict = {
                 "clip_name": (
@@ -363,10 +365,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                     if i < len(clip_names)
                     else f"unknown_{batch_idx}_{i}"
                 ),
-                "loss_rollout": per_sample_rollout_losses[i].item(),
+                "loss_jump": per_sample_jump_losses[i].item(),
                 "loss_teacher": loss_teacher.item(),
                 "per_timestep_losses": {
-                    f"step_{self.context_frames + s}": per_timestep_losses[s][i].item()
+                    f"tau_{tau_min + s}": per_timestep_losses[s][i].item()
                     for s in range(len(per_timestep_losses))
                 },
             }
@@ -385,8 +387,9 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     ) -> Tensor:
         """Test step with TTA — mirrors ACPredictorModule implementation."""
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames
-        T_pred = min(T_plus_1 - C, self.T_rollout)
+        T = T_plus_1 - 1
+        k = min(self.jump_k, T)
+        T_pred = k
 
         all_losses: list[float] = []
         all_per_timestep_losses: list[list[float]] = [[] for _ in range(T_pred)]
@@ -404,9 +407,9 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 else f"unknown_{batch_idx}_{i}"
             )
 
-            if self.tta_mode == "full_rollout":
+            if self.tta_mode == "jump":
                 predictions, targets, tta_stats = (
-                    self._tta_process_clip_full_rollout(
+                    self._tta_process_clip_jump(
                         sample_features,
                         sample_actions,
                         sample_states,
@@ -428,32 +431,33 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             all_losses.append(sample_loss.item())
 
             per_step_losses: dict[str, float] = {}
+            tau_min = T + 1 - k
             for step in range(T_pred):
                 step_pred = predictions[:, step * N : (step + 1) * N, :]
                 step_target = targets[:, step * N : (step + 1) * N, :]
                 step_loss = self._compute_loss(step_pred, step_target)
-                per_step_losses[f"step_{C + step}"] = step_loss.item()
+                per_step_losses[f"tau_{tau_min + step}"] = step_loss.item()
                 all_per_timestep_losses[step].append(step_loss.item())
 
             clip_result: TestResultsDict = {
                 "clip_name": clip_name,
-                "loss_rollout": sample_loss.item(),
+                "loss_jump": sample_loss.item(),
                 "loss_teacher": 0.0,
                 "per_timestep_losses": per_step_losses,
                 "tta_stats": tta_stats,
             }
             self._test_results.append(clip_result)
 
-        loss_rollout = sum(all_losses) / len(all_losses)
+        loss_jump = sum(all_losses) / len(all_losses)
         self.log(
-            "test/loss_rollout",
-            loss_rollout,
+            "test/loss_jump",
+            loss_jump,
             prog_bar=True,
             sync_dist=True,
         )
-        self.log("test/loss", loss_rollout, prog_bar=True, sync_dist=True)
+        self.log("test/loss", loss_jump, prog_bar=True, sync_dist=True)
 
-        return torch.tensor(loss_rollout, device=features.device)
+        return torch.tensor(loss_jump, device=features.device)
 
     # ─── Curriculum Learning ───
 
@@ -468,8 +472,6 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 "curriculum_schedule must be a non-empty list"
             )
 
-        max_prediction_steps = self.num_timesteps - 1
-
         for i, phase in enumerate(schedule):
             if not isinstance(phase, Mapping):
                 raise InvalidConfigurationError(
@@ -481,10 +483,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 raise InvalidConfigurationError(
                     f"Phase {i} 'epoch' must be a non-negative integer"
                 )
-            if "T_rollout" in phase and phase["T_rollout"] > max_prediction_steps:
+            if "jump_k" in phase and phase["jump_k"] > self.num_timesteps:
                 raise InvalidConfigurationError(
-                    f"Phase {i}: T_rollout ({phase['T_rollout']}) exceeds "
-                    f"max prediction steps ({max_prediction_steps})"
+                    f"Phase {i}: jump_k ({phase['jump_k']}) exceeds "
+                    f"num_timesteps ({self.num_timesteps})"
                 )
 
         epochs = [p["epoch"] for p in schedule]
@@ -523,10 +525,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         changes: list[str] = []
 
-        if "T_rollout" in params and params["T_rollout"] != self.T_rollout:
-            old_val = self.T_rollout
-            self.T_rollout = params["T_rollout"]
-            changes.append(f"T_rollout: {old_val} → {self.T_rollout}")
+        if "jump_k" in params and params["jump_k"] != self.jump_k:
+            old_val = self.jump_k
+            self.jump_k = params["jump_k"]
+            changes.append(f"jump_k: {old_val} → {self.jump_k}")
 
         if (
             "loss_weight_teacher" in params
@@ -539,27 +541,27 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             )
 
         if (
-            "loss_weight_rollout" in params
-            and params["loss_weight_rollout"] != self.loss_weight_rollout
+            "loss_weight_jump" in params
+            and params["loss_weight_jump"] != self.loss_weight_jump
         ):
-            old_val = self.loss_weight_rollout
-            self.loss_weight_rollout = params["loss_weight_rollout"]
+            old_val = self.loss_weight_jump
+            self.loss_weight_jump = params["loss_weight_jump"]
             changes.append(
-                f"loss_weight_rollout: {old_val} → {self.loss_weight_rollout}"
+                f"loss_weight_jump: {old_val} → {self.loss_weight_jump}"
             )
 
         if changes:
             log.info(f"[Curriculum] Epoch {epoch}: {', '.join(changes)}")
 
-        self.log("curriculum/T_rollout", float(self.T_rollout), sync_dist=True)
+        self.log("curriculum/jump_k", float(self.jump_k), sync_dist=True)
         self.log(
             "curriculum/loss_weight_teacher",
             self.loss_weight_teacher,
             sync_dist=True,
         )
         self.log(
-            "curriculum/loss_weight_rollout",
-            self.loss_weight_rollout,
+            "curriculum/loss_weight_jump",
+            self.loss_weight_jump,
             sync_dist=True,
         )
 
@@ -616,15 +618,15 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             return
 
         num_clips = len(self._test_results)
-        rollout_losses = [r["loss_rollout"] for r in self._test_results]
+        jump_losses = [r["loss_jump"] for r in self._test_results]
 
-        mean_loss = sum(rollout_losses) / num_clips
-        sorted_losses = sorted(rollout_losses)
+        mean_loss = sum(jump_losses) / num_clips
+        sorted_losses = sorted(jump_losses)
         median_loss = sorted_losses[num_clips // 2]
-        min_loss = min(rollout_losses)
-        max_loss = max(rollout_losses)
+        min_loss = min(jump_losses)
+        max_loss = max(jump_losses)
         std_loss = (
-            sum((x - mean_loss) ** 2 for x in rollout_losses) / num_clips
+            sum((x - mean_loss) ** 2 for x in jump_losses) / num_clips
         ) ** 0.5
 
         per_timestep_stats: dict[str, dict[str, float]] = {}
@@ -639,10 +641,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             }
 
         worst_clips = sorted(
-            self._test_results, key=lambda x: x["loss_rollout"], reverse=True
+            self._test_results, key=lambda x: x["loss_jump"], reverse=True
         )[:10]
         best_clips = sorted(
-            self._test_results, key=lambda x: x["loss_rollout"]
+            self._test_results, key=lambda x: x["loss_jump"]
         )[:5]
 
         self._print_test_results_summary(
@@ -669,8 +671,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             best_clips,
         )
 
-        self.log("test/final_mean_loss_rollout", mean_loss, sync_dist=True)
-        self.log("test/final_median_loss_rollout", median_loss, sync_dist=True)
+        self.log("test/final_mean_loss_jump", mean_loss, sync_dist=True)
+        self.log("test/final_median_loss_jump", median_loss, sync_dist=True)
 
     def _print_test_results_summary(
         self,
@@ -690,7 +692,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         print("=" * 70)
         print(f"\n📊 AGGREGATE STATISTICS (over {num_clips} clips)")
         print("-" * 50)
-        print(f"  Rollout Loss (L1):")
+        print(f"  Jump Prediction Loss ({self.loss_type}):")
         print(f"    Mean:   {mean_loss:.6f}")
         print(f"    Median: {median_loss:.6f}")
         print(f"    Std:    {std_loss:.6f}")
@@ -698,27 +700,27 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         print(f"    Max:    {max_loss:.6f}")
 
         print(
-            f"\n📈 PER-TIMESTEP BREAKDOWN (Context: {self.context_frames} frames)"
+            f"\n📈 PER-TARGET-FRAME BREAKDOWN (jump_k={self.jump_k})"
         )
         print("-" * 50)
-        print(f"  {'Frame':<10} {'Mean Loss':<12} {'Min':<12} {'Max':<12}")
+        print(f"  {'Target τ':<10} {'Mean Loss':<12} {'Min':<12} {'Max':<12}")
         for step_key, stats in per_timestep_stats.items():
-            frame_num = step_key.replace("step_", "z_")
+            frame_label = step_key.replace("tau_", "z_")
             print(
-                f"  {frame_num:<10} {stats['mean']:<12.6f} "
+                f"  {frame_label:<10} {stats['mean']:<12.6f} "
                 f"{stats['min']:<12.6f} {stats['max']:<12.6f}"
             )
 
         print(f"\n🔴 WORST-PERFORMING CLIPS (top 10)")
         for i, clip in enumerate(worst_clips, 1):
             print(
-                f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}"
+                f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_jump']:.6f}"
             )
 
         print(f"\n🟢 BEST-PERFORMING CLIPS (top 5)")
         for i, clip in enumerate(best_clips, 1):
             print(
-                f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_rollout']:.6f}"
+                f"  {i:2d}. {clip['clip_name']:<20} loss={clip['loss_jump']:.6f}"
             )
         print("=" * 70)
 
@@ -744,9 +746,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             "model_type": "AC-HOPE-ViT",
             "summary": {
                 "num_clips": num_clips,
-                "context_frames": self.context_frames,
-                "T_rollout": self.T_rollout,
-                "rollout_loss": {
+                "jump_k": self.jump_k,
+                "jump_loss": {
                     "mean": mean_loss,
                     "median": median_loss,
                     "std": std_loss,

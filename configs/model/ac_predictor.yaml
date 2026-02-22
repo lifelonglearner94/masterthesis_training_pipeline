@@ -35,10 +35,9 @@ model:
 
   # Loss settings (max T_teacher = num_timesteps - 1 = 7)
   T_teacher: 7  # Teacher-forcing prediction steps
-  T_rollout: 2   # Rollout prediction steps (autoregressive)
-  context_frames: 1  # Number of ground-truth context frames for rollout
+  jump_k: 3   # Number of candidate jump targets (τ sampled from last k frames)
   loss_weight_teacher: 1.0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
   normalize_reps: true  # Apply layer norm after predictor steps (V-JEPA2 paper)
   loss_type: "l1"  # Loss function: "l1" (MAE), "l2" (MSE), or "huber"
   huber_delta: 1.0  # Delta for Huber loss (only used when loss_type="huber")
@@ -47,10 +46,10 @@ model:
   # Example schedule to enable:
   #   curriculum_schedule:
   #     - epoch: 0
-  #       T_rollout: 2
+  #       jump_k: 2
   #       loss_weight_teacher: 1.0
   #     - epoch: 10
-  #       T_rollout: 4
+  #       jump_k: 4
   #       loss_weight_teacher: 0.5
   curriculum_schedule: null
 

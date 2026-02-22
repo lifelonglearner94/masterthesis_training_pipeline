@@ -25,7 +25,7 @@
 #   - Original video: 16 frames
 #   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
 #   - Available prediction steps: 7 (num_timesteps - 1 = 8 - 1)
-#   - T_teacher/T_rollout must be <= 7
+#   - T_teacher/jump_k must be <= 7
 # =============================================================================
 
 defaults:
@@ -75,8 +75,7 @@ data:
 model:
   # --- Temporal / loss settings (adapted for HOPE bi-level optimization) ---
   T_teacher: 7
-  T_rollout: 7                     # ↓ from 7: memory corruption feedback loop over long rollouts
-  context_frames: 1
+  jump_k: 3                     # Number of candidate jump targets
   use_activation_checkpointing: false   # HOPE DGD updates mutate state during forward — incompatible with checkpoint recomputation
 
   # --- Action dimension (dataset-specific) ---
@@ -111,7 +110,7 @@ model:
 
   # --- Loss weights ---
   loss_weight_teacher: 1.0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
 
   # --- Loss function (see docs/20260221_L1_vs_L2_Loss.md) ---
   loss_type: "l2"

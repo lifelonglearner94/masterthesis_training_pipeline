@@ -63,20 +63,19 @@ data:
 # MODEL: Extended TTA configuration
 # =============================================================================
 model:
-  T_rollout: 7
-  context_frames: 1
+  jump_k: 7
   T_teacher: 7
   use_activation_checkpointing: false
   action_embed_dim: 2
   loss_weight_teacher: 0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
   curriculum_schedule: null
 
   # =============================================================================
   # TEST TIME ADAPTATION (TTA) SETTINGS - EXTENDED
   # =============================================================================
   tta_enabled: true
-  tta_mode: "full_rollout"
+  tta_mode: "jump"
 
   # EXTENDED LAYER ADAPTATION:
   # "layernorm+attn_proj" adapts both LayerNorm AND attention output projections

@@ -1,18 +1,18 @@
 """Test Time Adaptation (TTA) wrapper for AC Predictor.
 
-Implements self-supervised TTA using rollout prediction error as the adaptation signal.
+Implements self-supervised TTA using jump prediction error as the adaptation signal.
 Only LayerNorm parameters are updated during adaptation, all other weights are frozen.
 
 Reference:
     - TENT: Fully Test-Time Adaptation by Entropy Minimization (Wang et al., 2021)
     - Adapted for regression (feature prediction) using L1 loss instead of entropy.
 
-TTA Loop ("Look-Back" Update):
-    1. Predict z_{t+1} from (z_t, a_t)
-    2. Wait for ground-truth z_{t+1}
+TTA Loop ("Jump-Based" Update):
+    1. Jump-predict z_τ from (z₀, a₀) with RoPE(τ)
+    2. Wait for ground-truth z_τ
     3. Compute L1 loss between prediction and ground-truth
     4. Update LayerNorm parameters
-    5. Predict z_{t+2} with updated model
+    5. Jump-predict next τ with updated model
 """
 
 import logging
@@ -30,8 +30,8 @@ type AdaptationStats = dict[str, float | int]
 # Constants
 DEFAULT_TTA_LR = 1e-4
 DEFAULT_GRAD_CLIP_NORM = 1.0
-DEFAULT_CONTEXT_FRAMES = 1
 DEFAULT_PATCHES_PER_FRAME = 256
+DEFAULT_JUMP_K = 3
 LAYER_NORM_EPS = 1e-6
 
 
@@ -45,8 +45,8 @@ class OptimizerType(StrEnum):
 logger = logging.getLogger(__name__)
 
 
-class RolloutTTAAgent(nn.Module):
-    """Test Time Adaptation agent using rollout prediction error.
+class JumpTTAAgent(nn.Module):
+    """Test Time Adaptation agent using jump prediction error.
 
     This agent wraps a predictor model and implements online adaptation
     by updating only LayerNorm parameters based on single-step prediction errors.
@@ -269,24 +269,26 @@ class RolloutTTAAgent(nn.Module):
         states: Tensor,
         ground_truth_next: Tensor | None = None,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Perform TTA step: adapt from previous prediction, then predict next.
 
-        This implements the "look-back" update scheme:
+        This implements the jump-based update scheme:
         1. If we have a previous prediction and ground-truth is available, adapt
-        2. Make a new prediction with (potentially) updated weights
+        2. Make a new jump prediction with (potentially) updated weights
         3. Store the prediction for the next adaptation step
 
         Args:
-            z_context: Current context features [B, C*N, D]
-            actions: Actions for context frames [B, C, action_dim]
-            states: States for context frames [B, C, action_dim]
+            z_context: Current context features [B, N, D]
+            actions: Actions [B, 1, action_dim]
+            states: States [B, 1, action_dim]
             ground_truth_next: Ground-truth features for validation [B, N, D].
                 If provided along with prev_prediction, triggers adaptation.
-            extrinsics: Optional extrinsics [B, C, action_dim-1]
+            extrinsics: Optional extrinsics [B, 1, action_dim-1]
+            target_timestep: Target frame index τ for jump prediction (0-indexed).
 
         Returns:
-            Predicted next features [B, N, D] (detached for downstream use).
+            Predicted features [B, N, D] (detached for downstream use).
         """
         # --- Phase A: Look-Back Adaptation ---
         if self.prev_prediction is not None and ground_truth_next is not None:
@@ -296,12 +298,11 @@ class RolloutTTAAgent(nn.Module):
         # --- Phase B: Forward Inference ---
         # Enable gradients so we can backpropagate in the NEXT adaptation step
         with torch.set_grad_enabled(True):
-            # Forward pass through predictor
-            z_pred_all = self.model(z_context, actions, states, extrinsics)
+            # Forward pass through predictor with optional target_timestep for jump
+            z_pred_all = self.model(z_context, actions, states, extrinsics, target_timestep=target_timestep)
 
-            # Extract only the last frame prediction (single-step rollout)
-            num_action_steps = actions.shape[1] if actions.dim() > 1 else 1
-            N = z_context.shape[1] // num_action_steps
+            # Extract only the last frame prediction (single-step jump prediction)
+            N = z_context.shape[1]
             # For single-step, extract last N tokens
             z_pred_next = z_pred_all[:, -N:, :]
 
@@ -365,20 +366,20 @@ class RolloutTTAAgent(nn.Module):
 
 
 class SequentialTTAProcessor:
-    """Process a full sequence with per-timestep TTA adaptation.
+    """Process a full sequence with per-target jump TTA adaptation.
 
-    This processor handles a complete clip by iterating through timesteps,
-    adapting at each step using the "look-back" scheme.
+    This processor handles a complete clip by iterating through jump targets,
+    adapting at each step using the "look-back" scheme with jump predictions.
 
-    For a sequence with T+1 frames (0 to T):
-        - Frame 0: Initial context (no prediction yet)
-        - Frames 1 to T: Predict, then adapt when ground-truth becomes available
+    For a sequence with T+1 frames (0 to T) and jump_k targets:
+        - Frame 0: Initial context (z₀)
+        - For each τ in {T+1-k, ..., T}: Jump-predict z_τ from z₀, then adapt
     """
 
     def __init__(
         self,
-        tta_agent: RolloutTTAAgent,
-        context_frames: int = DEFAULT_CONTEXT_FRAMES,
+        tta_agent: JumpTTAAgent,
+        jump_k: int = 3,
         patches_per_frame: int = DEFAULT_PATCHES_PER_FRAME,
         normalize_reps: bool = True,
     ) -> None:
@@ -386,12 +387,12 @@ class SequentialTTAProcessor:
 
         Args:
             tta_agent: The TTA agent wrapping the predictor
-            context_frames: Number of ground-truth context frames
+            jump_k: Number of candidate jump targets
             patches_per_frame: Number of patches (tokens) per frame
             normalize_reps: Whether to apply layer normalization to features
         """
         self.tta_agent = tta_agent
-        self.context_frames = context_frames
+        self.jump_k = jump_k
         self.patches_per_frame = patches_per_frame
         self.normalize_reps = normalize_reps
 
@@ -402,10 +403,10 @@ class SequentialTTAProcessor:
         states: Tensor,
         extrinsics: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float | int]]:
-        """Process a complete clip with TTA adaptation.
+        """Process a complete clip with jump-based TTA adaptation.
 
-        Iterates through the sequence, making predictions and adapting
-        at each timestep using the look-back scheme.
+        Iterates through jump targets, making predictions and adapting
+        at each target using the look-back scheme.
 
         Args:
             features: [B, T+1, N, D] - Full sequence features
@@ -415,12 +416,13 @@ class SequentialTTAProcessor:
 
         Returns:
             Tuple of:
-                - predictions: [B, T_pred, N, D] - All predictions made
+                - predictions: [B, k, N, D] - Jump predictions for all τ
                 - stats: Dictionary with adaptation statistics
         """
         B, T_plus_1, N, D = features.shape
-        C = self.context_frames
-        T_pred = T_plus_1 - C  # Number of predictions to make
+        T = T_plus_1 - 1
+        tau_min = T + 1 - self.jump_k
+        tau_max = T
 
         # Reset TTA agent for new clip
         if self.tta_agent.reset_per_clip:
@@ -433,47 +435,40 @@ class SequentialTTAProcessor:
                 features.reshape(B, -1, D), (D,), eps=LAYER_NORM_EPS
             ).reshape(B, T_plus_1, N, D)
 
-        # Initialize context with ground-truth frames
-        z_context = h[:, :C, :, :].reshape(B, C * N, D)
+        # Initial state: first frame
+        z_input = h[:, :1, :, :].reshape(B, N, D)
 
         # Store all predictions
         all_predictions: list[Tensor] = []
 
-        # Process each timestep
-        for step in range(T_pred):
-            # Target frame index for this prediction
-            target_idx = C + step
-
-            # Actions/states up to current context
-            num_action_steps = C + step
-            step_actions = actions[:, :num_action_steps, :]
-            step_states = states[:, :num_action_steps, :]
+        # Process each jump target
+        for i, tau in enumerate(range(tau_min, tau_max + 1)):
+            # Single action/state for initial step
+            step_actions = actions[:, :1, :]
+            step_states = states[:, :1, :]
             step_extrinsics = (
-                extrinsics[:, :num_action_steps, :]
+                extrinsics[:, :1, :]
                 if extrinsics is not None
                 else None
             )
 
-            # Ground-truth for this timestep (for adaptation in next iteration)
-            gt_next = h[:, target_idx, :, :]  # [B, N, D]
+            # Ground-truth for this target
+            gt_tau = h[:, tau, :, :]  # [B, N, D]
 
             # Make prediction with TTA (adapts from previous if available)
             z_pred = self.tta_agent.step(
-                z_context=z_context,
+                z_context=z_input,
                 actions=step_actions,
                 states=step_states,
-                ground_truth_next=gt_next if step > 0 else None,  # No adaptation on first step
+                ground_truth_next=gt_tau if i > 0 else None,
                 extrinsics=step_extrinsics,
             )
 
             all_predictions.append(z_pred)
 
-            # Update context for next step (autoregressive)
-            z_context = torch.cat([z_context, z_pred], dim=1)
-
         # Final adaptation with last ground-truth
-        if T_pred > 0:
-            final_gt = h[:, C + T_pred - 1, :, :]
+        if self.jump_k > 0:
+            final_gt = h[:, tau_max, :, :]
             if self.tta_agent.prev_prediction is not None:
                 self.tta_agent.adapt_step(
                     self.tta_agent.prev_prediction,
@@ -481,7 +476,7 @@ class SequentialTTAProcessor:
                 )
 
         # Stack predictions
-        predictions = torch.stack(all_predictions, dim=1)  # [B, T_pred, N, D]
+        predictions = torch.stack(all_predictions, dim=1)  # [B, k, N, D]
 
         # Get adaptation statistics
         stats = self.tta_agent.get_adaptation_stats()

@@ -59,11 +59,10 @@ data:
 # MODEL: Identity baseline specific settings
 # =============================================================================
 model:
-  T_rollout: 7
-  context_frames: 1
+  jump_k: 7
   T_teacher: 7
   loss_weight_teacher: 0.0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
 
 # =============================================================================
 # TRAINER: Test mode

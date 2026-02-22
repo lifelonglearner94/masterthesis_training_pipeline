@@ -52,8 +52,7 @@ def print_test_config(cfg: DictConfig) -> None:
     print(f"   Batch size:  {cfg.data.get('batch_size', 32)}")
 
     print(f"\n🔧 MODEL:")
-    print(f"   Context frames: {cfg.model.get('context_frames', 3)}")
-    print(f"   T_rollout:      {cfg.model.get('T_rollout', 4)}")
+    print(f"   Jump K:         {cfg.model.get('jump_k', 3)}")
     print(f"   T_teacher:      {cfg.model.get('T_teacher', 7)}")
 
     print(f"\n🏷️  METADATA:")
@@ -67,7 +66,7 @@ def main(cfg: DictConfig) -> float | None:
     """Evaluate a trained model on test data.
 
     This script loads a checkpoint and runs evaluation on a test dataset,
-    computing rollout losses with per-timestep breakdown.
+    computing jump losses with per-timestep breakdown.
 
     Args:
         cfg: Hydra configuration dictionary containing model, data, and

@@ -5,7 +5,7 @@
 # Use as: uv run src/eval.py experiment=test_ac_predictor_tta paths.data_dir=/path/to/your/clips ckpt_path=/path/to/checkpoint.ckpt
 #
 # This config is for evaluating a trained model with TEST TIME ADAPTATION (TTA).
-# TTA adapts LayerNorm parameters online using single-step rollout loss.
+# TTA adapts LayerNorm parameters online using single-step jump loss.
 #
 # Test clips: 22000-22999 (1000 clips total)
 #
@@ -69,8 +69,7 @@ data:
 # =============================================================================
 model:
   # --- Rollout configuration for testing ---
-  T_rollout: 7                     # Predict 7 timesteps autoregressively (z₁→z₇)
-  context_frames: 1                # Use 1 ground-truth context frame (z₀)
+  jump_k: 7                     # Number of candidate jump targets (τ sampled from last k frames)
   T_teacher: 7                     # Teacher forcing for comparison
   use_activation_checkpointing: false
 
@@ -79,7 +78,7 @@ model:
 
   # --- Loss weights (for test metrics) ---
   loss_weight_teacher: 0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
 
   # --- Curriculum disabled for testing ---
   curriculum_schedule: null
@@ -91,9 +90,9 @@ model:
   tta_enabled: true
 
   # TTA MODE: How adaptation is performed
-  # - "full_rollout" (RECOMMENDED): Predict full sequence z₁→z₇, compute loss, adapt, then evaluate
+  # - "jump" (RECOMMENDED): Predict full sequence z₁→z₇, compute loss, adapt, then evaluate
   # - "sequential": Step-by-step look-back adaptation (original TENT-style)
-  tta_mode: "full_rollout"
+  tta_mode: "jump"
 
   # Number of TTA update iterations per clip
   # INCREASED: 5 iterations allows for meaningful parameter updates
@@ -115,7 +114,7 @@ model:
   # false = accumulate adaptations across clips (experimental)
   tta_reset_per_clip: false
 
-  # Adaptation horizon (deprecated in full_rollout mode, uses T_rollout instead)
+  # Adaptation horizon (deprecated in jump mode, uses jump_k instead)
   tta_adaptation_horizon: 1
 
   # Optimizer settings for TTA

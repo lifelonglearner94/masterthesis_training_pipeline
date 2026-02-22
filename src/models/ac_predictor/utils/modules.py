@@ -225,6 +225,7 @@ class ACRoPEAttention(nn.Module):
         H: int | None = None,
         W: int | None = None,
         action_tokens: int = 0,
+        target_timestep: int | None = None,
     ) -> torch.Tensor:
         """Forward pass of ACRoPE attention.
 
@@ -236,6 +237,10 @@ class ACRoPEAttention(nn.Module):
             H: Height of spatial grid.
             W: Width of spatial grid.
             action_tokens: Number of action tokens to process separately.
+            target_timestep: Target frame index for jump prediction (0-indexed
+                into the features tensor). When set, RoPE temporal positions are
+                overridden to ``target_timestep - 1`` so the model's output
+                corresponds to the prediction for frame ``target_timestep``.
 
         Returns:
             Output tensor of shape (B, N, C).
@@ -245,6 +250,12 @@ class ACRoPEAttention(nn.Module):
         # Compute position of each frame token
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
+            d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
+        elif target_timestep is not None:
+            # Jump prediction: place all tokens at temporal position (target_timestep - 1)
+            # so the model output corresponds to frame target_timestep.
+            base_spatial = torch.arange(H * W, device=x.device)
+            mask = (target_timestep - 1) * H * W + base_spatial
             d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
         else:
             mask = torch.arange(int(T * H * W), device=x.device)
@@ -261,6 +272,11 @@ class ACRoPEAttention(nn.Module):
             action_q = []
             action_k = []
             action_v = []
+            # Temporal positions for action tokens: override for jump prediction
+            if target_timestep is not None:
+                act_time_pos = torch.full((T,), target_timestep - 1, dtype=torch.long, device=x.device)
+            else:
+                act_time_pos = torch.arange(T, device=x.device)
             for i in range(action_tokens):
                 a = x[:, :, i : i + 1, :].flatten(1, 2)
                 # Compute qkv for action tokens and rotate
@@ -268,8 +284,8 @@ class ACRoPEAttention(nn.Module):
                 q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
 
                 # Rotate temporal dimension for action tokens
-                qd = rotate_queries_or_keys(q[..., : self.d_dim], pos=torch.arange(T, device=x.device))
-                kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=torch.arange(T, device=x.device))
+                qd = rotate_queries_or_keys(q[..., : self.d_dim], pos=act_time_pos)
+                kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=act_time_pos)
                 qr = q[..., self.d_dim :]
                 kr = k[..., self.d_dim :]
 
@@ -666,6 +682,7 @@ class ACBlock(nn.Module):
         H: int | None = None,
         W: int | None = None,
         action_tokens: int = 0,
+        target_timestep: int | None = None,
     ) -> torch.Tensor:
         """Forward pass of ACBlock.
 
@@ -677,13 +694,14 @@ class ACBlock(nn.Module):
             H: Height of spatial grid.
             W: Width of spatial grid.
             action_tokens: Number of action tokens to process separately.
+            target_timestep: Target frame index for jump prediction.
 
         Returns:
             Output tensor of shape (B, N, C).
         """
         y = self.norm1(x)
         if isinstance(self.attn, ACRoPEAttention):
-            y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens)
+            y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens, target_timestep=target_timestep)
         else:
             y = self.attn(y, mask=mask, attn_mask=attn_mask)
         x = x + self.drop_path(y)

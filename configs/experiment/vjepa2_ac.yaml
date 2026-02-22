@@ -11,7 +11,7 @@
 #   - Original video: 16 frames
 #   - Precomputed features: 8 timesteps (16 frames / tubelet_size=2)
 #   - Available prediction steps: 7 (num_timesteps - 1 = 8 - 1)
-#   - T_teacher/T_rollout must be <= 7
+#   - T_teacher/jump_k must be <= 7
 # =============================================================================
 
 defaults:
@@ -59,8 +59,7 @@ data:
 model:
   # --- Memory settings ---
   T_teacher: 7                     # ⚠️ REDUCED from 7 (max for 8 timesteps)
-  T_rollout: 7                     # Fixed: predict 7 timesteps autoregressively
-  context_frames: 1                # Fixed: use 1 ground-truth context frame (z₀)
+  jump_k: 3                     # Number of candidate jump targets (τ from last k frames)
   use_activation_checkpointing: true  # ⚠️ ENABLED (trades compute for ~50% memory)
 
   # --- Model architecture (keep defaults from ac_predictor.yaml) ---
@@ -77,7 +76,7 @@ model:
 
   # --- Loss weights ---
   loss_weight_teacher: 1.0
-  loss_weight_rollout: 1.0
+  loss_weight_jump: 1.0
 
   # --- Loss function (see docs/20260221_L1_vs_L2_Loss.md) ---
   # "l1" = MAE (paper default, robust to outliers)
@@ -88,14 +87,14 @@ model:
 
   # --- Curriculum Learning Schedule ---
   # Dynamically adjusts loss_weight_teacher during training.
-  # T_rollout and context_frames are now FIXED (1 context → 7 predictions).
+  # jump_k is fixed at init. Curriculum adjusts loss weights.
   # Each phase activates at the specified epoch and remains active until the next phase.
   # Parameters not specified in a phase retain their previous values.
   #
-  # Recommended progression (from meine_eigene_Loss_Logik.md):
+  # Recommended progression:
   #   Phase 1: Stabilization - high teacher weight
   #   Phase 2: Transition - reduce teacher weight
-  #   Phase 3: Rollout-dominant - model learns long-horizon dynamics
+  #   Phase 3: Jump-dominant - model learns long-horizon dynamics
   #
   # Set to null to disable curriculum learning and use fixed values above.
   curriculum_schedule:
