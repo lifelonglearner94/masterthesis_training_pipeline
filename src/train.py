@@ -132,7 +132,8 @@ def main(cfg: DictConfig) -> float | None:
 
     # 7. Train
     if cfg.get("train"):
-        trainer.fit(model=model, datamodule=datamodule)
+        ckpt_path = cfg.get("ckpt_path")
+        trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
 
     # 8. Test
     if cfg.get("test"):

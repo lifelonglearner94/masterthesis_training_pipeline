@@ -182,6 +182,11 @@ class HOPEBlock(nn.Module):
         # Auxiliary loss for M_k/M_v gradient flow (accumulated per forward)
         self._aux_loss: Tensor = torch.tensor(0.0)
 
+        # Freeze flag: when True, skip all inner-loop DGD memory updates.
+        # Memories are still READ (for retrieval) but never WRITTEN.
+        # This enables pure inference for CL evaluation phases.
+        self.freeze_inner_loop: bool = False
+
     def forward(
         self,
         x: Tensor,
@@ -339,7 +344,8 @@ class HOPEBlock(nn.Module):
         # Paper: "There is no distinction between training and test time."
         # The inner loop runs during BOTH training and inference so the model
         # adapts in-context to each sequence (core HOPE advantage).
-        if torch.is_grad_enabled() or not self.training:
+        # When freeze_inner_loop=True, skip all memory writes for CL evaluation.
+        if not self.freeze_inner_loop and (torch.is_grad_enabled() or not self.training):
             # Retrieval error as surprise signal
             retrieval_error = v - output  # [B, C, D]
             surprise = self.M_memory.surprise(retrieval_error)  # [B]

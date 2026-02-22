@@ -1,0 +1,136 @@
+# @package _global_
+# =============================================================================
+# Continual Learning — LOWER BOUND (Naive Sequential Finetuning)
+# =============================================================================
+# Worst-case baseline: The model is sequentially fine-tuned on each task
+# with standard gradient descent and NO continual learning mechanisms
+# (no replay, no regularization, no TTA, no isolated parameter updates).
+#
+# This enforces CATASTROPHIC FORGETTING and defines the performance floor.
+# Any valid CL approach must statistically significantly outperform this.
+#
+# Pipeline: Base Training → Finetune Task 1 → Eval → Finetune Task 2 → Eval → ...
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_lower_bound paths.data_dir=/path/to/clips
+#
+# Architecture: AC-ViT (same as cl_ac_vit.yaml — standard transformer, ~43M params)
+# Task training: Naive finetuning (full gradient descent, no protection)
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_lower_bound"
+tags: ["cl", "continual_learning", "lower_bound", "naive_finetuning", "baseline"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-ViT Predictor (identical architecture to cl_ac_vit.yaml)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: true
+  action_embed_dim: 2
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l2"
+
+  # Curriculum for base training
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
+      loss_weight_teacher: 0.3
+
+  # Optimizer (V-JEPA2 paper settings)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # LR schedule (iteration-based)
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+  # TTA explicitly DISABLED — this is pure naive finetuning
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+trainer:
+  max_epochs: 30
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_lower_bound_${now:%Y%m%d_%H%M%S}"
+
+  # Sequential pipeline with naive finetune (no CL mechanisms)
+  pipeline_mode: "sequential"
+  task_training_mode: "finetune"
+
+  # --- Base Training Phase ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 40
+    val_split: 0.1
+
+  # --- Sequential Tasks ---
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  # --- Evaluation ---
+  eval:
+    clips_per_task: 100
+
+  # --- Task Training: Naive Finetuning ---
+  # Standard gradient descent on task clips — NO protection against forgetting.
+  # Uses the same optimizer/LR as base training for a fair comparison.
+  task_training:
+    max_epochs: 10
+    val_split: 0.0

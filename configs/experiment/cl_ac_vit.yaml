@@ -1,0 +1,149 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-ViT + TTA
+# =============================================================================
+# Full CL experiment: Base Training (5000 clips) → 5 Sequential Tasks (TTA)
+# with full evaluation after each phase.
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_vit paths.data_dir=/path/to/clips
+#
+# Architecture: AC-ViT (standard transformer, 24 layers, ~43M params)
+# Task training: Test-Time Adaptation (TTA) with accumulating weight updates
+# Evaluation: Frozen model (no TTA), pure inference on fixed eval clips
+#
+# W&B: Each phase creates a new run, all grouped under cl.wandb_group
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_vit"
+tags: ["cl", "continual_learning", "ac_vit", "tta"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-ViT Predictor (same architecture as vjepa2_ac.yaml)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: true
+  action_embed_dim: 2
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l2"
+
+  # Curriculum for base training (tasks use TTA, no curriculum)
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 7
+      loss_weight_teacher: 0.7
+    - epoch: 11
+      loss_weight_teacher: 0.3
+
+  # Optimizer (V-JEPA2 paper settings, used for base training)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # LR schedule (iteration-based)
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+  # TTA defaults (activated by cl_train.py during task training)
+  tta_enabled: false
+  tta_mode: "jump"
+  tta_lr: 5e-4
+  tta_grad_clip: 5.0
+  tta_reset_per_clip: false
+  tta_num_adaptation_steps: 5
+  tta_adapt_layers: "layernorm"
+  tta_optimizer_type: "adamw"
+  tta_optimizer_betas: [0.9, 0.999]
+
+# =============================================================================
+# TRAINER DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+trainer:
+  max_epochs: 30
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  # W&B grouping: all runs in this experiment share a group
+  wandb_group: "cl_ac_vit_${now:%Y%m%d_%H%M%S}"
+
+  # Task training mode: "tta" for AC-ViT, "finetune" for HOPE
+  task_training_mode: "tta"
+
+  # --- Base Training Phase ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 40
+    val_split: 0.1
+
+  # --- Sequential Tasks ---
+  # Each task has 1000 clips. Last `eval.clips_per_task` clips are reserved
+  # for evaluation; the rest are used for task training.
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  # --- Evaluation Configuration ---
+  eval:
+    # Fixed number of clips from each partition used for evaluation.
+    # These are always the LAST N clips of each range.
+    # E.g., base eval = clips 4900-4999, task 1 eval = clips 5900-5999
+    clips_per_task: 100
+
+  # --- TTA Settings for Task Training ---
+  tta:
+    tta_mode: "jump"
+    tta_lr: 5e-4
+    tta_grad_clip: 5.0
+    tta_num_adaptation_steps: 5
+    tta_adapt_layers: "layernorm"
+    tta_optimizer_type: "adamw"
+    tta_optimizer_betas: [0.9, 0.999]

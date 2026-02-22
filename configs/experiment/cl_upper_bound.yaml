@@ -1,0 +1,139 @@
+# @package _global_
+# =============================================================================
+# Continual Learning — UPPER BOUND (Joint / Offline Training)
+# =============================================================================
+# Best-case baseline: The sequential constraint is REMOVED. The model trains
+# on ALL data (base + all tasks) simultaneously in i.i.d. fashion.
+#
+# This defines the theoretical performance ceiling. No CL approach can
+# systematically outperform this, since the model has unrestricted access
+# to all physical phenomena at once.
+#
+# Also serves as a SANITY CHECK: if joint training can't solve the tasks,
+# then model capacity or data sampling is insufficient.
+#
+# Pipeline: Single training on all clips (0-10000) → Evaluate on each partition
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_upper_bound paths.data_dir=/path/to/clips
+#
+# Architecture: AC-ViT (same as cl_ac_vit.yaml — standard transformer, ~43M params)
+# Training: Single joint training on all 10000 clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_upper_bound"
+tags: ["cl", "continual_learning", "upper_bound", "joint_training", "baseline"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden by cl_train.py — joint training uses ALL clips)
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-ViT Predictor (identical architecture to cl_ac_vit.yaml)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: true
+  action_embed_dim: 2
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l2"
+
+  # Curriculum (scaled for longer training on more data)
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 10
+      loss_weight_teacher: 0.7
+    - epoch: 20
+      loss_weight_teacher: 0.3
+
+  # Optimizer (V-JEPA2 paper settings)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # LR schedule
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+  # TTA disabled — pure offline training
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS
+# =============================================================================
+trainer:
+  max_epochs: 40
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_upper_bound_${now:%Y%m%d_%H%M%S}"
+
+  # Joint pipeline: train on ALL data at once, then evaluate per partition
+  pipeline_mode: "joint"
+  task_training_mode: "finetune"  # Not used in joint mode, but required by schema
+
+  # --- Base Training (used only for eval partition definition) ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 40  # Not used in joint mode
+    val_split: 0.1
+
+  # --- Tasks (used only for eval partition definition) ---
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  # --- Evaluation ---
+  eval:
+    clips_per_task: 100
+
+  # --- Joint Training Settings ---
+  # Trains on ALL clips (0-10000) simultaneously. The clip range is
+  # automatically computed as the union of base_training + all tasks.
+  joint_training:
+    max_epochs: 40
+    val_split: 0.1

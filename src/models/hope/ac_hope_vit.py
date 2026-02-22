@@ -481,6 +481,22 @@ class ACHOPEViT(nn.Module):
         for blk in self.hope_blocks:
             blk.reset_memory_state()
 
+    def freeze_all_inner_loops(self) -> None:
+        """Freeze all HOPE blocks' inner-loop DGD memory updates.
+
+        Memories are still read (retrieval) but never written. Use this
+        for CL evaluation phases where no weight/memory updates are allowed.
+        """
+        for blk in self.hope_blocks:
+            blk.freeze_inner_loop = True
+        log.info("HOPE inner-loop DGD frozen for all blocks (eval mode)")
+
+    def unfreeze_all_inner_loops(self) -> None:
+        """Unfreeze all HOPE blocks' inner-loop DGD memory updates."""
+        for blk in self.hope_blocks:
+            blk.freeze_inner_loop = False
+        log.info("HOPE inner-loop DGD unfrozen for all blocks (train mode)")
+
     def get_aux_loss(self) -> Tensor:
         """Aggregate auxiliary M_k/M_v retrieval-quality loss from all blocks.
 
