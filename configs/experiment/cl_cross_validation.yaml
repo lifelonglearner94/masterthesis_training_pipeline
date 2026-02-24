@@ -1,0 +1,129 @@
+# @package _global_
+# =============================================================================
+# Continual Learning — 5-FOLD CROSS-VALIDATION (AC-ViT on ALL clips)
+# =============================================================================
+# The AC-ViT predictor is trained & evaluated with 5-fold cross-validation
+# over ALL 10 000 clips (0–9999). Clips are completely randomly shuffled
+# before splitting into folds (seeded for reproducibility).
+#
+# - Loss: L1 (MAE), both teacher-forcing AND jump-prediction losses active
+# - No curriculum schedule
+# - Each fold: train on 8000 clips, validate on 2000 clips
+#
+# Pipeline: For each of the 5 folds a fresh model is instantiated, trained,
+#           and evaluated. Per-fold and mean metrics are logged to W&B.
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_cross_validation paths.data_dir=/path/to/clips
+#
+# Architecture: AC-ViT (same transformer, ~43 M params)
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_predictor
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_cross_validation"
+tags: ["cl", "cross_validation", "ac_vit", "5fold", "l1"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per fold by the CV pipeline in cl_train.py)
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-ViT Predictor
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: true
+  action_embed_dim: 2
+
+  # Loss — L1, both teacher-forcing and jump-prediction equally weighted
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # No curriculum schedule
+  curriculum_schedule: null
+
+  # Optimizer (V-JEPA2 paper settings)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # LR schedule
+  use_iteration_scheduler: true
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
+
+  # TTA disabled — standard training
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS
+# =============================================================================
+trainer:
+  max_epochs: 40
+  gradient_clip_val: 1.01
+  gradient_clip_algorithm: norm
+  precision: "16-mixed"
+
+# =============================================================================
+# CONTINUAL LEARNING / CROSS-VALIDATION PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_cross_validation_${now:%Y%m%d_%H%M%S}"
+
+  pipeline_mode: "cross_validation"
+  task_training_mode: "finetune"  # Not used in CV mode, but required by schema
+
+  # --- Cross-validation settings ---
+  cross_validation:
+    n_folds: 5
+    clip_start: 0
+    clip_end: 10000
+    max_epochs: 40
+    val_split: 0.0   # Not used — folds define train/val directly
+
+  # --- Base/task definitions (needed for schema; not used in CV mode) ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 40
+    val_split: 0.1
+
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  eval:
+    clips_per_task: 100

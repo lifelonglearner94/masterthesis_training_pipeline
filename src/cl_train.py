@@ -33,12 +33,14 @@ from typing import Any
 
 import hydra
 import lightning as L
+import numpy as np
 import omegaconf
 import torch
 from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader, Subset
 
 from src.utils.cl_metrics import ContinualLearningMetricsTracker
 from src.utils.device_utils import log_device_info
@@ -779,6 +781,228 @@ def _run_sequential_pipeline(cfg: DictConfig) -> None:
     _log_final_summary(cfg, tracker, wandb_group, output_dir)
 
 
+def _run_cross_validation_pipeline(cfg: DictConfig) -> None:
+    """Run 5-fold cross-validation on ALL clips with random shuffling.
+
+    For each fold a fresh model is instantiated, trained on 4/5 of the data,
+    and evaluated on the held-out 1/5. Clips are completely randomly shuffled
+    (seeded) before splitting into folds.
+
+    Logs per-fold metrics + mean/std across folds to W&B.
+    """
+    from src.datamodules.precomputed_features import (
+        PrecomputedFeaturesDataset,
+        collate_fn,
+    )
+
+    cl_cfg = cfg.cl
+    cv_cfg = cl_cfg.cross_validation
+    output_dir = str(cfg.paths.output_dir)
+    wandb_group = cl_cfg.wandb_group
+
+    n_folds = cv_cfg.n_folds
+    clip_start = cv_cfg.clip_start
+    clip_end = cv_cfg.clip_end
+    max_epochs = cv_cfg.max_epochs
+
+    log.info("=" * 70)
+    log.info("CROSS-VALIDATION PIPELINE")
+    log.info(f"  Folds: {n_folds}")
+    log.info(f"  Clips: {clip_start} - {clip_end}")
+    log.info(f"  Epochs per fold: {max_epochs}")
+    log.info(f"  W&B group: {wandb_group}")
+    log.info("=" * 70)
+
+    # Build a FULL dataset spanning all clips
+    full_dataset = PrecomputedFeaturesDataset(
+        data_dir=cfg.paths.data_dir,
+        num_timesteps=cfg.data.get("num_timesteps", 8),
+        patches_per_frame=cfg.data.get("patches_per_frame", 256),
+        use_extrinsics=cfg.data.get("use_extrinsics", False),
+        feature_map_name=cfg.data.get("feature_map_name", "vjepa2_vitl16"),
+        clip_prefix=cfg.data.get("clip_prefix", "clip_"),
+        clip_start=clip_start,
+        clip_end=clip_end,
+    )
+    total_clips = len(full_dataset)
+    log.info(f"  Total clips found: {total_clips}")
+
+    # Completely random shuffle of indices (seeded)
+    rng = np.random.RandomState(cfg.get("seed", 42))
+    indices = rng.permutation(total_clips)
+
+    # Split into folds
+    fold_sizes = np.full(n_folds, total_clips // n_folds, dtype=int)
+    fold_sizes[: total_clips % n_folds] += 1  # distribute remainder
+    fold_indices: list[np.ndarray] = []
+    offset = 0
+    for size in fold_sizes:
+        fold_indices.append(indices[offset : offset + size])
+        offset += size
+
+    # Collect per-fold metrics
+    fold_metrics: list[dict[str, float]] = []
+
+    for fold_idx in range(n_folds):
+        log.info("\n" + "=" * 70)
+        log.info(f"FOLD {fold_idx + 1} / {n_folds}")
+        log.info("=" * 70)
+
+        # Build train/val index sets
+        val_idx = fold_indices[fold_idx].tolist()
+        train_idx = np.concatenate(
+            [fold_indices[j] for j in range(n_folds) if j != fold_idx]
+        ).tolist()
+
+        log.info(f"  Train clips: {len(train_idx)},  Val clips: {len(val_idx)}")
+
+        train_subset = Subset(full_dataset, train_idx)
+        val_subset = Subset(full_dataset, val_idx)
+
+        # Wrap in a minimal LightningDataModule
+        batch_size = cfg.data.get("batch_size", 64)
+        num_workers = cfg.data.get("num_workers", 8)
+        pin_memory = cfg.data.get("pin_memory", True)
+
+        class _FoldDataModule(L.LightningDataModule):
+            """Minimal DataModule wrapping Subset objects for one CV fold."""
+
+            def train_dataloader(self_dm):
+                return DataLoader(
+                    train_subset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=num_workers > 0,
+                    collate_fn=collate_fn,
+                )
+
+            def val_dataloader(self_dm):
+                return DataLoader(
+                    val_subset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=num_workers > 0,
+                    collate_fn=collate_fn,
+                )
+
+            def test_dataloader(self_dm):
+                return DataLoader(
+                    val_subset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=num_workers > 0,
+                    collate_fn=collate_fn,
+                )
+
+        fold_dm = _FoldDataModule()
+
+        # Fresh model for each fold
+        model = instantiate_model(cfg)
+
+        # W&B logger for this fold
+        fold_tags = list(cfg.get("tags", [])) + [f"fold_{fold_idx + 1}"]
+        wandb_logger = create_wandb_logger(
+            cfg,
+            run_name=f"fold_{fold_idx + 1}",
+            group=wandb_group,
+            job_type="cross_validation",
+            tags=fold_tags,
+            save_dir=f"{output_dir}/fold_{fold_idx + 1}",
+        )
+
+        # Trainer
+        trainer = create_trainer(
+            cfg,
+            wandb_logger,
+            max_epochs=max_epochs,
+            output_dir=f"{output_dir}/fold_{fold_idx + 1}",
+            gradient_clip_val=OmegaConf.select(
+                cfg, "trainer.gradient_clip_val", default=1.01
+            ),
+            precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
+        )
+
+        # Train
+        trainer.fit(model=model, datamodule=fold_dm)
+
+        # Evaluate on held-out fold
+        test_results = trainer.test(model=model, datamodule=fold_dm)
+
+        # Collect metrics
+        metrics = {}
+        if test_results:
+            metrics = {k: v for k, v in test_results[0].items()}
+        metrics["fold"] = fold_idx + 1
+        fold_metrics.append(metrics)
+
+        log.info(f"Fold {fold_idx + 1} metrics: {metrics}")
+
+        # Save fold checkpoint
+        ckpt_path = f"{output_dir}/checkpoints/fold_{fold_idx + 1}_final.ckpt"
+        save_model_checkpoint(model, ckpt_path)
+
+        finish_wandb(wandb_logger)
+
+    # -------------------------------------------------------------------------
+    # Summary across all folds
+    # -------------------------------------------------------------------------
+    log.info("\n" + "=" * 70)
+    log.info("CROSS-VALIDATION SUMMARY")
+    log.info("=" * 70)
+
+    # Compute mean/std for each numeric metric across folds
+    all_keys = {
+        k for m in fold_metrics for k, v in m.items() if isinstance(v, (int, float))
+    }
+    summary: dict[str, float] = {}
+    for key in sorted(all_keys):
+        if key == "fold":
+            continue
+        values = [m[key] for m in fold_metrics if key in m]
+        if values:
+            mean_val = float(np.mean(values))
+            std_val = float(np.std(values))
+            summary[f"cv_mean/{key}"] = mean_val
+            summary[f"cv_std/{key}"] = std_val
+            log.info(f"  {key}: {mean_val:.6f} ± {std_val:.6f}")
+
+    # Log summary to W&B
+    summary_logger = create_wandb_logger(
+        cfg,
+        run_name="cv_summary",
+        group=wandb_group,
+        job_type="summary",
+        tags=list(cfg.get("tags", [])) + ["summary"],
+        save_dir=f"{output_dir}/summary",
+    )
+    if summary_logger.experiment is not None:
+        summary_logger.experiment.log(summary)
+        # Also log per-fold results as a table
+        for fold_m in fold_metrics:
+            summary_logger.experiment.log(
+                {f"fold_{int(fold_m['fold'])}": fold_m}
+            )
+    finish_wandb(summary_logger)
+
+    # Save summary JSON
+    summary_path = f"{output_dir}/cv_summary.json"
+    os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+    with open(summary_path, "w") as f:
+        json.dump(
+            {"fold_metrics": fold_metrics, "summary": summary},
+            f,
+            indent=2,
+            default=str,
+        )
+    log.info(f"\nCV summary saved to: {summary_path}")
+
+
 def _run_joint_pipeline(cfg: DictConfig) -> None:
     """Run the joint (i.i.d.) training pipeline (Upper Bound).
 
@@ -842,10 +1066,12 @@ def main(cfg: DictConfig) -> None:
         _run_sequential_pipeline(cfg)
     elif pipeline_mode == "joint":
         _run_joint_pipeline(cfg)
+    elif pipeline_mode == "cross_validation":
+        _run_cross_validation_pipeline(cfg)
     else:
         raise ValueError(
             f"Unknown pipeline_mode: '{pipeline_mode}'. "
-            f"Expected 'sequential' or 'joint'."
+            f"Expected 'sequential', 'joint', or 'cross_validation'."
         )
 
 

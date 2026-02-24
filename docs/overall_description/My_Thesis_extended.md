@@ -8,15 +8,28 @@ Denn sie transformieren Frames mit Pixeln in einen latenten Raum, der viel Speic
 
 ---
 
-## Aufbau des Experiments
+## Aufbau des Experiments: Continual Learning Pipeline
 
 Ich habe einen **Physik Simulations Datensatz** erstellt, in dem Objekte einen Kraftimpuls bekommen und dann ein Stück rutschen!
+Anstatt eines simplen A→B→A Szenarios nutze ich nun eine **Continual Learning Pipeline mit 5 progressiven dynamischen Shifts**, um die Modelle auf Forward Transfer und Catastrophic Forgetting zu testen.
 
-| Phase | Bedingungen | Zweck |
-|-------|-------------|-------|
-| **A₁** | Normale Reibung | Training |
-| **B** | Reduzierte Reibung & Masse | Test-Time Adaptation (TTA) |
-| **A₂** | Wie A₁ | Catastrophic Forgetting Test |
+**1. Base Training Phase:** 5000 Clips, ca. 40 Epochen.
+
+**2. Sequential Task Curriculum:**
+| Task | Shift-Typ | Beschreibung |
+|------|-----------|--------------|
+| **1** | Scaling Shift | Lineare Anpassung |
+| **2** | Dissipation Shift | Eis-Szenario (Disentanglement) |
+| **3** | Discretization Shift | Hybride Dynamik / Wände |
+| **4** | Kinematics Shift | Rotation & Asymmetrie |
+| **5** | Compositional OOD | Das große Finale (Out-of-Distribution) |
+
+Nach jedem Task erfolgt eine **Volle Evaluation** auf einem fixen Validation-Set aller Tasks.
+
+### Methodisches Framework: Lower & Upper Bounds
+Um die Continual Learning Fähigkeiten objektiv zu messen, wird die Leistung zwischen zwei Extremen eingeordnet:
+- **Lower Bound (Naives Finetuning):** Strikt sequenzielles Training ohne Schutz vor Catastrophic Forgetting (Worst-Case).
+- **Upper Bound (Joint Training):** Offline-Training über alle aggregierten Daten gleichzeitig (Best-Case / theoretisches Maximum).
 
 Diese Clips habe ich durch einen **frozen ViT-L/16 Encoder** gejagt. Dadurch erhalte ich meine Feature Maps:
 - **Input:** 16 RGB Frames → **Output:** 8 Zeitschritte (tubelet_size=2)
@@ -39,15 +52,20 @@ Außerdem habe ich bei der Datengenerierung ein Array mit Stärke des Kraftimpul
 
 **Token Interleaving:** Pro Zeitschritt werden Action zwischen Bild-Patches eingefügt → Lokale Konditionierung.
 
-### Loss Funktionen
+### Loss Funktionen: Stochastic Jump Prediction
 
-**1. Teacher-Forcing Loss** (parallele Vorhersage aller Schritte):
+Der fehleranfällige autoregressive Rollout-Loss wurde durch eine **Stochastic Jump Prediction** ersetzt. Dies eliminiert Error Compounding (Exposure Bias) und reduziert die Komplexität von $\mathcal{O}(T)$ auf $\mathcal{O}(1)$ Forward-Passes pro Sequenz.
+
+**1. Teacher-Forcing Loss** (parallele Vorhersage aller Schritte zur Stabilisierung):
 $$\mathcal{L}_{\text{teacher-forcing}}(\phi) := \frac{1}{T} \sum_{k=1}^{T} || P_{\phi}(\cdot) - E(x_{k+1}) ||_{1}$$
 
-**2. Rollout Loss** (autoregressive Schleife):
-$$\mathcal{L}_{\text{rollout}}(\phi) := || P_{\phi}(a_{1:T}, s_{1}, z_{1}) - z_{T+1} ||_{1}$$
+**2. Stochastic Jump Prediction Loss** (direkte Vorhersage von $z_\tau$ aus $z_1$ und $a_1$):
+$$\mathcal{L}_{\text{jump}}(\phi) := || P_{\phi}(a_{1:\tau}, s_{1}, z_{1}) - z_{\tau} ||_{1}$$
+*(wobei $\tau$ uniform aus den letzten $k$ Frames gesampelt wird)*
 
-Gesamt: $L(\phi) := \mathcal{L}_{\text{teacher-forcing}} + \mathcal{L}_{\text{rollout}}$
+**Gesamt (Curriculum Learning Schedule):**
+$$L(\phi, e) := (1 - \lambda(e)) \cdot \mathcal{L}_{\text{teacher-forcing}} + \lambda(e) \cdot \mathcal{L}_{\text{jump}}$$
+*(Der Teacher-Forcing Anteil nimmt über die Epochen ab, während Jump Prediction dominiert)*
 
 ---
 
@@ -76,7 +94,7 @@ Mein Ziel ist die **HOPE Architektur** aus dem Nested Learning Paper von Behrouz
 
 **Neuheit:** HOPE (bisher nur Text) → **Videodaten im latenten Raum** = Adaptive Weltmodelle.
 
-**Erfolg? =** HOPE erzielt bessere Ergebnisse im A→B→A Szenario als ViT-AC mit Standard-TTA.
+**Erfolg? =** HOPE erzielt bessere Ergebnisse in der Continual Learning Pipeline (höherer Forward Transfer, geringeres Forgetting) als ViT-AC mit Standard-TTA und schließt die Lücke zum Upper Bound.
 
 ---
 
@@ -103,7 +121,7 @@ Jeder der x Blöcke besteht aus zwei Phasen:
 **Phase A — Self-Modifying Titan Layer** (ersetzt Standard-Attention):
 - MLP-basiertes assoziatives Gedächtnis, das seine eigenen Gewichte **im Forward-Pass** updatet
 - **Delta Gradient Descent (DGD):** $M_t = M_{t-1}(\alpha_t I - \eta_t k_t k_t^T) - \eta_t (M_{t-1} k_t - \hat{v}_t) k_t^T$
-- **Surprise Gating:** Memory wird nur geschrieben, wenn der Retrieval-Error hoch ist
+- **Surprise Gating:** Memory wird nur geschrieben, wenn der Retrieval-Error hoch ist. *Die neue Jump Prediction liefert hierfür ein starkes, makroskopisches Fehlersignal!*
 - **Self-Generated Targets:** $\hat{v}_t = M_{t-1}(v_t)$ → Das Modell setzt sich selbst Lernziele
 
 **Phase B — Continuum Memory System (CMS)** (ersetzt Standard-MLP):
@@ -124,7 +142,7 @@ Das Modell lernt stabil und konvergiert schnell auf den V-JEPA 2 Features.
 
 ---
 
-## Warum HOPE im A→B→A Szenario überlegen sein sollte
+## Warum HOPE in der Continual Learning Pipeline überlegen sein sollte
 
 Der entscheidende Unterschied zum Standard ViT-AC + TTA:
 
@@ -135,16 +153,20 @@ Der entscheidende Unterschied zum Standard ViT-AC + TTA:
 | **Mechanismus** | Gradient Descent auf Loss | DGD mit Surprise Gating |
 | **Forgetting-Risiko** | Hoch (trotz Einschränkung) | Gering (Multi-Frequenz CMS) |
 
-**Kernargument:** HOPE adaptiert sich *von Natur aus* an neue Daten — ohne separaten TTA-Schritt. Das CMS mit seinen drei Frequenz-Ebenen kann kurzfristige Änderungen (Domain B) lernen, ohne langfristiges Wissen (Domain A) zu vergessen.
+**Kernargument:** HOPE adaptiert sich *von Natur aus* an neue Daten — ohne separaten TTA-Schritt. Das CMS mit seinen drei Frequenz-Ebenen kann kurzfristige Änderungen (neue Tasks) lernen, ohne langfristiges Wissen (alte Tasks) zu vergessen.
 
-→ **Genau das, was wir für das A→B→A Szenario brauchen!**
+→ **Genau das, was wir für die progressiven dynamischen Shifts brauchen!**
 
 ---
 
 ## Nächste Schritte
 
-- Vollständiges A→B→A Experiment mit HOPE vs. ViT-AC + TTA Baseline
-- Quantitativer Vergleich: Forgetting-Rate, Adaptionsgeschwindigkeit, finale Loss-Werte
-- Analyse der Titan Memory Diagnostics (Surprise, Gradient Norms, Memory Drift)
+- Vollständige Evaluierung der 5-Task Continual Learning Pipeline mit HOPE vs. ViT-AC + TTA Baseline.
+- Training und Evaluierung der **Lower Bound** (Naives Finetuning) und **Upper Bound** (Joint Training) Modelle.
+- Quantitativer Vergleich anhand der Metriken:
+  - **Relative Forgetting Rate** (Experience & Stream Forgetting)
+  - **Performance Gap** zum Upper Bound
+  - **Forward Transfer (FWT)** und **Backward Transfer (BWT)**
+- Analyse der Titan Memory Diagnostics (Surprise, Gradient Norms, Memory Drift) unter den neuen Jump Prediction Bedingungen.
 
-*Das Modell lernt ständig → starke Hypothese, dass es im A→B→A Szenario deutlich besser performt!*
+*Das Modell lernt ständig → starke Hypothese, dass es in der Continual Learning Pipeline deutlich besser performt und sich dem Upper Bound annähert!*
