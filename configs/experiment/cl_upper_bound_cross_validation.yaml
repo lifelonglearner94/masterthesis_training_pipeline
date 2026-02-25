@@ -95,7 +95,7 @@ cl:
 
   # --- Cross-validation settings ---
   cross_validation:
-    n_folds: 5
+    n_folds: 10
     clip_start: 0
     clip_end: 10000
     max_epochs: 40

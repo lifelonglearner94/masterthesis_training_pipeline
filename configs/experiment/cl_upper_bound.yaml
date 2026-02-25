@@ -41,7 +41,7 @@ test: False
 # DATA DEFAULTS (overridden by cl_train.py — joint training uses ALL clips)
 # =============================================================================
 data:
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   pin_memory: true
 
@@ -57,16 +57,16 @@ model:
   # Loss
   loss_weight_teacher: 1.0
   loss_weight_jump: 1.0
-  loss_type: "l2"
+  loss_type: "l1"
 
   # Curriculum (scaled for longer training on more data)
   curriculum_schedule:
     - epoch: 0
       loss_weight_teacher: 1.0
     - epoch: 10
-      loss_weight_teacher: 0.7
+      loss_weight_teacher: 1.0
     - epoch: 20
-      loss_weight_teacher: 0.3
+      loss_weight_teacher: 1.0
 
   # Optimizer (V-JEPA2 paper settings)
   learning_rate: 4.25e-4
@@ -90,7 +90,7 @@ trainer:
   max_epochs: 40
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm
-  precision: "16-mixed"
+  precision: 32
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
