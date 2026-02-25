@@ -300,12 +300,14 @@ def evaluate_all_tasks(
         if tta_was_enabled:
             model.tta_enabled = tta_was_enabled
 
-        # Collect the loss metric
+        # Collect loss metrics (teacher/L1 and jump)
         loss = eval_trainer.callback_metrics.get("test/loss")
-        if loss is None:
-            loss = eval_trainer.callback_metrics.get("test/loss_jump")
-        if loss is not None:
-            loss_val = loss.item() if hasattr(loss, "item") else float(loss)
+        loss_jump = eval_trainer.callback_metrics.get("test/loss_jump")
+
+        # Primary R-matrix: teacher loss (fallback to jump if unavailable)
+        primary_loss = loss if loss is not None else loss_jump
+        if primary_loss is not None:
+            loss_val = primary_loss.item() if hasattr(primary_loss, "item") else float(primary_loss)
             tracker.update(train_exp_id, partition["exp_id"], loss_val)
             log.info(
                 f"  R[{train_exp_id}, {partition['exp_id']}] = {loss_val:.6f}"
@@ -315,22 +317,34 @@ def evaluate_all_tasks(
                 f"  No loss metric found for partition '{partition['name']}'"
             )
 
+        # Secondary R-matrix: jump loss
+        if loss_jump is not None:
+            jump_val = loss_jump.item() if hasattr(loss_jump, "item") else float(loss_jump)
+            tracker.update_jump(train_exp_id, partition["exp_id"], jump_val)
+            log.info(
+                f"  R_jump[{train_exp_id}, {partition['exp_id']}] = {jump_val:.6f}"
+            )
+
     # Unfreeze HOPE inner loops after evaluation
     if is_hope:
         model.model.unfreeze_all_inner_loops()
 
-    # Compute and log CL metrics
+    # Compute and log CL metrics (both teacher and jump)
     cl_metrics = tracker.compute_all_metrics(train_exp_id)
+    cl_metrics_jump = tracker.compute_all_metrics_jump(train_exp_id)
+    all_metrics = {**cl_metrics, **cl_metrics_jump}
+
     log.info(f"CL Metrics after {phase_name}:")
-    for k, v in cl_metrics.items():
+    for k, v in all_metrics.items():
         log.info(f"  {k}: {v:.6f}")
 
     # Log CL metrics to W&B
     if wandb_logger.experiment is not None:
-        wandb_logger.experiment.log(cl_metrics)
-        # Log R-matrix as a table
+        wandb_logger.experiment.log(all_metrics)
+        # Log R-matrices
         wandb_logger.experiment.log({
             "cl/R_matrix": tracker.R_matrix.tolist(),
+            "cl_jump/R_matrix": tracker.R_matrix_jump.tolist(),
         })
 
     finish_wandb(wandb_logger)
@@ -365,11 +379,19 @@ def run_base_training(
     # Instantiate model
     model = instantiate_model(cfg)
 
+    # Reserve eval clips at end of base range to prevent data leak
+    eval_clips = cfg.cl.eval.clips_per_task
+    train_clip_end = base_cfg.clip_end - eval_clips
+    log.info(
+        f"  Reserving clips {train_clip_end}-{base_cfg.clip_end} for evaluation "
+        f"(training on {base_cfg.clip_start}-{train_clip_end})"
+    )
+
     # Create datamodule for base training
     dm = create_datamodule(
         cfg,
         clip_start=base_cfg.clip_start,
-        clip_end=base_cfg.clip_end,
+        clip_end=train_clip_end,
         val_split=base_cfg.get("val_split", 0.1),
     )
 
@@ -520,6 +542,16 @@ def run_task_training_finetune(
     eval_clips = cfg.cl.eval.clips_per_task
     train_clip_end = task_cfg.clip_end - eval_clips
 
+    # Disable curriculum schedule during task fine-tuning (methodically cleaner)
+    model.disable_curriculum = True
+
+    # Override learning rate for task fine-tuning if configured
+    original_lr = getattr(model, "learning_rate", None)
+    task_lr = task_train_cfg.get("learning_rate", None)
+    if task_lr is not None:
+        model.learning_rate = task_lr
+        log.info(f"  Task LR override: {original_lr} → {task_lr}")
+
     # Create datamodule for task training
     dm = create_datamodule(
         cfg,
@@ -551,6 +583,11 @@ def run_task_training_finetune(
 
     # Train on task data
     trainer.fit(model=model, datamodule=dm)
+
+    # Restore original settings after task training
+    model.disable_curriculum = False
+    if task_lr is not None and original_lr is not None:
+        model.learning_rate = original_lr
 
     # Save checkpoint
     ckpt_path = f"{output_dir}/checkpoints/task_{task_idx}_{task_cfg.name}.ckpt"

@@ -41,7 +41,7 @@ The lower section of the diagram details the standardized **"Volle Evaluation"**
 **4.1. Evaluation Data Protocol**
 The evaluation process asks: "How exactly does full evaluation work?" The define protocol is:
 
-* **Fixed Validation Set:** A specific number of clips are randomly selected from *each* task. Crucially, this selection is fixed ("always the same ones!!") to ensure consistent cross-task comparison.
+* **Fixed Validation Set:** A specific number of clips are deterministically selected (the last N clips) from *each* task. Crucially, this selection is fixed ("always the same ones!!") to ensure consistent cross-task comparison.
 * **Inference Mode:** The models are frozen (weights are not updated) and run over this aggregated validation set.
 
 **4.2. Core Performance Metrics**

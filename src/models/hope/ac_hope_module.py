@@ -517,6 +517,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         if not self.curriculum_schedule:
             return
 
+        # Allow disabling curriculum during task fine-tuning phases
+        if getattr(self, "disable_curriculum", False):
+            return
+
         epoch = self.current_epoch
         params = self._get_curriculum_params_for_epoch(epoch)
 
