@@ -41,8 +41,8 @@ test: False
 # DATA DEFAULTS (overridden by cl_train.py — joint training uses ALL clips)
 # =============================================================================
 data:
-  batch_size: 32
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   pin_memory: true
 
 # =============================================================================

@@ -38,8 +38,8 @@ test: False
 # DATA DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 data:
-  batch_size: 32
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   pin_memory: true
 
 # =============================================================================
