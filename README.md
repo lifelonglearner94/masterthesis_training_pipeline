@@ -55,8 +55,10 @@ After each phase, a **full evaluation** (no weight updates) runs on fixed valida
 
 ### Running the full CL experiments
 
-uv run src/cl_train.py experiment=cl_cross_validation paths.data_dir=/path/to/clips
-
+# Run all 5 CL experiments sequentially
+```bash
+./run_all_cl_experiments.sh /path/to/clips
+```
 ```bash
 # AC-ViT + TTA (tasks via test-time adaptation)
 uv run src/cl_train.py experiment=cl_ac_vit paths.data_dir=/path/to/clips
