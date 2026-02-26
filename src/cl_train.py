@@ -100,6 +100,8 @@ def create_trainer(
     log_every_n_steps: int = 50,
     gradient_clip_val: float | None = None,
     precision: str | int = "16-mixed",
+    num_sanity_val_steps: int | None = None,
+    limit_val_batches: int | float = 1.0,
 ) -> Trainer:
     """Create a Trainer for a single CL phase."""
     callbacks: list[Callback] = [RichProgressBar()]
@@ -129,6 +131,8 @@ def create_trainer(
         log_every_n_steps=log_every_n_steps,
         enable_checkpointing=enable_checkpointing,
         check_val_every_n_epoch=1,
+        num_sanity_val_steps=num_sanity_val_steps,
+        limit_val_batches=limit_val_batches,
     )
 
     return trainer
@@ -553,11 +557,12 @@ def run_task_training_finetune(
         log.info(f"  Task LR override: {original_lr} → {task_lr}")
 
     # Create datamodule for task training
+    val_split = task_train_cfg.get("val_split", 0.0)
     dm = create_datamodule(
         cfg,
         clip_start=task_cfg.clip_start,
         clip_end=train_clip_end,
-        val_split=task_train_cfg.get("val_split", 0.0),
+        val_split=val_split,
     )
 
     # Create W&B logger
@@ -571,6 +576,11 @@ def run_task_training_finetune(
         save_dir=f"{output_dir}/task_{task_idx}",
     )
 
+    # When val_split=0.0 there is no validation set, so disable
+    # Lightning's sanity-check and validation loop to avoid a crash
+    # (val_dataloader() returns None when there is no val dataset).
+    no_val = val_split == 0.0
+
     # Create trainer
     trainer = create_trainer(
         cfg,
@@ -579,6 +589,8 @@ def run_task_training_finetune(
         output_dir=f"{output_dir}/task_{task_idx}",
         gradient_clip_val=OmegaConf.select(cfg, "trainer.gradient_clip_val", default=3.0),
         precision=OmegaConf.select(cfg, "trainer.precision", default="32"),
+        num_sanity_val_steps=0 if no_val else None,
+        limit_val_batches=0 if no_val else 1.0,
     )
 
     # Train on task data
@@ -762,8 +774,18 @@ def _run_sequential_pipeline(cfg: DictConfig) -> None:
         num_tasks=num_tasks, higher_is_better=False
     )
 
-    # PHASE 0: BASE TRAINING
-    model, base_ckpt = run_base_training(cfg, wandb_group, output_dir)
+    # PHASE 0: BASE TRAINING (or resume from existing checkpoint)
+    resume_ckpt = cl_cfg.get("resume_from_base_checkpoint", None)
+    if resume_ckpt:
+        log.info("=" * 70)
+        log.info("SKIPPING BASE TRAINING — resuming from checkpoint")
+        log.info(f"  Checkpoint: {resume_ckpt}")
+        log.info("=" * 70)
+        model = instantiate_model(cfg)
+        load_checkpoint_weights(model, resume_ckpt)
+        base_ckpt = resume_ckpt
+    else:
+        model, base_ckpt = run_base_training(cfg, wandb_group, output_dir)
 
     log.info("\n--- Evaluation after Base Training ---")
     evaluate_all_tasks(

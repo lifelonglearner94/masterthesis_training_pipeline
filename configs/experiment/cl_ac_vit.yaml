@@ -104,6 +104,10 @@ cl:
   # Task training mode: "tta" for AC-ViT, "finetune" for HOPE
   task_training_mode: "tta"
 
+  # Resume: set to a checkpoint path to skip base training and start from tasks
+  # e.g.  cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
+  resume_from_base_checkpoint: null
+
   # --- Base Training Phase ---
   base_training:
     clip_start: 0

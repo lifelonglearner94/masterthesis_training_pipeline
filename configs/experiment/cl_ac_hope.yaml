@@ -132,6 +132,10 @@ cl:
   # Task training mode: "finetune" for HOPE (regular gradient descent)
   task_training_mode: "finetune"
 
+  # Resume: set to a checkpoint path to skip base training and start from tasks
+  # e.g.  cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
+  resume_from_base_checkpoint: null
+
   # --- Base Training Phase ---
   base_training:
     clip_start: 0
