@@ -581,16 +581,17 @@ class BaselineLitModule(ACPredictorLossMixin, L.LightningModule):
         )
 
         # Log metrics
-        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True)
-        self.log("test/loss", loss, prog_bar=True, sync_dist=True)
+        bs = features.shape[0]
+        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log("test/loss", loss, prog_bar=True, sync_dist=True, batch_size=bs)
 
         for step, step_loss in enumerate(per_timestep_losses):
             T = self.num_timesteps
             k = min(self.jump_k, T)
             tau_min = T + 1 - k
             target_frame = tau_min + step
-            self.log(f"test/loss_jump_tau_{target_frame}", step_loss.mean(), sync_dist=True)
+            self.log(f"test/loss_jump_tau_{target_frame}", step_loss.mean(), sync_dist=True, batch_size=bs)
 
         # Store per-clip results
         per_sample_jump_losses = per_sample_losses[0]

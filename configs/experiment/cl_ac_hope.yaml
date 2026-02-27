@@ -117,7 +117,7 @@ model:
 # TRAINER DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 trainer:
-  max_epochs: 30
+  max_epochs: 40
   precision: 32  # HOPE inner-loop needs full precision
   gradient_clip_val: 3.0
   gradient_clip_algorithm: norm

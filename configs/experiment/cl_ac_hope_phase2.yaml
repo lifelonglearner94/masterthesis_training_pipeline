@@ -1,23 +1,25 @@
 # @package _global_
 # =============================================================================
-# Continual Learning Pipeline — AC-ViT + TTA
+# Continual Learning Pipeline — AC-HOPE-ViT Phase 2: Meta-Learning Fix
 # =============================================================================
-# Full CL experiment: Base Training (5000 clips) → 5 Sequential Tasks (TTA)
-# with full evaluation after each phase.
+# Builds on Phase 1 (cl_ac_hope_phase1.yaml) with one additional change:
+#   4. titan_detach_interval: 1 → 3  (richer meta-gradients for memory init)
+#
+# All Phase 1 fixes retained:
+#   1. surprise_threshold: 0.1
+#   2. task_training.learning_rate: 2e-5
+#   3. gradient_clip_val: 1.2
+#
+# Note: titan_detach_interval=3 increases peak VRAM ~2-3× due to retained
+#       computation graphs across 3 inner-loop DGD steps.
 #
 # Usage:
-#   uv run src/cl_train.py experiment=cl_ac_vit paths.data_dir=/path/to/clips
-#
-# Architecture: AC-ViT (standard transformer, 24 layers, ~43M params)
-# Task training: Test-Time Adaptation (TTA) with accumulating weight updates
-# Evaluation: Frozen model (no TTA), pure inference on fixed eval clips
-#
-# W&B: Each phase creates a new run, all grouped under cl.wandb_group
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase2 paths.data_dir=/path/to/clips
 # =============================================================================
 
 defaults:
   - override /data: precomputed_features
-  - override /model: ac_predictor
+  - override /model: ac_hope_vit
   - override /trainer: default
   - override /callbacks: default
   - override /logger: wandb
@@ -25,8 +27,8 @@ defaults:
 # =============================================================================
 # EXPERIMENT METADATA
 # =============================================================================
-task_name: "cl_ac_vit"
-tags: ["cl", "continual_learning", "ac_vit", "tta"]
+task_name: "cl_ac_hope_phase2"
+tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "param_matched", "phase2_meta_fix"]
 seed: 42
 train: True
 test: False
@@ -40,69 +42,94 @@ data:
   pin_memory: true
 
 # =============================================================================
-# MODEL: AC-ViT Predictor (same architecture as vjepa2_ac.yaml)
+# MODEL: AC-HOPE-ViT Param-Matched (same as ac_hope_vit_param_matched.yaml)
 # =============================================================================
 model:
   T_teacher: 7
   jump_k: 3
-  use_activation_checkpointing: true
+  use_activation_checkpointing: false  # HOPE DGD incompatible with checkpointing
   action_embed_dim: 2
+
+  # HOPE architecture (param-matched: depth=6, ~42M params)
+  depth: 6
+  titan_hidden_multiplier: 2
+  use_rope: true
+  titan_grad_clip_inner: 1.0
+  chunk_size: 1
+  titan_detach_interval: 3  # PHASE 2 FIX: unroll 3 DGD steps before detach → richer meta-gradient for M_{□,0}
+  surprise_threshold: 0.1  # PHASE 1 FIX: novelty gate — only update memory when retrieval error exceeds threshold
+
+  # CMS levels
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 4
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 16
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+
+  # Diagnostics
+  log_hope_diagnostics: true
 
   # Loss
   loss_weight_teacher: 1.0
   loss_weight_jump: 1.0
   loss_type: "l1"
 
-  # Curriculum for base training (tasks use TTA, no curriculum)  ... did set it to 1.0, so effectively no curriculum
+  # Curriculum for base training  ... did set it to 1.0, so effectively no curriculum
   curriculum_schedule:
     - epoch: 0
       loss_weight_teacher: 1.0
-    - epoch: 7
+    - epoch: 15
       loss_weight_teacher: 1.0
-    - epoch: 11
+    - epoch: 25
       loss_weight_teacher: 1.0
 
-  # Optimizer (V-JEPA2 paper settings, used for base training)
-  learning_rate: 4.25e-4
+  # Optimizer (HOPE bi-level optimization)
+  learning_rate: 1.5e-4
   weight_decay: 0.04
   betas: [0.9, 0.999]
 
-  # LR schedule (iteration-based)
-  use_iteration_scheduler: true
-  warmup_pct: 0.085
-  constant_pct: 0.83
-  decay_pct: 0.085
-  warmup_start_lr: 7.5e-5
+  # Per-group LR scaling
+  titan_lr_scale: 0.2
+  cms_lr_scale: 1.0
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.1
 
-  # TTA defaults (activated by cl_train.py during task training)
+  # LR schedule (longer warmup for meta-learning)
+  use_iteration_scheduler: true
+  warmup_pct: 0.15
+  constant_pct: 0.75
+  decay_pct: 0.10
+  warmup_start_lr: 3.0e-5
+
+  # TTA defaults (not used for task training, but available)
   tta_enabled: false
-  tta_mode: "jump"
-  tta_lr: 5e-4
-  tta_grad_clip: 5.0
-  tta_reset_per_clip: false
-  tta_num_adaptation_steps: 5
-  tta_adapt_layers: "layernorm+attn_proj"
-  tta_optimizer_type: "adamw"
-  tta_optimizer_betas: [0.9, 0.999]
 
 # =============================================================================
 # TRAINER DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 trainer:
   max_epochs: 40
-  gradient_clip_val: 1.01
+  precision: 32  # HOPE inner-loop needs full precision
+  gradient_clip_val: 1.2  # PHASE 1 FIX: tighter clipping to dampen bi-level gradient spikes at task boundaries
   gradient_clip_algorithm: norm
-  precision: 32
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
 # =============================================================================
 cl:
-  # W&B grouping: all runs in this experiment share a group
-  wandb_group: "cl_ac_vit_${now:%Y%m%d_%H%M%S}"
+  # W&B grouping
+  wandb_group: "cl_ac_hope_phase2_${now:%Y%m%d_%H%M%S}"
 
-  # Task training mode: "tta" for AC-ViT, "finetune" for HOPE
-  task_training_mode: "tta"
+  # Task training mode: "finetune" for HOPE (regular gradient descent)
+  task_training_mode: "finetune"
 
   # Resume: set to a checkpoint path to skip base training and start from tasks
   # e.g.  cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
@@ -116,8 +143,6 @@ cl:
     val_split: 0.1
 
   # --- Sequential Tasks ---
-  # Each task has 1000 clips. Last `eval.clips_per_task` clips are reserved
-  # for evaluation; the rest are used for task training.
   tasks:
     - name: "scaling_shift"
       clip_start: 5000
@@ -137,24 +162,11 @@ cl:
 
   # --- Evaluation Configuration ---
   eval:
-    # Fixed number of clips from each partition used for evaluation.
-    # These are always the LAST N clips of each range.
-    # E.g., base eval = clips 4900-4999, task 1 eval = clips 5900-5999
     clips_per_task: 100
 
-  # --- Task Training Settings (fine-tuning, comparable to HOPE) ---
+  # --- Task Training Settings (fine-tuning) ---
   task_training:
     max_epochs: 10
     val_split: 0.0
-    # Lower LR for fine-tuning to reduce catastrophic forgetting (1/3 of base LR)
-    learning_rate: 1.4e-4
-
-  # --- TTA Settings for Task Training ---
-  tta:
-    tta_mode: "jump"
-    tta_lr: 5e-4
-    tta_grad_clip: 5.0
-    tta_num_adaptation_steps: 5
-    tta_adapt_layers: "layernorm+attn_proj"
-    tta_optimizer_type: "adamw"
-    tta_optimizer_betas: [0.9, 0.999]
+    # PHASE 1 FIX: more conservative outer-loop LR to reduce weight drift during CL
+    learning_rate: 2e-5

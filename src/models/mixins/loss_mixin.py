@@ -366,8 +366,9 @@ class ACPredictorLossMixin:
         )
 
         # Log metrics
-        self.log(f"{stage}/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
-        self.log(f"{stage}/loss_jump", loss_jump, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
-        self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True)  # type: ignore[attr-defined]
+        bs = features.shape[0]
+        self.log(f"{stage}/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True, batch_size=bs)  # type: ignore[attr-defined]
+        self.log(f"{stage}/loss_jump", loss_jump, prog_bar=True, sync_dist=True, batch_size=bs)  # type: ignore[attr-defined]
+        self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True, batch_size=bs)  # type: ignore[attr-defined]
 
         return loss

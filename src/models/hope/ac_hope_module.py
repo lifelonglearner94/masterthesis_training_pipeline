@@ -342,9 +342,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             + self.loss_weight_jump * loss_jump
         )
 
-        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True)
-        self.log("test/loss", loss, prog_bar=True, sync_dist=True)
+        bs = features.shape[0]
+        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log("test/loss", loss, prog_bar=True, sync_dist=True, batch_size=bs)
 
         T = self.num_timesteps
         k = min(self.jump_k, T)
@@ -355,6 +356,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 f"test/loss_jump_tau_{target_frame}",
                 step_loss.mean(),
                 sync_dist=True,
+                batch_size=bs,
             )
 
         per_sample_jump_losses = per_sample_losses[0]
@@ -454,8 +456,9 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             loss_jump,
             prog_bar=True,
             sync_dist=True,
+            batch_size=B,
         )
-        self.log("test/loss", loss_jump, prog_bar=True, sync_dist=True)
+        self.log("test/loss", loss_jump, prog_bar=True, sync_dist=True, batch_size=B)
 
         return torch.tensor(loss_jump, device=features.device)
 

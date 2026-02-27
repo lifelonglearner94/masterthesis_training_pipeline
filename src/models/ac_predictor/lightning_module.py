@@ -416,9 +416,9 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             per_timestep_losses: Per-timestep loss breakdown
         """
         # Log aggregate metrics
-        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True)
-        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True)
-        self.log("test/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("test/loss_teacher", loss_teacher, prog_bar=True, sync_dist=True, batch_size=1)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, sync_dist=True, batch_size=1)
+        self.log("test/loss", loss, prog_bar=True, sync_dist=True, batch_size=1)
 
         # Log per-timestep losses (target frames in the jump range)
         T = self.num_timesteps
@@ -426,7 +426,7 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         tau_min = T + 1 - k
         for step, step_loss in enumerate(per_timestep_losses):
             target_frame = tau_min + step
-            self.log(f"test/loss_jump_tau_{target_frame}", step_loss.mean(), sync_dist=True)
+            self.log(f"test/loss_jump_tau_{target_frame}", step_loss.mean(), sync_dist=True, batch_size=1)
 
     def _store_test_results(
         self,
@@ -674,15 +674,15 @@ class ACPredictorModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         loss_jump = sum(all_losses) / len(all_losses)
 
         # Log metrics
-        self.log("test/loss_jump", loss_jump, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("test/loss", loss_jump, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("test/loss_jump", loss_jump, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("test/loss", loss_jump, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
         # Log per-timestep losses
         tau_min = T + 1 - k
         for step in range(T_pred):
             if all_per_timestep_losses[step]:
                 step_mean = sum(all_per_timestep_losses[step]) / len(all_per_timestep_losses[step])
-                self.log(f"test/loss_jump_tau_{tau_min + step}", step_mean, on_step=False, on_epoch=True, sync_dist=True)
+                self.log(f"test/loss_jump_tau_{tau_min + step}", step_mean, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
 
         return torch.tensor(loss_jump, device=features.device)
 
