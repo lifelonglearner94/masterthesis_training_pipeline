@@ -89,6 +89,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         titan_layers: int = 2,
         titan_activation: str = "gelu",
         titan_grad_clip_inner: float = 1.0,
+        titan_grad_clip_backward: float = 1.0,
         cms_level_specs: list[dict] | None = None,
         cms_use_chunk_scheduling: bool = False,
         chunk_size: int = 0,
@@ -170,6 +171,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             titan_layers=titan_layers,
             titan_activation=titan_activation,
             titan_grad_clip_inner=titan_grad_clip_inner,
+            titan_grad_clip_backward=titan_grad_clip_backward,
             cms_level_specs=cms_level_specs,
             cms_use_chunk_scheduling=cms_use_chunk_scheduling,
             chunk_size=chunk_size,
@@ -275,17 +277,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     # ─── Training / Validation ───
 
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
-        """Training step with HOPE diagnostic logging.
-
-        Resets all Titan memory active weights before each forward pass so
-        that DGD self-modification operates on fresh detached clones, avoiding
-        in-place modification errors on the outer autograd graph.
-
-        Adds auxiliary M_k/M_v retrieval-quality loss to provide gradient
-        flow to otherwise dead Titan parameters.
-        """
+        """Training step with HOPE diagnostic logging."""
         self.model.reset_all_memories()
-
         loss = self._shared_step(batch, "train")
 
         aux_loss = self.model.get_aux_loss()

@@ -67,6 +67,7 @@ class HOPEBlockConfig:
     titan_layers: int = 2
     titan_activation: str = TitanActivation.GELU
     titan_grad_clip_inner: float = 1.0
+    titan_grad_clip_backward: float = 1.0  # Level-2 backward clip for DGD chain
 
     # CMS settings
     cms_levels: list[LevelSpec] = field(
@@ -141,6 +142,7 @@ class HOPEBlock(nn.Module):
             num_layers=config.titan_layers,
             activation=config.titan_activation,
             grad_clip_inner=config.titan_grad_clip_inner,
+            grad_clip_backward=config.titan_grad_clip_backward,
             detach_interval=titan_detach_interval,
         )
         self.M_k = TitanMemory(mem_cfg)  # Key generation memory

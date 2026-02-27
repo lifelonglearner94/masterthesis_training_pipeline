@@ -46,6 +46,89 @@ from torch import Tensor
 log = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Custom autograd functions for stable DGD backward
+# ──────────────────────────────────────────────────────────────────────────
+
+class _StableGradPrecondScale(torch.autograd.Function):
+    """w_old * precond in forward; normalised backward to prevent overflow.
+
+    Forward:  out = w_old * precond                         (unchanged)
+    Backward: grad_w_old   = grad_output * precond          (standard)
+              grad_precond = grad_output * sign(w_old)       (normalised)
+
+    Why sign(w_old) instead of w_old?
+    The DGD preconditioner `precond = clamp(α − η·k², 0, 1)` depends on
+    lr_feat (from M_eta) and alpha_feat (from M_alpha).  The raw backward
+    `grad_precond = grad_output * w_old` scales every element by the full
+    weight magnitude.  With ~30 memory-chain gradient paths per block
+    (5 memories × 2 weights × live chunk pairs), each contributing
+    O(||w_old||) amplification, the accumulated gradient compounds
+    exponentially across 6 blocks → float32 overflow → NaN.
+
+    Replacing w_old with sign(w_old) preserves the gradient *direction*
+    while bounding each element's magnitude to |grad_output|.  Combined
+    with _BackwardGradClip (Level 2), this prevents both per-element
+    and per-tensor gradient explosion.
+
+    See docs/20260227_phase2_nan_debugging_session_report.md §3 for the
+    full numerical analysis.
+    """
+
+    @staticmethod
+    def forward(ctx, w_old: Tensor, precond: Tensor) -> Tensor:
+        ctx.save_for_backward(w_old, precond)
+        return w_old * precond
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        w_old, precond = ctx.saved_tensors
+        grad_w_old = grad_output * precond
+        # Normalise: sign(w_old) instead of w_old
+        grad_precond = grad_output * w_old.sign()
+        return grad_w_old, grad_precond
+
+
+class _BackwardGradClip(torch.autograd.Function):
+    """Identity in forward; clips backward gradient norm to *max_norm*.
+
+    This is the Level-2 defense: after each DGD update the new active
+    weights are wrapped with this function so that the backward gradient
+    flowing *through* them (from the next chunk's forward) is norm-clipped.
+
+    Without this, the SUM of ~30 bounded gradient paths (from
+    _StableGradPrecondScale * 5 memories * 2 weights) compounds across
+    blocks.  With this clip each memory's backward contribution is bounded,
+    ensuring linear (not exponential) gradient growth across blocks.
+
+    The default max_norm = grad_clip_inner (typically 1.0), matching the
+    inner-loop gradient clipping for symmetry.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, max_norm: float) -> Tensor:
+        ctx.max_norm = max_norm
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        max_norm = ctx.max_norm
+        grad_norm = grad_output.norm()
+        if grad_norm > max_norm:
+            grad_output = grad_output * (max_norm / (grad_norm + 1e-8))
+        return grad_output, None
+
+
+def _stable_precond_scale(w_old: Tensor, precond: Tensor) -> Tensor:
+    """Convenience wrapper for _StableGradPrecondScale.apply."""
+    return _StableGradPrecondScale.apply(w_old, precond)
+
+
+def _backward_grad_clip(x: Tensor, max_norm: float) -> Tensor:
+    """Convenience wrapper for _BackwardGradClip.apply."""
+    return _BackwardGradClip.apply(x, max_norm)
+
+
 class Activation(StrEnum):
     """Activation function types for Titan Memory."""
     GELU = "gelu"
@@ -63,6 +146,9 @@ class TitanMemoryConfig:
         num_layers: Number of layers (default: 2).
         activation: Activation function name (default: "gelu").
         grad_clip_inner: Gradient clipping threshold for inner loop (default: 1.0).
+        grad_clip_backward: Max gradient norm for DGD backward path (default: 1.0).
+            Level-2 defense: clips the backward gradient flowing through active
+            weights after DGD updates.  Set to 0 to disable.
         output_norm: Apply LayerNorm to output (default: True).
         detach_interval: Detach memory graph every N update steps, 0 = never (default: 0).
     """
@@ -72,6 +158,7 @@ class TitanMemoryConfig:
     num_layers: int = 2
     activation: str = "gelu"
     grad_clip_inner: float = 1.0
+    grad_clip_backward: float = 1.0
     output_norm: bool = True
     detach_interval: int = 0
 
@@ -311,6 +398,21 @@ class TitanMemory(nn.Module):
             )
 
         # ─── Compute per-feature η and α for weight update ───
+        # LIVE (not detached): lr_feat and alpha_feat remain in the computation
+        # graph so that M_eta/M_alpha receive outer-loss meta-gradients.
+        # This preserves the paper's core requirement (Behrouz 2025, §8.1):
+        # "the initial states of ALL memories are meta-learned".
+        #
+        # Gradient stability is ensured by a two-level defense:
+        #   Level 1 — _StableGradPrecondScale: element-wise sign normalisation
+        #             on w_old * precond prevents individual weight magnitudes
+        #             from amplifying backward gradients.
+        #   Level 2 — _BackwardGradClip: norm clipping on the DGD output active
+        #             weights bounds each memory's total backward contribution,
+        #             preventing the sum of ~30 gradient paths per block from
+        #             compounding exponentially across 6 blocks.
+        #
+        # See docs/20260227_phase2_nan_debugging_session_report.md for analysis.
         lr_feat = lr.mean(dim=(0, 1))
         alpha_feat = (
             alpha.mean(dim=(0, 1)) if alpha is not None
@@ -345,20 +447,30 @@ class TitanMemory(nn.Module):
             # DGD preconditioned update (Eq. 93): W_new = W_old * (α − η·k²) − η·grad
             # STABILITY: Clamp preconditioner to [0, 1] — without this, precond^7
             # across sequential chunk updates causes exponential weight growth / NaN.
+            # Level 1: _stable_precond_scale uses sign(w_old) in backward to
+            # prevent element-wise gradient amplification by weight magnitudes.
             if idx == 0:
                 # w1 [hidden, D]: preconditioner scales columns (input dim = D)
                 precond = alpha_feat.unsqueeze(0) - lr_feat.unsqueeze(0) * k_sq.unsqueeze(0)
                 precond = precond.clamp(0.0, 1.0)
-                new_w = w_old * precond - lr_feat.unsqueeze(0) * grad
+                new_w = _stable_precond_scale(w_old, precond) - lr_feat.unsqueeze(0) * grad
             else:
                 # w2 [D, hidden]: preconditioner scales rows (output dim = D)
                 precond = alpha_feat.unsqueeze(1) - lr_feat.unsqueeze(1) * k_sq.unsqueeze(1)
                 precond = precond.clamp(0.0, 1.0)
-                new_w = w_old * precond - lr_feat.unsqueeze(1) * grad
+                new_w = _stable_precond_scale(w_old, precond) - lr_feat.unsqueeze(1) * grad
             new_weights.append(new_w)
 
-        self._active_w1 = new_weights[0]
-        self._active_w2 = new_weights[1]
+        # Level 2: Clip backward gradient norm on the new active weights.
+        # This bounds each memory's total backward contribution, preventing
+        # accumulation of ~30 gradient paths from compounding across blocks.
+        clip_bw = self.config.grad_clip_backward
+        if clip_bw > 0:
+            self._active_w1 = _backward_grad_clip(new_weights[0], clip_bw)
+            self._active_w2 = _backward_grad_clip(new_weights[1], clip_bw)
+        else:
+            self._active_w1 = new_weights[0]
+            self._active_w2 = new_weights[1]
 
         # ─── Periodic detach to bound VRAM ───
         step = self._step_counter.item() + 1

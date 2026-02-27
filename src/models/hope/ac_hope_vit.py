@@ -40,6 +40,7 @@ from src.models.ac_predictor.utils.modules import build_action_block_causal_atte
 from src.models.ac_predictor.utils.tensors import trunc_normal_
 from src.models.hope.cms import LevelSpec
 from src.models.hope.hope_block import HOPEBlock, HOPEBlockConfig
+from src.models.hope.titan_memory import _backward_grad_clip
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ class ACHOPEViT(nn.Module):
         titan_layers: Number of layers in Titan memory MLP.
         titan_activation: Activation function for Titan memory.
         titan_grad_clip_inner: Gradient clip for inner-loop (DGD) gradients.
+        titan_grad_clip_backward: Max gradient norm for DGD backward path (default 1.0).
         cms_level_specs: List of CMS level specifications.
         cms_use_chunk_scheduling: Whether CMS uses chunk-based scheduling.
         chunk_size: Chunk size for intra-sequence Titan updates (0 = full sequence).
@@ -110,6 +112,7 @@ class ACHOPEViT(nn.Module):
         titan_layers: int = 2,
         titan_activation: str = "gelu",
         titan_grad_clip_inner: float = 1.0,
+        titan_grad_clip_backward: float = 1.0,
         cms_level_specs: list[BlockConfig] | None = None,
         cms_use_chunk_scheduling: bool = False,
         chunk_size: int = 0,
@@ -130,6 +133,7 @@ class ACHOPEViT(nn.Module):
         self.log_hope_diagnostics = log_hope_diagnostics
         self.use_activation_checkpointing = use_activation_checkpointing
         self.init_std = init_std
+        self.titan_grad_clip_backward = titan_grad_clip_backward
 
         # ─── Stage 1: Input & Embedding (same as AC_ViT) ───
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -164,6 +168,7 @@ class ACHOPEViT(nn.Module):
                     titan_layers=titan_layers,
                     titan_activation=titan_activation,
                     titan_grad_clip_inner=titan_grad_clip_inner,
+                    titan_grad_clip_backward=titan_grad_clip_backward,
                     cms_levels=cms_levels,
                     cms_use_chunk_scheduling=cms_use_chunk_scheduling,
                     chunk_size=chunk_size,
@@ -196,6 +201,7 @@ class ACHOPEViT(nn.Module):
             "titan_hidden_multiplier": titan_hidden_multiplier,
             "titan_layers": titan_layers,
             "titan_grad_clip_inner": titan_grad_clip_inner,
+            "titan_grad_clip_backward": titan_grad_clip_backward,
             "cms_levels": len(cms_levels),
             "use_rope": use_rope,
             "chunk_size": chunk_size,
@@ -445,6 +451,18 @@ class ACHOPEViT(nn.Module):
                     action_tokens=cond_tokens,
                     target_timestep=target_timestep,
                 )
+
+            # Level 3: block-level backward gradient clipping.
+            # Prevents gradient compounding across blocks by bounding the
+            # backward gradient norm of the block output.  Without this,
+            # the gradient flowing backward through the INPUT path of
+            # each Titan memory (grad_key = grad_output @ active_w) is
+            # unclipped and compounds exponentially across 6 blocks:
+            #   block_5: O(0.06) → block_4: O(3.8e9) → block_3: O(1.6e19) → Inf
+            # With this clip, each block sees at most grad_clip_backward from downstream.
+            if self.titan_grad_clip_backward > 0 and self.training:
+                x = _backward_grad_clip(x, self.titan_grad_clip_backward)
+
             log.debug(
                 f"    [AC_HOPE_ViT] Block {i} output: shape={x.shape}, "
                 f"min={x.min().item():.4f}, max={x.max().item():.4f}"
