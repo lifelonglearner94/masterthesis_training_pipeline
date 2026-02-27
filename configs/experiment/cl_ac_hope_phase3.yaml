@@ -23,7 +23,7 @@ test: False
 # DATA DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 data:
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   pin_memory: true
 
@@ -106,6 +106,7 @@ trainer:
   precision: 32  # HOPE inner-loop needs full precision
   gradient_clip_val: 3.0  # Keep original for base training (unrolled graph needs headroom); phase 1's 1.2 is too tight here
   gradient_clip_algorithm: norm
+  accumulate_grad_batches: 2  # effective batch size 16 (2 × actual batch_size 8)
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
