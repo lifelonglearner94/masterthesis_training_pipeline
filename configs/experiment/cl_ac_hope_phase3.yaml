@@ -1,0 +1,158 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-HOPE-ViT Phase 3
+
+# higher DEPTH
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase2"
+tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "param_matched", "phase2_meta_fix"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-ViT Param-Matched (same as ac_hope_vit_param_matched.yaml)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false  # HOPE DGD incompatible with checkpointing
+  action_embed_dim: 2
+
+  # HOPE architecture (more depth-matched: depth=12s)
+  depth: 12
+  titan_hidden_multiplier: 2
+  use_rope: true
+  titan_grad_clip_inner: 1.0
+  chunk_size: 1
+  titan_detach_interval: 2  # PHASE 2 FIX: unroll 2 DGD steps before detach → richer meta-gradient for M_{□,0} (3 causes NaN)
+  surprise_threshold: 0.1  # PHASE 1 FIX: novelty gate — only update memory when retrieval error exceeds threshold
+
+  # CMS levels
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 4
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 16
+      hidden_multiplier: 4.0
+      warmup_steps: 0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum for base training  ... did set it to 1.0, so effectively no curriculum
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # Optimizer (HOPE bi-level optimization)
+  learning_rate: 1.5e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  titan_lr_scale: 0.2
+  cms_lr_scale: 1.0
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.1
+
+  # LR schedule (longer warmup for meta-learning)
+  use_iteration_scheduler: true
+  warmup_pct: 0.15
+  constant_pct: 0.75
+  decay_pct: 0.10
+  warmup_start_lr: 3.0e-5
+
+  # TTA defaults (not used for task training, but available)
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+trainer:
+  max_epochs: 40
+  precision: 32  # HOPE inner-loop needs full precision
+  gradient_clip_val: 3.0  # Keep original for base training (unrolled graph needs headroom); phase 1's 1.2 is too tight here
+  gradient_clip_algorithm: norm
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  # W&B grouping
+  wandb_group: "cl_ac_hope_phase2_${now:%Y%m%d_%H%M%S}"
+
+  # Task training mode: "finetune" for HOPE (regular gradient descent)
+  task_training_mode: "finetune"
+
+  # Resume: set to a checkpoint path to skip base training and start from tasks
+  # e.g.  cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
+  resume_from_base_checkpoint: null
+
+  # --- Base Training Phase ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 40
+    val_split: 0.1
+
+  # --- Sequential Tasks ---
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  # --- Evaluation Configuration ---
+  eval:
+    clips_per_task: 100
+
+  # --- Task Training Settings (fine-tuning) ---
+  task_training:
+    max_epochs: 10
+    val_split: 0.0
+    # PHASE 1 FIX: more conservative outer-loop LR to reduce weight drift during CL
+    learning_rate: 2e-5
