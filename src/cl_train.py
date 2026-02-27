@@ -581,12 +581,13 @@ def run_task_training_finetune(
     # (val_dataloader() returns None when there is no val dataset).
     no_val = val_split == 0.0
 
-    # Create trainer
+    # Create trainer (no periodic checkpointing — we save manually after each task)
     trainer = create_trainer(
         cfg,
         wandb_logger,
         max_epochs=task_train_cfg.max_epochs,
         output_dir=f"{output_dir}/task_{task_idx}",
+        enable_checkpointing=False,
         gradient_clip_val=OmegaConf.select(cfg, "trainer.gradient_clip_val", default=3.0),
         precision=OmegaConf.select(cfg, "trainer.precision", default="32"),
         num_sanity_val_steps=0 if no_val else None,
