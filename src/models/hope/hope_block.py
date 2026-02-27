@@ -572,9 +572,25 @@ class HOPEBlock(nn.Module):
         # and similarly M_v params → v → target matching → aux_loss.
         # Both k and v are live tensors (in the computation graph from M_k/M_v
         # forward passes above), so gradients flow back to M_k/M_v parameters.
+        #
+        # CRITICAL: We use DETACHED M_memory weights for this retrieval so that
+        # the aux gradient only flows through k (→ M_k) and v (→ M_v), NOT
+        # through M_memory's DGD update chain. With detach_interval > 1, the
+        # post-update weights are still live (connected to nn.Parameters via the
+        # preconditioner), and backprop through [aux_loss → M_memory(k) →
+        # post-update weights → precond → w_old] includes a factor of ||w_old||
+        # (the full weight matrix). Across 5 memories × 6 blocks × 7 chunks,
+        # these terms overflow intermediate backward values to inf/NaN before
+        # gradient_clip_val can be applied. With detach_interval=1 this was
+        # harmless (weights are already detached), but with >1 it's fatal.
         if self.training and torch.is_grad_enabled():
-            # Retrieve using adaptive keys through the (now updated) memory
-            retrieved_via_k = self.M_memory(k)  # [B, N, D] — differentiable through k
+            # Retrieve using adaptive keys through M_memory with DETACHED weights
+            # so gradient flows through k only — not through the DGD update chain.
+            _w1 = self.M_memory._active_w1.detach()
+            _w2 = self.M_memory._active_w2.detach()
+            h = F.linear(k, _w1)
+            h = self.M_memory.act(h)
+            retrieved_via_k = self.M_memory.norm(F.linear(h, _w2) + k)
             # Measure how close retrieved values are to the adaptive v
             aux = F.mse_loss(retrieved_via_k, v.detach())  # M_k path
             aux = aux + F.mse_loss(retrieved_via_k.detach(), v)  # M_v path
