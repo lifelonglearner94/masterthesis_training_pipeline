@@ -1,7 +1,7 @@
 # Phase 2 NaN Fix: Detach M_memory Weights in Auxiliary Loss
 
-**Date:** 2026-02-27  
-**File changed:** `src/models/hope/hope_block.py` (`_update_memories()`)  
+**Date:** 2026-02-27
+**File changed:** `src/models/hope/hope_block.py` (`_update_memories()`)
 **Configs affected:** Any config with `titan_detach_interval > 1` (i.e. `cl_ac_hope_phase2.yaml`)
 
 ---
