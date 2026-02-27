@@ -42,8 +42,8 @@ model:
   use_rope: true
   titan_grad_clip_inner: 1.0
   chunk_size: 1
-  titan_detach_interval: 2  # PHASE 2 FIX: unroll 2 DGD steps before detach → richer meta-gradient for M_{□,0} (3 causes NaN)
-  surprise_threshold: 0.1  # PHASE 1 FIX: novelty gate — only update memory when retrieval error exceeds threshold
+  titan_detach_interval: 3  # PHASE 2 FIX: unroll 2 DGD steps before detach → richer meta-gradient for M_{□,0} (3 causes NaN)
+  surprise_threshold: 0.0  # PHASE 1 FIX: novelty gate — only update memory when retrieval error exceeds threshold
 
   # CMS levels
   cms_level_specs:
