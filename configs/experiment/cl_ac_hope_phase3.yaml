@@ -85,15 +85,15 @@ model:
   cms_level_specs:
     - name: "fast"
       update_period: 1
-      hidden_multiplier: 2.0     # [B] Down from 4.0 — free params for extra depth
+      hidden_multiplier: 4.0     # [B] Down from 4.0 — free params for extra depth
       warmup_steps: 0
     - name: "medium"
       update_period: 4
-      hidden_multiplier: 2.0     # [B]
+      hidden_multiplier: 4.0     # [B]
       warmup_steps: 0
     - name: "slow"
       update_period: 16
-      hidden_multiplier: 2.0     # [B]
+      hidden_multiplier: 4.0     # [B]
       warmup_steps: 0
 
   # Diagnostics
@@ -142,6 +142,7 @@ trainer:
   precision: 32                    # HOPE inner-loop needs full precision
   gradient_clip_val: 1.5           # [F] Down from 3.0 — tighter clip pairs with higher LR
   gradient_clip_algorithm: norm
+  accumulate_grad_batches: 2
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
