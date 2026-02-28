@@ -229,6 +229,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
 
         self._test_results: list[TestResultsDict] = []
 
+        # CL warm-start: when True, aux loss is not added during training.
+        # Set externally by cl_train.py when skip_hope_for_base is enabled.
+        self.skip_aux_loss: bool = False
+
     def _validate_temporal_dimensions(self, T_teacher: int, jump_k: int) -> None:
         """Validate that temporal dimensions are within bounds."""
         max_prediction_steps = self.num_timesteps - 1
@@ -281,10 +285,11 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.model.reset_all_memories()
         loss = self._shared_step(batch, "train")
 
-        aux_loss = self.model.get_aux_loss()
-        if aux_loss.item() > 0:
-            loss = loss + self.aux_loss_weight * aux_loss
-            self.log("train/aux_loss_mk_mv", aux_loss.detach(), sync_dist=True)
+        if not self.skip_aux_loss:
+            aux_loss = self.model.get_aux_loss()
+            if aux_loss.item() > 0:
+                loss = loss + self.aux_loss_weight * aux_loss
+                self.log("train/aux_loss_mk_mv", aux_loss.detach(), sync_dist=True)
 
         if self.log_hope_diagnostics and batch_idx % self._diagnostics_log_interval == 0:
             self._log_hope_diagnostics("train")

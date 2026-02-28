@@ -420,8 +420,29 @@ def run_base_training(
         precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
     )
 
+    # ─── HOPE warm-start: disable inner-loop DGD + aux loss for base task ───
+    skip_hope_for_base = cfg.cl.get("skip_hope_for_base", False)
+    is_hope_model = "hope" in cfg.get("task_name", "")
+    if skip_hope_for_base and is_hope_model:
+        log.info(
+            "HOPE warm-start: disabling inner-loop DGD and aux loss for "
+            "base training (no prior knowledge to protect yet)"
+        )
+        model.model.freeze_all_inner_loops()
+        model.skip_aux_loss = True
+
     # Train
     trainer.fit(model=model, datamodule=dm)
+
+    # ─── HOPE warm-start: re-enable after base training ───
+    if skip_hope_for_base and is_hope_model:
+        model.model.unfreeze_all_inner_loops()
+        model.skip_aux_loss = False
+        model.model.reset_all_memories()
+        log.info(
+            "HOPE warm-start: re-enabled inner-loop DGD + aux loss, "
+            "memories reset for clean CL start"
+        )
 
     # Save checkpoint
     ckpt_dir = f"{output_dir}/checkpoints"
@@ -556,6 +577,31 @@ def run_task_training_finetune(
         model.learning_rate = task_lr
         log.info(f"  Task LR override: {original_lr} → {task_lr}")
 
+    # Override warmup settings for task fine-tuning if configured.
+    # Fixes a bug where warmup_start_lr from base training could exceed
+    # the task LR (e.g. warmup_start_lr=3e-5 > task_lr=2e-5), causing
+    # a "warmup-down" effect that wastes early task training iterations.
+    original_warmup_pct = getattr(model, "warmup_pct", None)
+    original_warmup_start_lr = getattr(model, "warmup_start_lr", None)
+    task_warmup_pct = task_train_cfg.get("warmup_pct", None)
+    task_warmup_start_lr = task_train_cfg.get("warmup_start_lr", None)
+    if task_warmup_pct is not None:
+        model.warmup_pct = task_warmup_pct
+        log.info(f"  Task warmup_pct override: {original_warmup_pct} → {task_warmup_pct}")
+    if task_warmup_start_lr is not None:
+        model.warmup_start_lr = task_warmup_start_lr
+        log.info(f"  Task warmup_start_lr override: {original_warmup_start_lr} → {task_warmup_start_lr}")
+    elif task_lr is not None and original_warmup_start_lr is not None:
+        # Auto-fix: if task LR is set but warmup_start_lr is not overridden,
+        # ensure warmup_start_lr doesn't exceed the task LR.
+        if original_warmup_start_lr > task_lr:
+            safe_warmup_start_lr = task_lr * 0.2
+            model.warmup_start_lr = safe_warmup_start_lr
+            log.info(
+                f"  Task warmup_start_lr auto-fix: {original_warmup_start_lr} > task_lr {task_lr}, "
+                f"set to {safe_warmup_start_lr}"
+            )
+
     # Create datamodule for task training
     val_split = task_train_cfg.get("val_split", 0.0)
     dm = create_datamodule(
@@ -601,6 +647,10 @@ def run_task_training_finetune(
     model.disable_curriculum = False
     if task_lr is not None and original_lr is not None:
         model.learning_rate = original_lr
+    if original_warmup_pct is not None and (task_warmup_pct is not None or model.warmup_pct != original_warmup_pct):
+        model.warmup_pct = original_warmup_pct
+    if original_warmup_start_lr is not None and model.warmup_start_lr != original_warmup_start_lr:
+        model.warmup_start_lr = original_warmup_start_lr
 
     # Save checkpoint
     ckpt_path = f"{output_dir}/checkpoints/task_{task_idx}_{task_cfg.name}.ckpt"

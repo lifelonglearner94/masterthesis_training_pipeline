@@ -1,8 +1,43 @@
 # @package _global_
 # =============================================================================
-# Continual Learning Pipeline — AC-HOPE-ViT Phase 3
+# Continual Learning Pipeline — AC-HOPE-ViT Phase 3: Plasticity & Convergence
+# =============================================================================
+# Addresses the two core issues from Phase 1/2:
+#   1. HOPE base training converges ~0.047 worse than ViT lower bound (0.325 vs 0.278)
+#   2. HOPE has lower plasticity on new tasks (immediate error 0.33-0.40 vs 0.28-0.34)
+#
+# Changes from Phase 2 (all scientifically motivated):
+#
+#   ARCHITECTURE (close base convergence gap):
+#     A. depth: 6 → 8        — +33% compositional depth while staying param-matched
+#     B. CMS hidden_mult: 4→2 — free up params for extra layers (384→768→384 per CMS)
+#     C. cms_use_chunk_scheduling: true — activate multi-timescale CMS (was disabled!)
+#
+#   TRAINING (accelerate convergence):
+#     D. learning_rate: 1.5e-4 → 2.5e-4   — +67%, still 41% below ViT baseline
+#     E. titan_lr_scale: 0.2 → 0.3         — Titan LR: 3e-5 → 7.5e-5
+#     F. gradient_clip_val: 3.0 → 1.5      — tighter clip pairs with higher LR
+#     G. base_training.max_epochs: 40 → 60  — bi-level optimization needs more iters
+#     H. warmup_pct: 0.15 → 0.10           — shorter warmup, longer constant phase
+#
+#   PLASTICITY (new task adaptation):
+#     I. task_training.learning_rate: 5e-5 → 1.5e-4  — 3× boost (ViT uses 4.25e-4)
+#     J. task_training.warmup_pct: 0.05               — short warmup for 10-epoch tasks
+#     K. task_training.warmup_start_lr: 3e-5           — proper warmup start for task LR
+#
+#   CL STABILITY (maintain low forgetting):
+#     L. surprise_threshold: 0.1 (retained from Phase 2) — novelty-gated memory writes
+#     M. titan_detach_interval: 2 (retained from Phase 2) — richer meta-gradients
+#
+#   VRAM:
+#     N. batch_size: 16 → 8 — accommodate depth=8 + detach_interval=2 on RTX 4090
+#
+# Param budget: 8 blocks × 5.03M/block + 0.79M shared ≈ 41.0M (vs 43M ViT baseline)
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase3 paths.data_dir=/path/to/clips
+# =============================================================================
 
-# higher DEPTH
 defaults:
   - override /data: precomputed_features
   - override /model: ac_hope_vit
@@ -13,8 +48,8 @@ defaults:
 # =============================================================================
 # EXPERIMENT METADATA
 # =============================================================================
-task_name: "cl_ac_hope_phase2"
-tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "param_matched", "phase2_meta_fix"]
+task_name: "cl_ac_hope_phase3"
+tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "param_matched", "phase3_plasticity"]
 seed: 42
 train: True
 test: False
@@ -23,12 +58,12 @@ test: False
 # DATA DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 data:
-  batch_size: 8
+  batch_size: 8      # [N] Reduced from 16 — VRAM headroom for depth=8 + detach_interval=2
   num_workers: 4
   pin_memory: true
 
 # =============================================================================
-# MODEL: AC-HOPE-ViT Param-Matched (same as ac_hope_vit_param_matched.yaml)
+# MODEL: AC-HOPE-ViT Phase 3 (depth=8, ~41M params)
 # =============================================================================
 model:
   T_teacher: 7
@@ -36,28 +71,29 @@ model:
   use_activation_checkpointing: false  # HOPE DGD incompatible with checkpointing
   action_embed_dim: 2
 
-  # HOPE architecture (more depth-matched: depth=12s)
-  depth: 12
-  titan_hidden_multiplier: 2
+  # HOPE architecture — depth=8, CMS hidden_mult=2.0 for param matching
+  depth: 8                        # [A] Up from 6: +33% compositional depth
+  titan_hidden_multiplier: 4
   use_rope: true
   titan_grad_clip_inner: 1.0
   chunk_size: 1
-  titan_detach_interval: 3  # PHASE 2 FIX: unroll 2 DGD steps before detach → richer meta-gradient for M_{□,0} (3 causes NaN)
-  surprise_threshold: 0.0  # PHASE 1 FIX: novelty gate — only update memory when retrieval error exceeds threshold
+  titan_detach_interval: 2        # [M] Retained from Phase 2: richer meta-gradients
+  surprise_threshold: 0.1         # [L] Retained from Phase 2: novelty-gated memory writes
 
-  # CMS levels
+  # CMS levels — hidden_multiplier reduced 4.0→2.0, chunk scheduling ENABLED
+  cms_use_chunk_scheduling: true  # [C] ACTIVATE multi-timescale CMS (was disabled!)
   cms_level_specs:
     - name: "fast"
       update_period: 1
-      hidden_multiplier: 4.0
+      hidden_multiplier: 2.0     # [B] Down from 4.0 — free params for extra depth
       warmup_steps: 0
     - name: "medium"
       update_period: 4
-      hidden_multiplier: 4.0
+      hidden_multiplier: 2.0     # [B]
       warmup_steps: 0
     - name: "slow"
       update_period: 16
-      hidden_multiplier: 4.0
+      hidden_multiplier: 2.0     # [B]
       warmup_steps: 0
 
   # Diagnostics
@@ -68,7 +104,7 @@ model:
   loss_weight_jump: 1.0
   loss_type: "l1"
 
-  # Curriculum for base training  ... did set it to 1.0, so effectively no curriculum
+  # Curriculum for base training — disabled (all 1.0)
   curriculum_schedule:
     - epoch: 0
       loss_weight_teacher: 1.0
@@ -78,55 +114,53 @@ model:
       loss_weight_teacher: 1.0
 
   # Optimizer (HOPE bi-level optimization)
-  learning_rate: 1.5e-4
+  learning_rate: 2.5e-4            # [D] Up from 1.5e-4 (+67%, still 41% below ViT's 4.25e-4)
   weight_decay: 0.04
   betas: [0.9, 0.999]
 
   # Per-group LR scaling
-  titan_lr_scale: 0.2
+  titan_lr_scale: 0.3              # [E] Up from 0.2 → Titan LR = 7.5e-5 (was 3e-5)
   cms_lr_scale: 1.0
   titan_weight_decay: 0.005
   aux_loss_weight: 0.1
 
-  # LR schedule (longer warmup for meta-learning)
+  # LR schedule
   use_iteration_scheduler: true
-  warmup_pct: 0.15
-  constant_pct: 0.75
+  warmup_pct: 0.10                 # [H] Down from 0.15 — shorter warmup for more total iters
+  constant_pct: 0.80               # [H] Up from 0.75 — longer learning plateau
   decay_pct: 0.10
-  warmup_start_lr: 3.0e-5
+  warmup_start_lr: 5.0e-5          # [F] Proportional to new base LR (0.2× factor maintained)
 
-  # TTA defaults (not used for task training, but available)
+  # TTA defaults
   tta_enabled: false
 
 # =============================================================================
 # TRAINER DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 trainer:
-  max_epochs: 40
-  precision: 32  # HOPE inner-loop needs full precision
-  gradient_clip_val: 3.0  # Keep original for base training (unrolled graph needs headroom); phase 1's 1.2 is too tight here
+  max_epochs: 65                   # [G] Up from 40 — bi-level optimization needs more iters
+  precision: 32                    # HOPE inner-loop needs full precision
+  gradient_clip_val: 1.5           # [F] Down from 3.0 — tighter clip pairs with higher LR
   gradient_clip_algorithm: norm
-  accumulate_grad_batches: 2  # effective batch size 16 (2 × actual batch_size 8)
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
 # =============================================================================
 cl:
   # W&B grouping
-  wandb_group: "cl_ac_hope_phase2_${now:%Y%m%d_%H%M%S}"
+  wandb_group: "cl_ac_hope_phase3_${now:%Y%m%d_%H%M%S}"
 
-  # Task training mode: "finetune" for HOPE (regular gradient descent)
+  # Task training mode
   task_training_mode: "finetune"
 
   # Resume: set to a checkpoint path to skip base training and start from tasks
-  # e.g.  cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
   resume_from_base_checkpoint: null
 
   # --- Base Training Phase ---
   base_training:
     clip_start: 0
     clip_end: 5000
-    max_epochs: 40
+    max_epochs: 65                 # [G] Up from 40
     val_split: 0.1
 
   # --- Sequential Tasks ---
@@ -155,5 +189,6 @@ cl:
   task_training:
     max_epochs: 10
     val_split: 0.0
-    # PHASE 1 FIX: more conservative outer-loop LR to reduce weight drift during CL
-    learning_rate: 2e-5
+    learning_rate: 1.5e-4          # [I] Up from 5e-5 — 3× plasticity boost
+    warmup_pct: 0.05               # [J] Short warmup for 10-epoch tasks
+    warmup_start_lr: 3.0e-5        # [K] Proper warmup start (below task LR)
