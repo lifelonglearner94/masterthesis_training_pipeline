@@ -803,6 +803,26 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         else:
             return self._configure_adamw_optimizer()
 
+    def lr_scheduler_step(self, scheduler: Any, metric: Any | None = None) -> None:
+        """Override Lightning's scheduler step to support _DualScheduler.
+
+        Lightning validates that schedulers are instances of
+        ``torch.optim.lr_scheduler.LRScheduler``. Our ``_DualScheduler``
+        wraps two LambdaLR schedulers (one for Muon, one for AdamW), so
+        it doesn't pass the isinstance check.  Overriding this hook tells
+        Lightning to skip the API check and lets us call ``.step()``
+        directly.
+
+        For standard LRSchedulers (AdamW path), we delegate to the
+        parent implementation.
+        """
+        if hasattr(scheduler, 's1') and hasattr(scheduler, 's2'):
+            # _DualScheduler: step both sub-schedulers
+            scheduler.step()
+        else:
+            # Standard PyTorch LR scheduler
+            super().lr_scheduler_step(scheduler, metric)
+
     def _configure_m3_muon_optimizer(self) -> dict[str, Any]:
         """Configure Hybrid Muon+AdamW optimizer (M3 from nested learning paper).
 
