@@ -972,8 +972,16 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             # that steps both. For now, use the AdamW scheduler as the primary
             # (it has more param groups) and manually step Muon's.
             class _DualScheduler:
-                def __init__(self, s1, s2):
+                """Wraps two LR schedulers so Lightning sees a single scheduler.
+
+                Lightning validates ``scheduler.optimizer in optimizers``, so we
+                expose ``.optimizer`` pointing to the HybridMuonAdamW wrapper
+                that was returned as the optimizer from configure_optimizers().
+                """
+                def __init__(self, s1, s2, parent_optimizer):
                     self.s1, self.s2 = s1, s2
+                    # Lightning checks this attribute during setup
+                    self.optimizer = parent_optimizer
                 def step(self):
                     self.s1.step()
                     self.s2.step()
@@ -988,7 +996,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
-                    "scheduler": _DualScheduler(schedulers[0], schedulers[1]),
+                    "scheduler": _DualScheduler(schedulers[0], schedulers[1], optimizer),
                     "interval": "step",
                     "frequency": 1,
                 },
