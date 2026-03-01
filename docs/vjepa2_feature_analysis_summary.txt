@@ -1,0 +1,46 @@
+V-JEPA 2 ViT-L/16 Feature Map Analysis Summary
+============================================================
+
+Dataset:           output/base_plus_5_tasks_dataset
+Clips analyzed:    10000 / 10000
+Feature shape:     (2048, 1024)
+  = 8 timesteps × 256 spatial × 1024 dim
+Dtype:             float16
+Analysis time:     1230.0s
+
+Global Statistics
+----------------------------------------
+Mean of clip means:     0.008201
+Std of clip means:      0.004293
+Mean of clip stds:      3.184355
+Std of clip stds:       0.050587
+Global min:             -42.8750
+Global max:             43.7188
+Mean L2 norm:           101.7952
+Mean sparsity (<0.01):  0.39%
+Mean IQR:               2.8840
+
+Inter-clip cosine sim:  0.9245 ± 0.0379
+Temporal cosine sim:    0.8694 ± 0.0535
+
+
+Per-Task Comparison
+============================================================
+Task                       n    μ(mean)     μ(std)      μ(L2)  Dyn.Range  Sparse%      IQR
+-------------------------------------------------------------------------------------------
+Base                    5000     0.0095     3.2130   102.7079    75.2259    0.39%   2.9142
+T1-Scale                1000     0.0074     3.1991   102.2687    74.9017    0.39%   2.8999
+T2-Ice                  1000     0.0080     3.1679   101.2726    74.6280    0.40%   2.8735
+T3-Bounce               1000     0.0079     3.1541   100.8280    74.5806    0.40%   2.8587
+T4-Rot                  1000     0.0065     3.1304   100.0801    75.8448    0.40%   2.8187
+T5-OOD                  1000     0.0048     3.1268    99.9633    75.8413    0.40%   2.8182
+
+Inter-Task Cosine Similarity
+----------------------------------------
+                  Base  T1-Scale    T2-Ice T3-Bounce    T4-Rot    T5-OOD
+        Base    1.0000    0.9882    0.9835    0.9814    0.9510    0.9536
+    T1-Scale    0.9882    1.0000    0.9936    0.9905    0.9667    0.9700
+      T2-Ice    0.9835    0.9936    1.0000    0.9964    0.9758    0.9791
+   T3-Bounce    0.9814    0.9905    0.9964    1.0000    0.9698    0.9764
+      T4-Rot    0.9510    0.9667    0.9758    0.9698    1.0000    0.9976
+      T5-OOD    0.9536    0.9700    0.9791    0.9764    0.9976    1.0000
