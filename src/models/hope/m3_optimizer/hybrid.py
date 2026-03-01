@@ -99,6 +99,26 @@ class HybridMuonAdamW:
     # -- Convenience -------------------------------------------------------
 
     @property
+    def state(self) -> dict:
+        """Combined optimizer state from both sub-optimizers.
+
+        Lightning accesses ``optimizer.state`` to move tensors between
+        devices (CPU ↔ GPU). We merge both sub-optimizer state dicts
+        into a single view.
+        """
+        combined: dict = {}
+        if self.muon_opt:
+            combined.update(self.muon_opt.state)
+        if self.adamw_opt:
+            combined.update(self.adamw_opt.state)
+        return combined
+
+    @state.setter
+    def state(self, value: dict) -> None:
+        """Allow Lightning to set state (no-op, state lives in sub-optimizers)."""
+        pass
+
+    @property
     def param_groups(self) -> list:
         groups: list = []
         if self.muon_opt:
