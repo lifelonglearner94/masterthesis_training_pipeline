@@ -2,19 +2,22 @@
 
 Implements the CMS component of the HOPE architecture. CMS provides a hierarchy
 of MLPs operating at different temporal frequencies:
-    - Fast level  (period=1): captures immediate action responses
-    - Medium level (period=4): captures motion dynamics
-    - Slow level   (period=16): captures static scene structure / background
+    - Fast level  (period=1): processes every frame
+    - Medium level (period=3): processes every 3rd frame (e.g. aligned with jump_k)
+    - Slow level   (period=7): processes once per clip (clip-level physics context)
 
 Each level is a simple MLP with residual connection and gradient clipping.
-Higher-frequency levels update every token; lower-frequency levels update
-every `period` tokens, accumulating inputs via chunk-based processing.
+Higher-frequency levels process every frame; lower-frequency levels only
+process frames whose index is divisible by their update_period.
 
 Key design from the paper (Section 8.3):
     y_t = MLP^(f_K)( MLP^(f_{K-1})( ... MLP^(f_1)(o_t) ... ) )
 
-The multi-frequency design handles both fast movements and slow backgrounds,
-which is critical for robotics video prediction.
+Frame-Aware Scheduling (adapted for video data):
+    update_period refers to FRAMES, not flat token indices. When scheduling
+    is enabled, each CMS level only processes all tokens belonging to
+    frames where (frame_index % update_period == 0). Tokens in skipped
+    frames pass through unchanged via the residual connection.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ class LevelSpec:
 
     Attributes:
         name: Human-readable identifier (e.g., 'fast', 'medium', 'slow').
-        update_period: Tokens between updates (1=fastest, updates every token).
+        update_period: Frames between updates (1=every frame, 3=every 3rd frame, etc.).
         warmup_steps: Number of training steps before level starts updating.
         jitter: Random variation in update period for regularization.
         hidden_multiplier: Hidden dimension multiplier (dim * multiplier).
@@ -182,60 +185,68 @@ class CMS(nn.Module):
         """Return the number of frequency levels."""
         return len(self.blocks)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        T: int | None = None,
+        tokens_per_frame: int | None = None,
+    ) -> Tensor:
         """Forward pass through all CMS levels (cascade).
 
-        In standard mode, all levels process every token. In chunk scheduling
-        mode, slower levels are applied per-token based on their update_period:
-        each token is checked against the global temporal step counter so that
-        faster levels process every token while slower levels only process
-        every `update_period`-th token (matching the paper's multi-timescale
-        intent within a sequence).
+        In standard mode, all levels process every token. In frame-aware
+        chunk scheduling mode, slower levels only process tokens belonging
+        to frames where (frame_index % update_period == 0). All tokens
+        within an active frame are processed together, preserving spatial
+        coherence within each frame.
 
         Args:
             x: [B, N, D] input tokens from Titan memory output.
+            T: Number of temporal frames in the sequence. Required for
+                frame-aware scheduling.
+            tokens_per_frame: Number of tokens per frame (H*W + action_tokens).
+                Required for frame-aware scheduling.
 
         Returns:
             [B, N, D] processed tokens.
         """
-        if not self.use_chunk_scheduling:
+        if not self.use_chunk_scheduling or T is None or tokens_per_frame is None:
             # Standard mode: all levels process all tokens
             for block in self.blocks:
                 x = block(x)
             return x
 
-        # Chunk-scheduling mode: per-token temporal frequency gating
+        # Frame-aware scheduling: mask by frame index, not token index
         B, N, D = x.shape
-        base_step = self._global_step.item()
 
         for block, spec in zip(self.blocks, self.levels_spec):
-            # Fast level with warmup complete: process all tokens
-            if spec.update_period <= 1 and base_step >= spec.warmup_steps:
+            # Fast level (period=1): always process everything
+            if spec.update_period <= 1:
                 x = block(x)
                 continue
 
-            # Build update mask based on temporal position
-            token_steps = torch.arange(N, device=x.device) + base_step
-            update_mask = (
-                (token_steps >= spec.warmup_steps)
-                & (token_steps % spec.update_period == 0)
-            )
+            # Determine which frames are active for this level
+            # Frame f is active if f % update_period == 0
+            frame_indices = torch.arange(T, device=x.device)
+            active_frames = (frame_indices % spec.update_period == 0)
 
-            if not update_mask.any():
+            if not active_frames.any():
                 continue
 
-            if update_mask.all():
+            if active_frames.all():
                 x = block(x)
             else:
-                # Process only qualifying tokens
-                indices = update_mask.nonzero(as_tuple=True)[0]
+                # Expand frame-level mask to token-level mask:
+                # each frame owns `tokens_per_frame` contiguous tokens
+                token_mask = active_frames.repeat_interleave(tokens_per_frame)
+                # Handle edge case: N might not equal T * tokens_per_frame
+                token_mask = token_mask[:N]
+
+                indices = token_mask.nonzero(as_tuple=True)[0]
                 x_sub = x[:, indices, :]
                 x_sub = block(x_sub)
                 x = x.clone()
                 x[:, indices, :] = x_sub
 
-        # Advance step counter by the number of tokens processed
-        self._global_step += N
         return x
 
     def reset_step_counter(self) -> None:

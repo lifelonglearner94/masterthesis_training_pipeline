@@ -116,6 +116,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         betas: tuple[float, float] = (0.9, 0.999),
         warmup_epochs: int = 10,
         max_epochs: int = 100,
+        optimizer_type: str = "adamw",
+        muon_momentum: float = 0.95,
         # Iteration-based LR schedule
         use_iteration_scheduler: bool = False,
         curriculum_schedule: list[dict] | None = None,
@@ -209,6 +211,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.cms_lr_scale = cms_lr_scale
         self.titan_weight_decay = titan_weight_decay
         self.aux_loss_weight = aux_loss_weight
+        self.optimizer_type = optimizer_type
+        self.muon_momentum = muon_momentum
 
         self.use_iteration_scheduler = use_iteration_scheduler
         self.warmup_pct = warmup_pct
@@ -778,8 +782,15 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer with per-group learning rates.
 
-        Uses AdamW with 3 parameter groups:
-            1. Titan memories: LR * titan_lr_scale (default 0.5×)
+        Supports two optimizer backends:
+            - "adamw" (default): Standard AdamW with 3 parameter groups
+            - "m3_muon": Hybrid Muon+AdamW from nested learning paper.
+              Routes ≥2D weight matrices to Muon (Newton-Schulz preconditioning),
+              biases/norms/embeddings to AdamW. Per-group LR scaling is applied
+              via separate filter functions.
+
+        Parameter groups (for both backends):
+            1. Titan memories: LR * titan_lr_scale (default 0.3×)
             2. CMS blocks: LR * cms_lr_scale (default 1.0×)
             3. Projections/embeddings: LR (full)
 
@@ -787,6 +798,206 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         (DGD), so their outer-loop learning rate should be more conservative
         to avoid instability (Criticism §1).
         """
+        if self.optimizer_type == "m3_muon":
+            return self._configure_m3_muon_optimizer()
+        else:
+            return self._configure_adamw_optimizer()
+
+    def _configure_m3_muon_optimizer(self) -> dict[str, Any]:
+        """Configure Hybrid Muon+AdamW optimizer (M3 from nested learning paper).
+
+        Routes ≥2D weight matrices to torch.optim.Muon and everything else
+        to AdamW. Applies per-group LR scaling by creating separate
+        HybridMuonAdamW instances or adjusting param groups.
+        """
+        from src.models.hope.m3_optimizer import build_hybrid_muon_adamw, is_muon_candidate
+
+        # Collect parameters with their group-specific LR
+        titan_patterns = {"M_k.", "M_v.", "M_eta.", "M_alpha.", "M_memory."}
+
+        muon_params: list[torch.nn.Parameter] = []
+        adamw_params: list[dict[str, Any]] = []  # dicts with lr overrides
+
+        titan_count, cms_count, other_count = 0, 0, 0
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Determine group-specific LR and WD
+            if any(pattern in name for pattern in titan_patterns):
+                lr = self.learning_rate * self.titan_lr_scale
+                wd = (
+                    self.titan_weight_decay
+                    if self.titan_weight_decay is not None
+                    else self.weight_decay
+                )
+                titan_count += param.numel()
+            elif "cms." in name:
+                lr = self.learning_rate * self.cms_lr_scale
+                wd = self.weight_decay
+                cms_count += param.numel()
+            else:
+                lr = self.learning_rate
+                wd = self.weight_decay
+                other_count += param.numel()
+
+            # Route: Muon for ≥2D weight matrices, AdamW for the rest
+            if is_muon_candidate(name, param):
+                # Muon doesn't support per-param lr easily, so we use the
+                # base lr for Muon params. For titan params routed to Muon,
+                # we still put them in AdamW to respect the lr scaling.
+                if any(pattern in name for pattern in titan_patterns):
+                    adamw_params.append({"params": [param], "lr": lr, "weight_decay": wd})
+                else:
+                    muon_params.append(param)
+            else:
+                adamw_params.append({"params": [param], "lr": lr, "weight_decay": wd})
+
+        log.info(
+            f"[M3 Optimizer] Titan: {titan_count:,} params, "
+            f"CMS: {cms_count:,} params, "
+            f"Other: {other_count:,} params"
+        )
+        log.info(
+            f"[M3 Optimizer] Muon: {sum(p.numel() for p in muon_params):,} params, "
+            f"AdamW: {sum(sum(p.numel() for p in g['params']) for g in adamw_params):,} params"
+        )
+
+        # Build Muon sub-optimizer
+        muon_opt = None
+        if muon_params:
+            if not hasattr(torch.optim, "Muon"):
+                raise RuntimeError(
+                    "torch.optim.Muon not available. Requires PyTorch >= 2.9."
+                )
+            muon_opt = torch.optim.Muon(  # type: ignore[attr-defined]
+                muon_params,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                momentum=self.muon_momentum,
+            )
+
+        # Build AdamW sub-optimizer
+        adamw_opt = None
+        if adamw_params:
+            adamw_opt = torch.optim.AdamW(
+                adamw_params,
+                betas=self.betas,
+            )
+
+        # Wrap in a combined optimizer that exposes step/zero_grad/state_dict
+        from src.models.hope.m3_optimizer import HybridMuonAdamW
+        optimizer = HybridMuonAdamW(
+            muon_opt=muon_opt,
+            adamw_opt=adamw_opt,
+            muon_param_elems=sum(p.numel() for p in muon_params),
+            adamw_param_elems=sum(sum(p.numel() for p in g["params"]) for g in adamw_params),
+        )
+
+        log.info(f"[M3 Optimizer] {optimizer}")
+
+        if self.use_iteration_scheduler:
+            return self._configure_iteration_scheduler_m3(optimizer)
+        else:
+            # No scheduler for now; M3 is typically used with constant LR
+            return {"optimizer": optimizer}
+
+    def _configure_iteration_scheduler_m3(
+        self, optimizer: Any
+    ) -> dict[str, Any]:
+        """Configure iteration-based LR scheduler for M3 optimizer.
+
+        Since HybridMuonAdamW wraps two optimizers, we create LambdaLR
+        schedulers for each sub-optimizer and step both.
+        """
+        if (
+            self.trainer is not None
+            and self.trainer.estimated_stepping_batches
+        ):
+            total_iters = int(self.trainer.estimated_stepping_batches)
+        else:
+            warnings.warn(
+                "Could not get total iterations from trainer. "
+                "LR schedule may not work correctly.",
+                UserWarning,
+                stacklevel=2,
+            )
+            total_iters = self.DEFAULT_TOTAL_ITERS_FALLBACK
+
+        warmup_iters = int(self.warmup_pct * total_iters)
+        constant_iters = int(self.constant_pct * total_iters)
+        decay_iters = int(self.decay_pct * total_iters)
+
+        computed_total = warmup_iters + constant_iters + decay_iters
+        if computed_total != total_iters:
+            constant_iters += total_iters - computed_total
+
+        warmup_end = warmup_iters
+        constant_end = warmup_end + constant_iters
+        warmup_start_factor = self.warmup_start_lr / self.learning_rate
+
+        def lr_lambda_iter(step: int) -> float:
+            if step < warmup_end:
+                progress = step / max(warmup_iters, 1)
+                return warmup_start_factor + (1.0 - warmup_start_factor) * progress
+            elif step < constant_end:
+                return 1.0
+            elif step < total_iters:
+                progress = (step - constant_end) / max(decay_iters, 1)
+                return 1.0 - progress
+            else:
+                return 0.0
+
+        schedulers = []
+        if optimizer.muon_opt:
+            sched_muon = torch.optim.lr_scheduler.LambdaLR(optimizer.muon_opt, lr_lambda_iter)
+            schedulers.append(sched_muon)
+        if optimizer.adamw_opt:
+            sched_adamw = torch.optim.lr_scheduler.LambdaLR(optimizer.adamw_opt, lr_lambda_iter)
+            schedulers.append(sched_adamw)
+
+        if len(schedulers) == 1:
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": schedulers[0],
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+        elif len(schedulers) == 2:
+            # Lightning doesn't natively support 2 schedulers for 1 optimizer.
+            # We chain them into a SequentialLR-like wrapper via a custom callback
+            # that steps both. For now, use the AdamW scheduler as the primary
+            # (it has more param groups) and manually step Muon's.
+            class _DualScheduler:
+                def __init__(self, s1, s2):
+                    self.s1, self.s2 = s1, s2
+                def step(self):
+                    self.s1.step()
+                    self.s2.step()
+                def get_last_lr(self):
+                    return self.s1.get_last_lr()
+                def state_dict(self):
+                    return {"s1": self.s1.state_dict(), "s2": self.s2.state_dict()}
+                def load_state_dict(self, state):
+                    self.s1.load_state_dict(state["s1"])
+                    self.s2.load_state_dict(state["s2"])
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": _DualScheduler(schedulers[0], schedulers[1]),
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+        else:
+            return {"optimizer": optimizer}
+
+    def _configure_adamw_optimizer(self) -> dict[str, Any]:
+        """Configure standard AdamW optimizer with per-group learning rates."""
         param_groups = self.model.get_parameter_groups()
 
         optimizer_groups: list[dict[str, Any]] = []

@@ -226,7 +226,8 @@ class HOPEBlock(nn.Module):
 
         # ─── Phase B: CMS ───
         y = self.norm2(x)
-        y = self.cms(y)
+        tokens_per_frame = (action_tokens + H * W) if H is not None and W is not None else None
+        y = self.cms(y, T=T, tokens_per_frame=tokens_per_frame)
         x = x + self.drop_path(y)
 
         return x

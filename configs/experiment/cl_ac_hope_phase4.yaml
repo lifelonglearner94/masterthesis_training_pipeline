@@ -1,0 +1,197 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-HOPE-ViT Phase 4: Frame-Aware CMS + M3 Muon
+# =============================================================================
+# Builds on Phase 3 with two major enhancements:
+#
+#   1. FRAME-AWARE CMS SCHEDULING (fix from Phase 3)
+#      Phase 3 CMS update_period operated on flat token indices (spatial subsampling
+#      artefact). Phase 4 rewrites CMS to schedule at the frame level:
+#        - fast:   update_period=1 → every frame
+#        - medium: update_period=3 → every 3rd frame
+#        - slow:   update_period=7 → first+last frames only
+#      This correctly implements multi-timescale temporal abstraction.
+#
+#   2. M3 MUON OPTIMIZER (from nested learning / Titans paper)
+#      Hybrid Muon+AdamW: routes ≥2D weight matrices to Muon (Newton-Schulz
+#      preconditioning), biases/norms/embeddings to AdamW. Titan memory params
+#      forced to AdamW for separate LR scaling. Expected faster convergence
+#      than pure AdamW on matrix-heavy architectures.
+#
+# Architecture changes from Phase 3:
+#   A. depth: 8 → 5                  — fewer blocks, stronger memories + CMS per block
+#   B. titan_hidden_multiplier: 4    — retained: strong Titan memories
+#   C. CMS hidden_mult: 4.0 → heterogeneous 2.0/2.5/3.0
+#      - Slower frequencies get larger capacity (theoretically motivated:
+#        slow CMS captures more complex long-range patterns)
+#   D. CMS update_periods: {1,4,16} → {1,3,7} (frame-aligned for T=7)
+#
+# Param budget: 5 blocks × ~8.4M/block + ~0.8M shared ≈ 42.9M (≈43M ViT baseline)
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase4 paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase4"
+tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "param_matched",
+       "phase4_frame_cms", "m3_muon", "frame_aware"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16      # Kept from Phase 3 — depth=5 uses less VRAM but Muon adds state
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-ViT Phase 4 (depth=5, ~42.9M params)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false  # HOPE DGD incompatible with checkpointing
+  action_embed_dim: 2
+
+  # HOPE architecture — depth=5, titan_mult=4, heterogeneous CMS
+  depth: 5                        # [A] Down from 8: stronger per-block capacity
+  titan_hidden_multiplier: 4      # [B] Retained: strong Titan persistent memories
+  use_rope: false                 # [E] Disabled: RoPE requires Q·K dot product (attention),
+                                  #     but HOPE feeds Q→MLP and K→DGD separately — no
+                                  #     relative-position benefit. V-JEPA2 features already
+                                  #     have position info from the encoder.
+  titan_grad_clip_inner: 1.0
+  chunk_size: 1
+  titan_detach_interval: 2        # Retained from Phase 3: richer meta-gradients
+  surprise_threshold: 0.1         # Retained from Phase 3: novelty-gated memory writes
+
+  # CMS levels — frame-aware scheduling with heterogeneous capacity
+  cms_use_chunk_scheduling: true  # Frame-aware multi-timescale CMS
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1            # [D] Every frame (7/7 active)
+      hidden_multiplier: 2.0      # [C] Smallest: fast updates need less capacity
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3            # [D] Every 3rd frame (3/7 active: frames 0,3,6)
+      hidden_multiplier: 2.5      # [C] Medium capacity for medium-range patterns
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7            # [D] Every 7th frame (1/7 active: frame 0 only)
+      hidden_multiplier: 3.0      # [C] Largest: slow CMS handles complex long-range
+      warmup_steps: 0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum for base training — disabled (all 1.0)
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # M3 Muon Optimizer — hybrid Muon+AdamW
+  optimizer_type: "m3_muon"       # NEW: M3 hybrid optimizer
+  muon_momentum: 0.95             # NEW: Muon momentum (default from Titans paper)
+
+  # Base LR and weight decay (shared by Muon and AdamW branches)
+  learning_rate: 2.5e-4            # Retained from Phase 3
+  weight_decay: 0.04
+  betas: [0.9, 0.999]             # Used by AdamW branch only
+
+  # Per-group LR scaling (titan params forced to AdamW for separate LR)
+  titan_lr_scale: 0.3              # Retained from Phase 3: Titan LR = 7.5e-5
+  cms_lr_scale: 1.0
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.1
+
+  # LR schedule
+  use_iteration_scheduler: true
+  warmup_pct: 0.10                 # Retained from Phase 3
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 5.0e-5
+
+  # TTA defaults
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+trainer:
+  max_epochs: 65                   # Retained from Phase 3
+  precision: 32                    # HOPE inner-loop needs full precision
+  gradient_clip_val: 1.5           # Retained from Phase 3
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  # W&B grouping
+  wandb_group: "cl_ac_hope_phase4_${now:%Y%m%d_%H%M%S}"
+
+  # Task training mode
+  task_training_mode: "finetune"
+
+  # Resume: set to a checkpoint path to skip base training and start from tasks
+  resume_from_base_checkpoint: null
+
+  # --- Base Training Phase ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 65
+    val_split: 0.1
+
+  # --- Sequential Tasks ---
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  # --- Evaluation Configuration ---
+  eval:
+    clips_per_task: 100
+
+  # --- Task Training Settings (fine-tuning) ---
+  task_training:
+    max_epochs: 10
+    val_split: 0.0
+    learning_rate: 1.5e-4          # Retained from Phase 3
+    warmup_pct: 0.05
+    warmup_start_lr: 3.0e-5
