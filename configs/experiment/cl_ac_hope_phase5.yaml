@@ -1,0 +1,199 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-HOPE-ViT Phase 5: Temporal Embeddings + Spatial Mixing
+# =============================================================================
+# Addresses two fundamental architectural deficits identified in Phase 4:
+#
+#   1. LEARNABLE TEMPORAL EMBEDDINGS (Fix for jump prediction)
+#      Phase 4 disabled RoPE (correct: RoPE needs Q·K dot products, but HOPE
+#      feeds Q→MLP independently). However, this removed ALL temporal position
+#      info. The model could not distinguish which future frame to predict in
+#      jump mode, causing loss_jump to plateau at ~0.5 (predicting the
+#      "average" of all possible target frames).
+#
+#      Fix: Two additive learned embeddings (frame_pos_embed + target_pos_embed)
+#        - frame_pos_embed: tells each token which input frame it belongs to
+#        - target_pos_embed: tells the model which future frame to predict
+#
+#   2. SPATIAL MIXING (Fix for expressivity / plasticity)
+#      HOPE processes each token independently through Titan MLPs and CMS MLPs.
+#      Unlike the ViT baseline (24× self-attention layers), there is ZERO
+#      cross-token spatial interaction. This severely limits representational
+#      capacity and explains the poor plasticity (0.35-0.39 vs ViT's 0.30).
+#
+#      Fix: Per-frame MLP-Mixer-style token mixing layer (Phase C) after CMS.
+#      Each frame's 258 tokens are mixed via a learned Linear(258,258) → GELU →
+#      Linear(258,258). Output-layer is zero-initialized for stable training.
+#
+# Architecture: depth=5, titan_mult=4, CMS={2.0/2.5/3.0}, spatial_mixing=true
+# Param budget: ~43.6M (vs 43M ViT baseline, Δ=+0.6M from spatial mixing layers)
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase5 paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase5"
+tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "param_matched",
+       "phase5_temporal_embed", "spatial_mixing"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-ViT Phase 5 (depth=5, ~43.6M params)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false  # HOPE DGD incompatible with checkpointing
+  action_embed_dim: 2
+
+  # HOPE architecture — depth=5, titan_mult=4, heterogeneous CMS + spatial mixing
+  depth: 5
+  titan_hidden_multiplier: 4
+  use_rope: false                 # RoPE disabled: Q→MLP (no dot product), temporal info
+                                  # now comes from learnable frame_pos_embed + target_pos_embed
+  titan_grad_clip_inner: 1.0
+  chunk_size: 1
+  titan_detach_interval: 2
+  surprise_threshold: 0.1
+
+  # Spatial mixing (Phase C) — KEY FIX: adds cross-token interaction
+  # Without this, HOPE has zero spatial interaction between tokens.
+  # Each frame's 258 tokens are mixed via a 2-layer MLP on the token dimension.
+  use_spatial_mixing: true
+
+  # CMS levels — frame-aware scheduling with heterogeneous capacity
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1            # Every frame (7/7 active)
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3            # Every 3rd frame (3/7 active: frames 0,3,6)
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7            # Every 7th frame (1/7 active: frame 0 only)
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum for base training — disabled (all 1.0)
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # Optimizer — AdamW (simpler, more reliable than M3 Muon for debugging new arch)
+  optimizer_type: "adamw"
+
+  # Base LR and weight decay
+  learning_rate: 2.5e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  titan_lr_scale: 0.3
+  cms_lr_scale: 1.0
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.1
+
+  # LR schedule
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 5.0e-5
+
+  # TTA defaults
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+trainer:
+  max_epochs: 65
+  precision: 32                    # HOPE inner-loop needs full precision
+  gradient_clip_val: 1.5
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  # W&B grouping
+  wandb_group: "cl_ac_hope_phase5_${now:%Y%m%d_%H%M%S}"
+
+  # Task training mode
+  task_training_mode: "finetune"
+
+  # Resume: set to a checkpoint path to skip base training and start from tasks
+  resume_from_base_checkpoint: null
+
+  # --- Base Training Phase ---
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 65
+    val_split: 0.1
+
+  # --- Sequential Tasks ---
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  # --- Evaluation Configuration ---
+  eval:
+    clips_per_task: 100
+
+  # --- Task Training Settings (fine-tuning) ---
+  task_training:
+    max_epochs: 10
+    val_split: 0.0
+    learning_rate: 1.5e-4
+    warmup_pct: 0.05
+    warmup_start_lr: 3.0e-5

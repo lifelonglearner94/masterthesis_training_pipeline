@@ -97,6 +97,8 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         surprise_threshold: float = 0.0,
         log_hope_diagnostics: bool = True,
         diagnostics_log_interval: int = DEFAULT_DIAGNOSTICS_LOG_INTERVAL,
+        # Spatial mixing (Phase C)
+        use_spatial_mixing: bool = False,
         # Optimizer: per-group LR/WD scaling
         titan_lr_scale: float = 0.2,
         cms_lr_scale: float = 1.0,
@@ -182,6 +184,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             drop_rate=drop_rate,
             drop_path_rate=drop_path_rate,
             log_hope_diagnostics=log_hope_diagnostics,
+            use_spatial_mixing=use_spatial_mixing,
         )
 
         self.T_teacher = T_teacher

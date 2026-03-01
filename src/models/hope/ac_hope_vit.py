@@ -118,6 +118,8 @@ class ACHOPEViT(nn.Module):
         chunk_size: int = 0,
         titan_detach_interval: int = 0,
         surprise_threshold: float = 0.0,
+        # Spatial mixing (Phase C)
+        use_spatial_mixing: bool = False,
         # Regularization
         drop_rate: float = DEFAULT_DROP_RATE,
         drop_path_rate: float = DEFAULT_DROP_PATH_RATE,
@@ -153,6 +155,24 @@ class ACHOPEViT(nn.Module):
         self.grid_width = img_size[1] // patch_size
         self.patches_per_frame = self.grid_height * self.grid_width
 
+        # ─── Learnable temporal embeddings (Phase 5 fixes) ───
+        # These replace RoPE's temporal function with embeddings that work with MLPs.
+        # - frame_pos_embed: tells each token WHICH frame it belongs to (input position)
+        # - target_pos_embed: tells the model WHICH frame to predict (jump target)
+        # Without these, HOPE with use_rope=False has NO temporal position info at all,
+        # and jump prediction cannot distinguish between different target frames.
+        self.frame_pos_embed = nn.Embedding(num_timesteps + 2, predictor_embed_dim)
+        self.target_pos_embed = nn.Embedding(num_timesteps + 2, predictor_embed_dim)
+
+        # ─── Spatial mixing tokens count ───
+        cond_tok_count = (
+            COND_TOKENS_WITH_EXTRINSICS
+            if use_extrinsics
+            else COND_TOKENS_WITHOUT_EXTRINSICS
+        )
+        spatial_mixing_tokens = self.patches_per_frame + cond_tok_count
+        self._use_spatial_mixing = use_spatial_mixing
+
         # ─── Stage 2: HOPE-ViT Backbone ───
         cms_levels = self._build_cms_levels(cms_level_specs)
 
@@ -175,6 +195,8 @@ class ACHOPEViT(nn.Module):
                     use_rope=use_rope,
                     grid_size=self.grid_height,
                     surprise_threshold=surprise_threshold,
+                    use_spatial_mixing=use_spatial_mixing,
+                    spatial_mixing_tokens=spatial_mixing_tokens,
                     drop_path=dpr[i],
                     drop=drop_rate,
                 ),
@@ -207,6 +229,7 @@ class ACHOPEViT(nn.Module):
             "chunk_size": chunk_size,
             "titan_detach_interval": titan_detach_interval,
             "surprise_threshold": surprise_threshold,
+            "use_spatial_mixing": use_spatial_mixing,
             "total_params": sum(p.numel() for p in self.parameters()),
         }
 
@@ -425,6 +448,31 @@ class ACHOPEViT(nn.Module):
             Processed tokens after all HOPE blocks.
         """
         log.debug(f"    [AC_HOPE_ViT] >>> Processing {len(self.hope_blocks)} HOPE blocks >>>")
+
+        # ─── Inject learnable temporal position information ───
+        tokens_per_frame = cond_tokens + self.patches_per_frame
+        if target_timestep is not None:
+            # Jump prediction mode: input is frame 0, predict frame τ.
+            # Add frame-0 position to input tokens.
+            frame_0_emb = self.frame_pos_embed(
+                torch.zeros(1, dtype=torch.long, device=x.device)
+            )  # [1, D]
+            x = x + frame_0_emb.unsqueeze(0)  # broadcast [1, 1, D] → [B, N, D]
+            # Add target timestep embedding so the model knows WHICH frame to predict.
+            target_emb = self.target_pos_embed(
+                torch.tensor(target_timestep, dtype=torch.long, device=x.device)
+            )  # [D]
+            x = x + target_emb.unsqueeze(0).unsqueeze(0)  # [1, 1, D] → [B, N, D]
+        else:
+            # Teacher-forcing mode: add per-frame position embeddings.
+            # Each frame's tokens get the embedding for that frame index.
+            frame_indices = torch.arange(T, dtype=torch.long, device=x.device)
+            frame_embs = self.frame_pos_embed(frame_indices)  # [T, D]
+            # Expand: [T, D] → [1, T, 1, D] → [1, T, tpf, D] → [1, T*tpf, D]
+            frame_embs = frame_embs.unsqueeze(0).unsqueeze(2)  # [1, T, 1, D]
+            frame_embs = frame_embs.expand(-1, -1, tokens_per_frame, -1)  # [1, T, tpf, D]
+            frame_embs = frame_embs.reshape(1, T * tokens_per_frame, -1)  # [1, N, D]
+            x = x + frame_embs  # broadcast over batch
 
         for i, blk in enumerate(self.hope_blocks):
             if self.use_activation_checkpointing:

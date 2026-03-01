@@ -80,6 +80,10 @@ model:
 
   surprise_threshold: 0.0       # Min surprise to trigger memory update (0=always)
 
+  # Spatial mixing (Phase C) — adds cross-token interaction within each frame
+  # Without this, HOPE processes each token independently (no spatial interaction)
+  use_spatial_mixing: false
+
   # ─── Diagnostics (Criticism §1: log all relevant parameters) ───
   log_hope_diagnostics: true
 

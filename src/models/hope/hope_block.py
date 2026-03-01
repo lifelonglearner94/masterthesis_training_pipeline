@@ -91,6 +91,12 @@ class HOPEBlockConfig:
     # Surprise gating
     surprise_threshold: float = 0.0  # Min surprise to trigger memory update (0=always)
 
+    # Spatial mixing (Phase C) — adds cross-token interaction within each frame.
+    # Without this, HOPE processes each token independently (no spatial interaction),
+    # unlike the ViT baseline where self-attention mixes all tokens.
+    use_spatial_mixing: bool = False
+    spatial_mixing_tokens: int = 258  # tokens_per_frame (H*W + action_tokens)
+
     # Drop path (stochastic depth)
     drop_path: float = 0.0
 
@@ -170,6 +176,20 @@ class HOPEBlock(nn.Module):
             use_chunk_scheduling=config.cms_use_chunk_scheduling,
         )
 
+        # ─── Phase C: Spatial Mixing (MLP-Mixer style token mixing) ───
+        self.use_spatial_mixing = config.use_spatial_mixing
+        if config.use_spatial_mixing:
+            tpf = config.spatial_mixing_tokens
+            self.norm3 = nn.LayerNorm(dim)
+            self.spatial_mix = nn.Sequential(
+                nn.Linear(tpf, tpf, bias=False),
+                nn.GELU(),
+                nn.Linear(tpf, tpf, bias=False),
+            )
+            # Zero-init output layer so spatial mixing starts as identity
+            # (residual contribution = 0), ensuring stable training start
+            nn.init.zeros_(self.spatial_mix[2].weight)
+
         # ─── Drop path (stochastic depth) ───
         from src.models.ac_predictor.utils.modules import DropPath
 
@@ -229,6 +249,18 @@ class HOPEBlock(nn.Module):
         tokens_per_frame = (action_tokens + H * W) if H is not None and W is not None else None
         y = self.cms(y, T=T, tokens_per_frame=tokens_per_frame)
         x = x + self.drop_path(y)
+
+        # ─── Phase C: Spatial Mixing (cross-token interaction within each frame) ───
+        if self.use_spatial_mixing and T is not None and H is not None and W is not None:
+            tpf = action_tokens + H * W
+            y = self.norm3(x)
+            B_s, N_s, D_s = y.shape
+            y = y.view(B_s, T, tpf, D_s)
+            y = y.permute(0, 1, 3, 2)       # [B, T, D, tokens_per_frame]
+            y = self.spatial_mix(y)           # mix across token dimension
+            y = y.permute(0, 1, 3, 2)       # [B, T, tokens_per_frame, D]
+            y = y.reshape(B_s, N_s, D_s)    # [B, N, D]
+            x = x + self.drop_path(y)
 
         return x
 
