@@ -76,11 +76,15 @@ class HybridMuonAdamW:
         if self.adamw_opt:
             self.adamw_opt.zero_grad()
 
-    def step(self) -> None:
+    def step(self, closure=None) -> None:
+        loss = None
+        if closure is not None:
+            loss = closure()
         if self.muon_opt:
             self.muon_opt.step()
         if self.adamw_opt:
             self.adamw_opt.step()
+        return loss
 
     # -- State dict --------------------------------------------------------
 
