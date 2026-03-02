@@ -1,0 +1,192 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-HOPE-Hybrid-ViT Phase 8
+# =============================================================================
+# NEW ARCHITECTURE: Hybrid = Attention + Titan Memory + CMS
+#
+# Motivation (from Phase 6 analysis):
+#   HOPE consistently underperforms ViT baseline because it REPLACED attention
+#   with Titan memory, causing three critical deficits:
+#     1. "Token Blindness" — no pairwise token interaction (Titan is per-token MLP)
+#     2. Shallow depth — 5 blocks vs ViT's 24 (param budget consumed by 5 memories)
+#     3. No RoPE — requires Q·K dot products which Titan doesn't have
+#
+# Solution (Ansatz C — Hybrid Architecture):
+#   RETAIN self-attention and ADD Titan memory as AUGMENTATION:
+#     Phase A: ACRoPEAttention — full self-attention with 3D RoPE
+#     Phase B: Titan M_memory — in-context DGD adaptation (single memory)
+#     Phase C: CMS — multi-frequency MLPs
+#
+# Key simplifications vs original HOPE:
+#   • 1 Titan memory per block (not 5) — K/V from standard Linear projections
+#   • η/α are learned nn.Parameters (not full Titan memories)
+#   • No aux_loss needed (projections get direct outer-loop gradients)
+#   • depth=12 (deeper than 5, possible because per-block cost is lower)
+#
+# Architecture: depth=12, attention+titan(mult=2)+CMS({2.0/2.5/3.0}),
+#               longterm_memory=true (for CL)
+# Param budget: ~44M (comparable to 43M ViT baseline)
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase8 paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_hybrid_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase8"
+tags: ["cl", "continual_learning", "ac_hope_hybrid", "attention", "titan",
+       "cms", "phase8", "rope", "longterm_memory"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-Hybrid-ViT Phase 8 (depth=12, ~44M params)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false
+  action_embed_dim: 2
+
+  # ─── Hybrid architecture ───
+  depth: 12
+  num_heads: 16
+
+  # Titan memory (compact: augments attention, doesn't replace it)
+  titan_hidden_multiplier: 2
+  titan_layers: 2
+  titan_activation: "gelu"
+  titan_grad_clip_inner: 1.0
+  titan_grad_clip_backward: 1.0
+  titan_detach_interval: 2       # Detach every step for VRAM safety
+  surprise_threshold: 0.1        # Only update on surprising inputs
+
+  # Longterm memory for cross-clip CL
+  use_longterm_memory: true
+  longterm_hidden_multiplier: 2
+  longterm_lr_scale: 0.1          # 10× slower than clip-level DGD
+
+  # CMS — heterogeneous multi-frequency
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+
+  # Attention settings
+  qkv_bias: true
+  attn_drop_rate: 0.0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+  diagnostics_log_interval: 50
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum — mild schedule
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # Regularization
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # Optimizer — AdamW
+  optimizer_type: "adamw"
+  learning_rate: 2.5e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  titan_lr_scale: 0.3
+  cms_lr_scale: 1.0
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.0            # Not needed for hybrid
+
+  # LR schedule — iteration-based (V-JEPA2 paper)
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 5.0e-5
+
+  # TTA defaults
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS
+# =============================================================================
+trainer:
+  max_epochs: 65
+  precision: 32
+  gradient_clip_val: 1.5
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_ac_hope_phase8_${now:%Y%m%d_%H%M%S}"
+  task_training_mode: "finetune"
+  resume_from_base_checkpoint: null
+
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 65
+    val_split: 0.1
+
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  eval:
+    clips_per_task: 100
