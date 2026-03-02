@@ -190,3 +190,10 @@ cl:
 
   eval:
     clips_per_task: 100
+
+  task_training:
+    max_epochs: 10
+    val_split: 0.0
+    learning_rate: 1.5e-4
+    warmup_pct: 0.05
+    warmup_start_lr: 3.0e-5
