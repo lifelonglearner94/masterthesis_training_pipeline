@@ -84,6 +84,12 @@ model:
   # Without this, HOPE processes each token independently (no spatial interaction)
   use_spatial_mixing: false
 
+  # Cross-clip persistent longterm memory (Ansatz B)
+  # Adds M_longterm that persists across clips for slow knowledge accumulation
+  use_longterm_memory: false
+  longterm_hidden_multiplier: 2     # Hidden dim multiplier for M_longterm (smaller than M_memory's 4)
+  longterm_lr_scale: 0.1            # DGD learning rate scale (10x slower than clip-level)
+
   # ─── Diagnostics (Criticism §1: log all relevant parameters) ───
   log_hope_diagnostics: true
 

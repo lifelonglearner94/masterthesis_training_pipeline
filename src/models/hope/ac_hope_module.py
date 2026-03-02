@@ -99,6 +99,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         diagnostics_log_interval: int = DEFAULT_DIAGNOSTICS_LOG_INTERVAL,
         # Spatial mixing (Phase C)
         use_spatial_mixing: bool = False,
+        # Cross-clip persistent longterm memory (Ansatz B)
+        use_longterm_memory: bool = False,
+        longterm_hidden_multiplier: int = 2,
+        longterm_lr_scale: float = 0.1,
         # Optimizer: per-group LR/WD scaling
         titan_lr_scale: float = 0.2,
         cms_lr_scale: float = 1.0,
@@ -185,6 +189,9 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             drop_path_rate=drop_path_rate,
             log_hope_diagnostics=log_hope_diagnostics,
             use_spatial_mixing=use_spatial_mixing,
+            use_longterm_memory=use_longterm_memory,
+            longterm_hidden_multiplier=longterm_hidden_multiplier,
+            longterm_lr_scale=longterm_lr_scale,
         )
 
         self.T_teacher = T_teacher
@@ -836,7 +843,7 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         from src.models.hope.m3_optimizer import build_hybrid_muon_adamw, is_muon_candidate
 
         # Collect parameters with their group-specific LR
-        titan_patterns = {"M_k.", "M_v.", "M_eta.", "M_alpha.", "M_memory."}
+        titan_patterns = {"M_k.", "M_v.", "M_eta.", "M_alpha.", "M_memory.", "M_longterm."}
 
         muon_params: list[torch.nn.Parameter] = []
         adamw_params: list[dict[str, Any]] = []  # dicts with lr overrides

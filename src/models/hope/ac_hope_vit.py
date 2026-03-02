@@ -120,6 +120,10 @@ class ACHOPEViT(nn.Module):
         surprise_threshold: float = 0.0,
         # Spatial mixing (Phase C)
         use_spatial_mixing: bool = False,
+        # Cross-clip persistent longterm memory (Ansatz B)
+        use_longterm_memory: bool = False,
+        longterm_hidden_multiplier: int = 2,
+        longterm_lr_scale: float = 0.1,
         # Regularization
         drop_rate: float = DEFAULT_DROP_RATE,
         drop_path_rate: float = DEFAULT_DROP_PATH_RATE,
@@ -172,6 +176,7 @@ class ACHOPEViT(nn.Module):
         )
         spatial_mixing_tokens = self.patches_per_frame + cond_tok_count
         self._use_spatial_mixing = use_spatial_mixing
+        self._use_longterm_memory = use_longterm_memory
 
         # ─── Stage 2: HOPE-ViT Backbone ───
         cms_levels = self._build_cms_levels(cms_level_specs)
@@ -197,6 +202,9 @@ class ACHOPEViT(nn.Module):
                     surprise_threshold=surprise_threshold,
                     use_spatial_mixing=use_spatial_mixing,
                     spatial_mixing_tokens=spatial_mixing_tokens,
+                    use_longterm_memory=use_longterm_memory,
+                    longterm_hidden_multiplier=longterm_hidden_multiplier,
+                    longterm_lr_scale=longterm_lr_scale,
                     drop_path=dpr[i],
                     drop=drop_rate,
                 ),
@@ -230,6 +238,9 @@ class ACHOPEViT(nn.Module):
             "titan_detach_interval": titan_detach_interval,
             "surprise_threshold": surprise_threshold,
             "use_spatial_mixing": use_spatial_mixing,
+            "use_longterm_memory": use_longterm_memory,
+            "longterm_hidden_multiplier": longterm_hidden_multiplier if use_longterm_memory else None,
+            "longterm_lr_scale": longterm_lr_scale if use_longterm_memory else None,
             "total_params": sum(p.numel() for p in self.parameters()),
         }
 
@@ -543,9 +554,22 @@ class ACHOPEViT(nn.Module):
         return x
 
     def reset_all_memories(self) -> None:
-        """Reset all HOPE block memory states (call between sequences)."""
+        """Reset all HOPE block clip-level memory states (call between sequences).
+
+        M_longterm is NOT reset — it persists across clips by design.
+        Use reset_all_longterm_memories() for explicit longterm reset.
+        """
         for blk in self.hope_blocks:
             blk.reset_memory_state()
+
+    def reset_all_longterm_memories(self) -> None:
+        """Explicitly reset all longterm memories to meta-learned initial state.
+
+        Only call this for testing, ablation, or between CL task phases.
+        In normal CL training, longterm memories should persist.
+        """
+        for blk in self.hope_blocks:
+            blk.reset_longterm_memory()
 
     def freeze_all_inner_loops(self) -> None:
         """Freeze all HOPE blocks' inner-loop DGD memory updates.
@@ -619,7 +643,7 @@ class ACHOPEViT(nn.Module):
         cms_params: list[Tensor] = []
         other_params: list[Tensor] = []
 
-        titan_patterns = {"M_k.", "M_v.", "M_eta.", "M_alpha.", "M_memory."}
+        titan_patterns = {"M_k.", "M_v.", "M_eta.", "M_alpha.", "M_memory.", "M_longterm."}
 
         for name, param in self.named_parameters():
             if not param.requires_grad:

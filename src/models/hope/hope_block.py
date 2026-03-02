@@ -97,6 +97,16 @@ class HOPEBlockConfig:
     use_spatial_mixing: bool = False
     spatial_mixing_tokens: int = 258  # tokens_per_frame (H*W + action_tokens)
 
+    # Cross-clip persistent longterm memory (Ansatz B).
+    # Adds a 6th Titan memory (M_longterm) that is NEVER reset between clips.
+    # This creates a separation of concerns:
+    #   - M_memory (clip-level): fast adaptation, reset each clip, learns current physics
+    #   - M_longterm (persistent): slow accumulation, survives across clips, learns common patterns
+    # A learned gate decides per-token how much to use clip vs longterm memory.
+    use_longterm_memory: bool = False
+    longterm_hidden_multiplier: int = 2  # Smaller than M_memory (mult=4) for compactness
+    longterm_lr_scale: float = 0.1  # DGD learning rate scale (slower = more stable accumulation)
+
     # Drop path (stochastic depth)
     drop_path: float = 0.0
 
@@ -156,6 +166,28 @@ class HOPEBlock(nn.Module):
         self.M_eta = TitanMemory(mem_cfg)  # Learning rate generation memory
         self.M_alpha = TitanMemory(mem_cfg)  # Decay factor generation memory
         self.M_memory = TitanMemory(mem_cfg)  # Main retrieval memory
+
+        # ─── Cross-clip persistent longterm memory (Ansatz B) ───
+        self.use_longterm_memory = config.use_longterm_memory
+        if config.use_longterm_memory:
+            longterm_cfg = TitanMemoryConfig(
+                dim=dim,
+                hidden_multiplier=config.longterm_hidden_multiplier,
+                num_layers=config.titan_layers,
+                activation=config.titan_activation,
+                grad_clip_inner=config.titan_grad_clip_inner,
+                grad_clip_backward=config.titan_grad_clip_backward,
+                detach_interval=titan_detach_interval,
+            )
+            self.M_longterm = TitanMemory(longterm_cfg)
+            # Learned gate: per-token scalar deciding clip-level vs longterm memory
+            # sigmoid(gate) ∈ [0,1]: 1 = use M_memory (clip), 0 = use M_longterm
+            self.longterm_gate = nn.Linear(dim, 1, bias=True)
+            # Init gate bias positive so gate starts ~0.73 (favor clip-level initially)
+            # The model gradually learns when to rely on longterm memory
+            nn.init.constant_(self.longterm_gate.bias, 1.0)
+            nn.init.zeros_(self.longterm_gate.weight)
+            self.longterm_lr_scale = config.longterm_lr_scale
 
         # Output projection for Phase A
         self.out_proj = nn.Linear(dim, dim, bias=True)
@@ -374,6 +406,14 @@ class HOPEBlock(nn.Module):
 
         # Step 3: Retrieve from main memory
         output = self.M_memory(q)  # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
+
+        # Step 3b: Gated longterm memory retrieval (Ansatz B)
+        # Combines clip-level (M_memory) and persistent (M_longterm) retrieval
+        # via a learned per-token gate: output = g * clip + (1-g) * longterm
+        if self.use_longterm_memory:
+            output_longterm = self.M_longterm(q)
+            gate = torch.sigmoid(self.longterm_gate(q))  # [B, C, 1]
+            output = gate * output + (1.0 - gate) * output_longterm
 
         # Step 4-6: Compute surprise + per-memory self-targets + DGD update
         # Paper: "There is no distinction between training and test time."
@@ -631,12 +671,31 @@ class HOPEBlock(nn.Module):
             aux = aux + F.mse_loss(retrieved_via_k.detach(), v)  # M_v path
             self._aux_loss = self._aux_loss + aux
 
-    def reset_memory_state(self) -> None:
-        """Reset all memory states to meta-learned initial parameters.
+        # ─── Longterm memory DGD update (Ansatz B) ───
+        # M_longterm receives the SAME DGD update as other memories, but with a
+        # scaled-down learning rate (longterm_lr_scale, default 0.1). This ensures
+        # slow, stable accumulation across clips. Surprise gating naturally causes
+        # memorable (high-surprise) clips to update M_longterm more than boring ones.
+        if self.use_longterm_memory:
+            self_target_lt = self.M_longterm.generate_self_target(v)
+            eta_longterm = eta * self.longterm_lr_scale
+            self.M_longterm.compute_and_apply_update(
+                key=k,
+                value=self_target_lt,
+                error_signal=surprise,
+                lr=eta_longterm,
+                alpha=alpha,
+            )
 
-        Call this at the start of each new sequence to ensure memories
-        don't carry state between independent sequences.
-        Initializes active weights (detached clones) for functional forward.
+    def reset_memory_state(self) -> None:
+        """Reset clip-level memory states to meta-learned initial parameters.
+
+        Call this at the start of each new sequence/clip.
+
+        CRITICAL: M_longterm is NOT reset here — it persists across clips.
+        Only its computation graph is detached to prevent cross-clip OOM.
+        On first call (M_longterm._active_w1 is None), it is initialized
+        from nn.Parameters like all other memories.
         """
         for mem in [self.M_k, self.M_v, self.M_eta, self.M_alpha, self.M_memory]:
             mem.reset_active_weights()
@@ -644,6 +703,34 @@ class HOPEBlock(nn.Module):
         self.cms.reset_step_counter()
         # Reset auxiliary loss accumulator for this sequence
         self._aux_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+
+        # M_longterm: initialize on first call, persist & detach thereafter
+        if self.use_longterm_memory:
+            if self.M_longterm._active_w1 is None:
+                # First clip: initialize from meta-learned nn.Parameters
+                self.M_longterm.reset_active_weights()
+            else:
+                # Subsequent clips: detach to cut cross-clip computation graph
+                # (prevents OOM from unbounded graph growth across clips).
+                # The accumulated DGD knowledge in the weights is preserved.
+                self.M_longterm._active_w1 = self.M_longterm._active_w1.detach()
+                self.M_longterm._active_w2 = self.M_longterm._active_w2.detach()
+            self.M_longterm.reset_diagnostics()
+
+    def reset_longterm_memory(self) -> None:
+        """Explicitly reset longterm memory to meta-learned initial state.
+
+        Use this for:
+            - Testing (ensure clean state between test runs)
+            - Ablation studies (measure impact of longterm memory)
+            - Between CL task phases (if you want task-local longterm memory)
+
+        In normal CL training, this should NOT be called — the whole point
+        of M_longterm is to persist across clips and tasks.
+        """
+        if self.use_longterm_memory:
+            self.M_longterm.reset_active_weights()
+            self.M_longterm.reset_diagnostics()
 
     def get_diagnostics(self) -> dict[str, float]:
         """Aggregate diagnostics from all sub-components.
@@ -661,6 +748,11 @@ class HOPEBlock(nn.Module):
         ]:
             for key, val in mem.get_diagnostics().items():
                 diag[f"{prefix}/{key}"] = val
+
+        # Longterm memory diagnostics
+        if self.use_longterm_memory:
+            for key, val in self.M_longterm.get_diagnostics().items():
+                diag[f"M_longterm/{key}"] = val
 
         if self._last_surprise is not None:
             diag["hope/mean_surprise"] = self._last_surprise.mean().item()
