@@ -100,9 +100,10 @@ model:
   max_epochs: ${trainer.max_epochs}
   optimizer_type: "adamw"
 
-  # Per-group LR scaling
-  titan_lr_scale: 0.3             # Titan params LR = learning_rate * 0.3
-  cms_lr_scale: 1.0               # CMS params LR = learning_rate * 1.0
+  # Per-group LR scaling (4 groups: attention, titan, cms, projections)
+  attention_lr_scale: 1.0         # Attention LR = learning_rate * 1.0 (match ViT baseline)
+  titan_lr_scale: 0.1             # Titan params LR = learning_rate * 0.1 (augmentation role)
+  cms_lr_scale: 0.6               # CMS params LR = learning_rate * 0.6
   titan_weight_decay: 0.005       # Separate WD for Titan
   aux_loss_weight: 0.0            # Not needed for hybrid (K/V have direct gradients)
 

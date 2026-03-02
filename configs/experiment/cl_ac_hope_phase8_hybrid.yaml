@@ -125,15 +125,16 @@ model:
   drop_rate: 0.0
   drop_path_rate: 0.1
 
-  # Optimizer — AdamW
+  # Optimizer — AdamW (base LR matches ViT baseline from V-JEPA2 paper)
   optimizer_type: "adamw"
-  learning_rate: 2.5e-4
+  learning_rate: 4.25e-4
   weight_decay: 0.04
   betas: [0.9, 0.999]
 
-  # Per-group LR scaling
-  titan_lr_scale: 0.3
-  cms_lr_scale: 1.0
+  # Per-group LR scaling (4 groups: attention, titan, cms, projections)
+  attention_lr_scale: 1.0         # 4.25e-4 — match ViT baseline for token mixing
+  titan_lr_scale: 0.1             # 4.25e-5 — slow, augmentation role
+  cms_lr_scale: 0.6               # 2.55e-4 — moderate, feature transforms
   titan_weight_decay: 0.005
   aux_loss_weight: 0.0            # Not needed for hybrid
 
@@ -142,7 +143,7 @@ model:
   warmup_pct: 0.10
   constant_pct: 0.80
   decay_pct: 0.10
-  warmup_start_lr: 5.0e-5
+  warmup_start_lr: 7.5e-5
 
   # TTA defaults
   tta_enabled: false
@@ -194,6 +195,6 @@ cl:
   task_training:
     max_epochs: 10
     val_split: 0.0
-    learning_rate: 1.5e-4
+    learning_rate: 1.4e-4
     warmup_pct: 0.05
-    warmup_start_lr: 3.0e-5
+    warmup_start_lr: 2.5e-5

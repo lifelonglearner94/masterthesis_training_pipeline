@@ -367,11 +367,11 @@ class TestGradientFlow:
 class TestParameterGroups:
     """verify get_parameter_groups() returns disjoint groups."""
 
-    def test_three_groups(self, tiny_model):
-        """Must return exactly 3 groups: titan, cms, projections."""
+    def test_four_groups(self, tiny_model):
+        """Must return exactly 4 groups: attention, titan, cms, projections."""
         groups = tiny_model.get_parameter_groups()
         names = {g["group_name"] for g in groups}
-        assert names == {"titan", "cms", "projections"}
+        assert names == {"attention", "titan", "cms", "projections"}
 
     def test_all_params_covered(self, tiny_model):
         """All trainable parameters are in exactly one group."""

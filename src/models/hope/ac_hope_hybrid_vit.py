@@ -506,11 +506,16 @@ class ACHOPEHybridViT(nn.Module):
     def get_parameter_groups(self) -> ParameterGroups:
         """Get parameter groups for optimizer with different learning rates.
 
-        Returns 3 groups:
-            1. Titan memory parameters (lower LR — inner-loop optimized)
-            2. CMS parameters (normal LR)
-            3. Attention/Projection/Embedding parameters (normal LR)
+        Returns 4 groups:
+            1. **attention** — self-attention params (QKV, proj, norm1) per block.
+               Matches ViT baseline LR for comparable token-mixing capacity.
+            2. **titan** — Titan memory params (M_memory, M_longterm, η/α, projections,
+               gate). Lower LR since these are inner-loop augmentation.
+            3. **cms** — CMS MLP parameters. Moderate LR.
+            4. **projections** — embedding, decoding, action/state encoders,
+               remaining norms. Matches attention LR.
         """
+        attention_params: list[Tensor] = []
         titan_params: list[Tensor] = []
         cms_params: list[Tensor] = []
         other_params: list[Tensor] = []
@@ -521,6 +526,10 @@ class ACHOPEHybridViT(nn.Module):
             "longterm_gate.",
         }
 
+        attention_patterns = {
+            "attn.", "norm1.",
+        }
+
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
@@ -528,10 +537,13 @@ class ACHOPEHybridViT(nn.Module):
                 titan_params.append(param)
             elif "cms." in name:
                 cms_params.append(param)
+            elif any(pattern in name for pattern in attention_patterns):
+                attention_params.append(param)
             else:
                 other_params.append(param)
 
         return [
+            {"params": attention_params, "group_name": "attention"},
             {"params": titan_params, "group_name": "titan"},
             {"params": cms_params, "group_name": "cms"},
             {"params": other_params, "group_name": "projections"},

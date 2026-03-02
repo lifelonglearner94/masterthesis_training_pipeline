@@ -92,8 +92,9 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         longterm_hidden_multiplier: int = 2,
         longterm_lr_scale: float = 0.1,
         # Optimizer: per-group LR/WD scaling
-        titan_lr_scale: float = 0.3,
-        cms_lr_scale: float = 1.0,
+        attention_lr_scale: float = 1.0,
+        titan_lr_scale: float = 0.1,
+        cms_lr_scale: float = 0.6,
         titan_weight_decay: float | None = None,
         aux_loss_weight: float = 0.0,  # Not needed for hybrid
         # Loss settings
@@ -201,6 +202,7 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.betas = betas
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.attention_lr_scale = attention_lr_scale
         self.titan_lr_scale = titan_lr_scale
         self.cms_lr_scale = cms_lr_scale
         self.titan_weight_decay = titan_weight_decay
@@ -549,13 +551,16 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             if not params:
                 continue
 
-            if name == "titan":
+            if name == "attention":
+                lr = self.learning_rate * self.attention_lr_scale
+                wd = self.weight_decay
+            elif name == "titan":
                 lr = self.learning_rate * self.titan_lr_scale
                 wd = self.titan_weight_decay if self.titan_weight_decay is not None else self.weight_decay
             elif name == "cms":
                 lr = self.learning_rate * self.cms_lr_scale
                 wd = self.weight_decay
-            else:
+            else:  # projections
                 lr = self.learning_rate
                 wd = self.weight_decay
 
