@@ -124,6 +124,11 @@ class ACHOPEViT(nn.Module):
         use_longterm_memory: bool = False,
         longterm_hidden_multiplier: int = 2,
         longterm_lr_scale: float = 0.1,
+        # Phase 7 longterm memory enhancements
+        longterm_retrieval_conditioned_gate: bool = False,
+        longterm_alpha_min: float = 0.0,
+        longterm_own_surprise: bool = False,
+        longterm_consolidation_ema: float = 0.0,
         # Regularization
         drop_rate: float = DEFAULT_DROP_RATE,
         drop_path_rate: float = DEFAULT_DROP_PATH_RATE,
@@ -205,6 +210,10 @@ class ACHOPEViT(nn.Module):
                     use_longterm_memory=use_longterm_memory,
                     longterm_hidden_multiplier=longterm_hidden_multiplier,
                     longterm_lr_scale=longterm_lr_scale,
+                    longterm_retrieval_conditioned_gate=longterm_retrieval_conditioned_gate,
+                    longterm_alpha_min=longterm_alpha_min,
+                    longterm_own_surprise=longterm_own_surprise,
+                    longterm_consolidation_ema=longterm_consolidation_ema,
                     drop_path=dpr[i],
                     drop=drop_rate,
                 ),
@@ -241,6 +250,10 @@ class ACHOPEViT(nn.Module):
             "use_longterm_memory": use_longterm_memory,
             "longterm_hidden_multiplier": longterm_hidden_multiplier if use_longterm_memory else None,
             "longterm_lr_scale": longterm_lr_scale if use_longterm_memory else None,
+            "longterm_retrieval_conditioned_gate": longterm_retrieval_conditioned_gate if use_longterm_memory else None,
+            "longterm_alpha_min": longterm_alpha_min if use_longterm_memory else None,
+            "longterm_own_surprise": longterm_own_surprise if use_longterm_memory else None,
+            "longterm_consolidation_ema": longterm_consolidation_ema if use_longterm_memory else None,
             "total_params": sum(p.numel() for p in self.parameters()),
         }
 
@@ -570,6 +583,18 @@ class ACHOPEViT(nn.Module):
         """
         for blk in self.hope_blocks:
             blk.reset_longterm_memory()
+
+    def consolidate_all_longterm_memories(self) -> None:
+        """Consolidate accumulated DGD state into longterm nn.Parameters via EMA.
+
+        Phase 7 consolidation: call this between CL tasks to absorb the
+        accumulated DGD knowledge into the meta-learned initial state.
+        This prevents the active weights from drifting arbitrarily far from
+        parameters and provides meta-learning feedback.
+        """
+        for blk in self.hope_blocks:
+            blk.consolidate_longterm_memory()
+        log.info("Phase 7: consolidated longterm memory EMA across all blocks")
 
     def freeze_all_inner_loops(self) -> None:
         """Freeze all HOPE blocks' inner-loop DGD memory updates.

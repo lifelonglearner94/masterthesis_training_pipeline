@@ -103,6 +103,11 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         use_longterm_memory: bool = False,
         longterm_hidden_multiplier: int = 2,
         longterm_lr_scale: float = 0.1,
+        # Phase 7 longterm memory enhancements
+        longterm_retrieval_conditioned_gate: bool = False,
+        longterm_alpha_min: float = 0.0,
+        longterm_own_surprise: bool = False,
+        longterm_consolidation_ema: float = 0.0,
         # Optimizer: per-group LR/WD scaling
         titan_lr_scale: float = 0.2,
         cms_lr_scale: float = 1.0,
@@ -192,6 +197,10 @@ class ACHOPEModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             use_longterm_memory=use_longterm_memory,
             longterm_hidden_multiplier=longterm_hidden_multiplier,
             longterm_lr_scale=longterm_lr_scale,
+            longterm_retrieval_conditioned_gate=longterm_retrieval_conditioned_gate,
+            longterm_alpha_min=longterm_alpha_min,
+            longterm_own_surprise=longterm_own_surprise,
+            longterm_consolidation_ema=longterm_consolidation_ema,
         )
 
         self.T_teacher = T_teacher

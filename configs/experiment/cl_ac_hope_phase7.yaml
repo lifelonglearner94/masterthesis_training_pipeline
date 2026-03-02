@@ -1,0 +1,237 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-HOPE-ViT Phase 7: Enhanced Longterm Memory
+# =============================================================================
+# Builds on Phase 6 (persistent longterm memory) and addresses all B-grade
+# review items to achieve A-level design across every dimension:
+#
+#   1. RETRIEVAL-CONDITIONED GATE (B→A: Gate Design)
+#
+#      Problem: Phase 6 gate conditions on q alone — it cannot distinguish
+#      "both memories agree" from "they disagree but clip-level is better."
+#
+#      Solution: Gate input becomes [q; |M_memory(q) - M_longterm(q)|].
+#      The discrepancy signal tells the gate HOW DIFFERENT the two memories
+#      are for each token, enabling context-aware routing.
+#      Param increase: +D per gate (384 → 2*384 input) ≈ +384*5 = 1920 params.
+#
+#   2. ASYMMETRIC DECAY (B→A: DGD Scaling)
+#
+#      Problem: Phase 6 uses the same α (decay) for both clip and longterm
+#      memories. In CLS theory, the slow (neocortical) system should retain
+#      more and forget less.
+#
+#      Solution: Clamp α for M_longterm to [α_min, 1.0] where α_min = 0.95.
+#      This ensures M_longterm retains ≥95% of its knowledge per DGD step,
+#      while clip-level memories can decay freely.
+#
+#   3. LONGTERM-SPECIFIC SURPRISE (B→A: DGD Scaling)
+#
+#      Problem: Phase 6 uses M_memory's retrieval error as surprise signal
+#      for M_longterm — the longterm memory is updated based on the clip-
+#      level system's surprise, not its own.
+#
+#      Solution: M_longterm computes its own surprise from its own retrieval
+#      error. It updates most when IT is surprised, not when M_memory is.
+#      This decouples the two memory systems' update dynamics.
+#
+#   4. CONSOLIDATION EMA (B+→A: Asymmetric Reset)
+#
+#      Problem: After .detach(), M_longterm's accumulated DGD weights become
+#      constants. The meta-learned initial state (nn.Parameters) receives no
+#      feedback about how well the accumulated state serves across clips.
+#
+#      Solution: Between CL tasks, run EMA consolidation:
+#        param_new = (1 - ema) * param_old + ema * active_weight
+#      This absorbs accumulated DGD knowledge into the initial state,
+#      preventing unbounded drift and providing meta-learning feedback.
+#      ema = 0.01 → slow consolidation, 1% per task.
+#
+# Combined effect on CL metrics:
+#   Plasticity ↓: Retrieval-conditioned gate routes novel tokens to fresh M_memory
+#   Forgetting ↓: Asymmetric decay + own surprise + consolidation preserve invariants
+#
+# Architecture: depth=5, titan_mult=4, CMS={2.0/2.5/3.0}, spatial_mixing=true,
+#               longterm_memory=true (mult=2) + Phase 7 enhancements
+# Param budget: ~46.5M (same as Phase 6 + negligible gate input increase)
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase7 paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase7"
+tags: ["cl", "continual_learning", "ac_hope", "titan", "cms", "phase7",
+       "longterm_memory", "retrieval_gate", "asymmetric_decay",
+       "own_surprise", "consolidation", "spatial_mixing", "temporal_embed"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-ViT Phase 7 (depth=5, ~46.5M params)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false  # HOPE DGD incompatible with checkpointing
+  action_embed_dim: 2
+
+  # HOPE architecture — depth=5, titan_mult=4, heterogeneous CMS
+  depth: 5
+  titan_hidden_multiplier: 4
+  use_rope: false                 # RoPE disabled: temporal info from learnable embeddings
+  titan_grad_clip_inner: 1.0
+  chunk_size: 1
+  titan_detach_interval: 2
+  surprise_threshold: 0.1
+
+  # Spatial mixing (Phase C) — cross-token interaction (from Phase 5)
+  use_spatial_mixing: true
+
+  # ─── Persistent longterm memory (from Phase 6) ───
+  use_longterm_memory: true
+  longterm_hidden_multiplier: 2   # Compact slow summary
+  longterm_lr_scale: 0.05         # 20× slower DGD (tighter than Phase 6's 0.1)
+
+  # ─── NEW Phase 7: All B→A enhancements ───
+
+  # 1. Retrieval-conditioned gate: conditions on [q; |o_clip - o_long|]
+  #    so the gate knows HOW DIFFERENT the two memories are per token.
+  longterm_retrieval_conditioned_gate: true
+
+  # 2. Asymmetric decay: α for M_longterm clamped to [0.95, 1.0].
+  #    M_longterm retains ≥95% of knowledge per DGD step.
+  #    Clip-level memories decay freely (no constraint).
+  longterm_alpha_min: 0.95
+
+  # 3. Longterm-specific surprise: M_longterm updates based on its OWN
+  #    retrieval error, not M_memory's. Decoupled update dynamics.
+  longterm_own_surprise: true
+
+  # 4. Consolidation EMA: between CL tasks, absorb DGD state into
+  #    nn.Parameters via slow EMA. 1% per task → meta-learning feedback.
+  longterm_consolidation_ema: 0.01
+
+  # CMS levels — frame-aware scheduling with heterogeneous capacity
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum for base training — disabled
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # Optimizer — AdamW
+  optimizer_type: "adamw"
+  learning_rate: 2.5e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  titan_lr_scale: 0.3
+  cms_lr_scale: 1.0
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.1
+
+  # LR schedule
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 5.0e-5
+
+  # TTA defaults
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS
+# =============================================================================
+trainer:
+  max_epochs: 65
+  precision: 32
+  gradient_clip_val: 1.5
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_ac_hope_phase7_${now:%Y%m%d_%H%M%S}"
+  task_training_mode: "finetune"
+  resume_from_base_checkpoint: null
+
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 65
+    val_split: 0.1
+
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  eval:
+    clips_per_task: 100
+
+  task_training:
+    max_epochs: 10
+    val_split: 0.0
+    learning_rate: 1.5e-4
+    warmup_pct: 0.05
+    warmup_start_lr: 3.0e-5

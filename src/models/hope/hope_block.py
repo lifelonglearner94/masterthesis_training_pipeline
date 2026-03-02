@@ -107,6 +107,35 @@ class HOPEBlockConfig:
     longterm_hidden_multiplier: int = 2  # Smaller than M_memory (mult=4) for compactness
     longterm_lr_scale: float = 0.1  # DGD learning rate scale (slower = more stable accumulation)
 
+    # ─── Phase 7 enhancements (addresses B→A review items) ───
+
+    # Retrieval-conditioned gate (Phase 7): gate sees query AND retrieval
+    # discrepancy between M_memory and M_longterm, enabling the model to
+    # decide based on *how different* the two memories are, not just the query.
+    # When False, uses Phase 6 simple gate: g = σ(W_g · q + b_g)
+    # When True, uses enriched gate: g = σ(W_g · [q; |o_clip - o_long|] + b_g)
+    longterm_retrieval_conditioned_gate: bool = False
+
+    # Asymmetric decay (Phase 7): clamp α for M_longterm to enforce higher
+    # retention than clip-level memories. CLS theory prescribes that the
+    # neocortical (slow) memory should retain more and forget less.
+    # Range: 0.0 = disabled (same α as clip-level), 1.0 = no decay at all.
+    longterm_alpha_min: float = 0.0  # 0.0 = disabled; recommended: 0.95
+
+    # Longterm-specific surprise (Phase 7): compute surprise from
+    # M_longterm's own retrieval error instead of reusing M_memory's signal.
+    # This gives M_longterm an independent update criterion aligned with ITS
+    # own knowledge state — it updates most when IT is surprised, not when
+    # the clip-level system is surprised.
+    longterm_own_surprise: bool = False
+
+    # Consolidation EMA (Phase 7): periodically absorb accumulated DGD
+    # state into M_longterm's nn.Parameters via exponential moving average.
+    # This provides meta-learning feedback about longterm accumulation quality
+    # and prevents the active weights from drifting arbitrarily far from the
+    # learnable initial state.  Rate = 0.0 means disabled.
+    longterm_consolidation_ema: float = 0.0  # 0.0 = disabled; recommended: 0.01
+
     # Drop path (stochastic depth)
     drop_path: float = 0.0
 
@@ -167,7 +196,7 @@ class HOPEBlock(nn.Module):
         self.M_alpha = TitanMemory(mem_cfg)  # Decay factor generation memory
         self.M_memory = TitanMemory(mem_cfg)  # Main retrieval memory
 
-        # ─── Cross-clip persistent longterm memory (Ansatz B) ───
+        # ─── Cross-clip persistent longterm memory (Ansatz B + Phase 7) ───
         self.use_longterm_memory = config.use_longterm_memory
         if config.use_longterm_memory:
             longterm_cfg = TitanMemoryConfig(
@@ -180,14 +209,26 @@ class HOPEBlock(nn.Module):
                 detach_interval=titan_detach_interval,
             )
             self.M_longterm = TitanMemory(longterm_cfg)
-            # Learned gate: per-token scalar deciding clip-level vs longterm memory
-            # sigmoid(gate) ∈ [0,1]: 1 = use M_memory (clip), 0 = use M_longterm
-            self.longterm_gate = nn.Linear(dim, 1, bias=True)
+
+            # ─── Gate: Phase 7 retrieval-conditioned vs Phase 6 simple ───
+            # Phase 7 gate conditions on [q; |o_clip - o_long|] (2*D → 1),
+            # allowing the gate to decide based on retrieval discrepancy.
+            # Phase 6 gate conditions on q alone (D → 1).
+            self._retrieval_conditioned_gate = config.longterm_retrieval_conditioned_gate
+            if config.longterm_retrieval_conditioned_gate:
+                # Input: [q_t; |M_memory(q) - M_longterm(q)|]  →  2*D → 1
+                self.longterm_gate = nn.Linear(2 * dim, 1, bias=True)
+            else:
+                self.longterm_gate = nn.Linear(dim, 1, bias=True)
             # Init gate bias positive so gate starts ~0.73 (favor clip-level initially)
             # The model gradually learns when to rely on longterm memory
             nn.init.constant_(self.longterm_gate.bias, 1.0)
             nn.init.zeros_(self.longterm_gate.weight)
+
             self.longterm_lr_scale = config.longterm_lr_scale
+            self.longterm_alpha_min = config.longterm_alpha_min
+            self.longterm_own_surprise = config.longterm_own_surprise
+            self.longterm_consolidation_ema = config.longterm_consolidation_ema
 
         # Output projection for Phase A
         self.out_proj = nn.Linear(dim, dim, bias=True)
@@ -407,12 +448,20 @@ class HOPEBlock(nn.Module):
         # Step 3: Retrieve from main memory
         output = self.M_memory(q)  # o_t = M_{memory,t-1}(q_t)  (Eq. 86)
 
-        # Step 3b: Gated longterm memory retrieval (Ansatz B)
+        # Step 3b: Gated longterm memory retrieval (Ansatz B + Phase 7)
         # Combines clip-level (M_memory) and persistent (M_longterm) retrieval
         # via a learned per-token gate: output = g * clip + (1-g) * longterm
         if self.use_longterm_memory:
             output_longterm = self.M_longterm(q)
-            gate = torch.sigmoid(self.longterm_gate(q))  # [B, C, 1]
+            # Phase 7 retrieval-conditioned gate: conditions on
+            # [q; |o_clip - o_long|] so the gate knows HOW DIFFERENT
+            # the two memories are, not just what the query is.
+            if self._retrieval_conditioned_gate:
+                discrepancy = (output - output_longterm).abs()  # [B, C, D]
+                gate_input = torch.cat([q, discrepancy], dim=-1)  # [B, C, 2D]
+            else:
+                gate_input = q  # [B, C, D] (Phase 6 simple gate)
+            gate = torch.sigmoid(self.longterm_gate(gate_input))  # [B, C, 1]
             output = gate * output + (1.0 - gate) * output_longterm
 
         # Step 4-6: Compute surprise + per-memory self-targets + DGD update
@@ -421,18 +470,26 @@ class HOPEBlock(nn.Module):
         # adapts in-context to each sequence (core HOPE advantage).
         # When freeze_inner_loop=True, skip all memory writes for CL evaluation.
         if not self.freeze_inner_loop and (torch.is_grad_enabled() or not self.training):
-            # Retrieval error as surprise signal
+            # Retrieval error as surprise signal (clip-level)
             retrieval_error = v - output  # [B, C, D]
             surprise = self.M_memory.surprise(retrieval_error)  # [B]
             self._last_surprise = surprise.detach()
+
+            # Phase 7: longterm-specific surprise for M_longterm's DGD update.
+            # M_longterm uses its OWN retrieval error as the update criterion,
+            # so it updates most when IT is surprised (not when M_memory is).
+            longterm_surprise = None
+            if self.use_longterm_memory and self.longterm_own_surprise:
+                lt_retrieval_error = v - output_longterm  # [B, C, D]
+                longterm_surprise = self.M_longterm.surprise(lt_retrieval_error)  # [B]
 
             # Only update if surprise exceeds threshold
             if self.config.surprise_threshold > 0:
                 update_mask = surprise > self.config.surprise_threshold
                 if update_mask.any():
-                    self._update_memories(k, v, surprise, eta, alpha)
+                    self._update_memories(k, v, surprise, eta, alpha, longterm_surprise=longterm_surprise)
             else:
-                self._update_memories(k, v, surprise, eta, alpha)
+                self._update_memories(k, v, surprise, eta, alpha, longterm_surprise=longterm_surprise)
 
         # Project output
         output = self.out_proj(output)
@@ -600,6 +657,7 @@ class HOPEBlock(nn.Module):
         surprise: Tensor,
         eta: Tensor,
         alpha: Tensor,
+        longterm_surprise: Tensor | None = None,
     ) -> None:
         """Update all adaptive memories via DGD with self-generated targets.
 
@@ -624,9 +682,12 @@ class HOPEBlock(nn.Module):
         Args:
             k: [B, N, D] keys (output of M_k, in computation graph).
             v: [B, N, D] values (output of M_v, in computation graph).
-            surprise: [B] surprise signal per sample.
+            surprise: [B] surprise signal per sample (from M_memory).
             eta: [B, N, D] adaptive learning rate.
             alpha: [B, N, D] adaptive decay factor.
+            longterm_surprise: [B] optional longterm-specific surprise signal.
+                If provided (Phase 7), M_longterm uses its OWN surprise instead
+                of M_memory's. If None, falls back to M_memory's surprise.
         """
         memories = [self.M_k, self.M_v, self.M_eta, self.M_alpha, self.M_memory]
 
@@ -671,20 +732,34 @@ class HOPEBlock(nn.Module):
             aux = aux + F.mse_loss(retrieved_via_k.detach(), v)  # M_v path
             self._aux_loss = self._aux_loss + aux
 
-        # ─── Longterm memory DGD update (Ansatz B) ───
-        # M_longterm receives the SAME DGD update as other memories, but with a
-        # scaled-down learning rate (longterm_lr_scale, default 0.1). This ensures
-        # slow, stable accumulation across clips. Surprise gating naturally causes
-        # memorable (high-surprise) clips to update M_longterm more than boring ones.
+        # ─── Longterm memory DGD update (Ansatz B + Phase 7) ───
+        # M_longterm receives the SAME DGD update as other memories, but with:
+        #   1. Scaled-down learning rate (longterm_lr_scale, default 0.1)
+        #   2. Phase 7: asymmetric decay — α clamped to [α_min, 1.0] for higher retention
+        #   3. Phase 7: own surprise signal — updates based on M_longterm's own retrieval error
         if self.use_longterm_memory:
             self_target_lt = self.M_longterm.generate_self_target(v)
             eta_longterm = eta * self.longterm_lr_scale
+
+            # Phase 7: Asymmetric decay — clamp α for M_longterm to enforce
+            # higher retention than clip-level memories.  In CLS theory, the
+            # neocortical (slow) system should retain more and forget less.
+            # α_min=0.95 means M_longterm retains ≥95% of existing knowledge per step.
+            if self.longterm_alpha_min > 0.0:
+                alpha_longterm = alpha.clamp(min=self.longterm_alpha_min)
+            else:
+                alpha_longterm = alpha
+
+            # Phase 7: Use M_longterm's own surprise signal if available,
+            # otherwise fall back to M_memory's surprise.
+            lt_surprise = longterm_surprise if longterm_surprise is not None else surprise
+
             self.M_longterm.compute_and_apply_update(
                 key=k,
                 value=self_target_lt,
-                error_signal=surprise,
+                error_signal=lt_surprise,
                 lr=eta_longterm,
-                alpha=alpha,
+                alpha=alpha_longterm,
             )
 
     def reset_memory_state(self) -> None:
@@ -731,6 +806,41 @@ class HOPEBlock(nn.Module):
         if self.use_longterm_memory:
             self.M_longterm.reset_active_weights()
             self.M_longterm.reset_diagnostics()
+
+    def consolidate_longterm_memory(self) -> None:
+        """Absorb accumulated DGD state into M_longterm's nn.Parameters via EMA.
+
+        Phase 7 consolidation mechanism (analogous to neocortical sleep replay):
+            param_new = (1 - ema_rate) * param_old + ema_rate * active_weight
+
+        This provides meta-learning feedback about longterm accumulation quality
+        and prevents the active weights from drifting arbitrarily far from the
+        learnable initial state.
+
+        Call this between CL tasks (not between individual clips) to consolidate
+        knowledge from the completed task into the persistent memory's initial state.
+
+        After consolidation, the active weights are re-initialized from the
+        updated nn.Parameters (detached) so subsequent clips start from the
+        consolidated state.
+        """
+        if not self.use_longterm_memory or self.longterm_consolidation_ema <= 0.0:
+            return
+        if self.M_longterm._active_w1 is None:
+            return  # Nothing to consolidate yet
+
+        ema = self.longterm_consolidation_ema
+        with torch.no_grad():
+            # EMA update: param ← (1 - ema) * param + ema * active
+            self.M_longterm.w1.weight.mul_(1.0 - ema).add_(
+                self.M_longterm._active_w1.detach(), alpha=ema
+            )
+            self.M_longterm.w2.weight.mul_(1.0 - ema).add_(
+                self.M_longterm._active_w2.detach(), alpha=ema
+            )
+        # Re-initialize active weights from the updated parameters
+        self.M_longterm._active_w1 = self.M_longterm.w1.weight.clone().detach()
+        self.M_longterm._active_w2 = self.M_longterm.w2.weight.clone().detach()
 
     def get_diagnostics(self) -> dict[str, float]:
         """Aggregate diagnostics from all sub-components.

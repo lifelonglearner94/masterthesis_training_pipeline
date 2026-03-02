@@ -90,6 +90,12 @@ model:
   longterm_hidden_multiplier: 2     # Hidden dim multiplier for M_longterm (smaller than M_memory's 4)
   longterm_lr_scale: 0.1            # DGD learning rate scale (10x slower than clip-level)
 
+  # Phase 7 longterm memory enhancements
+  longterm_retrieval_conditioned_gate: false  # Gate conditions on [q; |o_clip - o_long|] instead of just q
+  longterm_alpha_min: 0.0            # Clamp α for M_longterm (0.0=disabled, 0.95=high retention)
+  longterm_own_surprise: false       # M_longterm uses its own retrieval error for surprise gating
+  longterm_consolidation_ema: 0.0    # EMA rate for absorbing DGD state into nn.Parameters (0.0=disabled)
+
   # ─── Diagnostics (Criticism §1: log all relevant parameters) ───
   log_hope_diagnostics: true
 
