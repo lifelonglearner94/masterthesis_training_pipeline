@@ -244,7 +244,7 @@ cl:
     # Number of clips to store in the buffer. Reservoir sampling ensures
     # uniform coverage: each past clip has equal probability of being stored.
     # Rule of thumb: 10% of base training clips provides good coverage.
-    buffer_size: 700            # Increased: better coverage with 5 sequential tasks
+    buffer_size: 600            # Increased: better coverage with 5 sequential tasks
 
     # Fraction of each training batch from the replay buffer.
     # 0.3 = 30% replay + 70% new task data per step.
