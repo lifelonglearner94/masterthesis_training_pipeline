@@ -228,6 +228,24 @@ class TitanMemory(nn.Module):
         )
 
     # ──────────────────────────────────────────────────────────────────────
+    # Device safety: move active weights when the module moves
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _apply(self, fn):
+        """Override _apply so active weights follow .to() / .cuda() / .cpu().
+
+        nn.Module._apply only moves nn.Parameters and registered buffers.
+        _active_w1/_active_w2 are plain tensors (needed for DGD inner loop),
+        so we must move them explicitly to avoid device mismatches.
+        """
+        super()._apply(fn)
+        if self._active_w1 is not None:
+            self._active_w1 = fn(self._active_w1)
+        if self._active_w2 is not None:
+            self._active_w2 = fn(self._active_w2)
+        return self
+
+    # ──────────────────────────────────────────────────────────────────────
     # Active-weight management
     # ──────────────────────────────────────────────────────────────────────
 

@@ -2,7 +2,7 @@
 # =============================================================================
 # Continual Learning Pipeline — AC-HOPE-Hybrid-ViT Phase 9
 # =============================================================================
-# FROZEN ATTENTION + TITAN RESET + CMS ADAPTATION
+# SOFT-FROZEN ATTENTION + TITAN RESET + CMS ADAPTATION
 #
 # Core insight from Phase 8 analysis:
 #   The Hybrid closes only ~10% of the LB→UB gap. Forgetting improved (37%
@@ -11,12 +11,14 @@
 #
 # Phase 9 strategy — three complementary interventions:
 #
-#   1. FREEZE ATTENTION during task training (requires_grad=False)
+#   1. SOFT-FREEZE ATTENTION during task training (very low LR)
 #      Attention learned universal spatial-temporal token mixing (3D RoPE)
 #      during base training. Physics shifts (scaling, dissipation, kinematics)
-#      don't change spatial structure — they change feature dynamics captured
-#      by CMS and Titan. Hard freeze prevents ANY drift of the ~18M attention
-#      parameters, providing maximum forgetting protection.
+#      mostly change feature dynamics (CMS/Titan domain), not spatial structure.
+#      But for lifelong learning, hard freezing is too rigid — the attention
+#      representations must slowly co-adapt with the evolving CMS/Titan features.
+#      A very small LR (0.02× task LR = 2.8e-6) makes attention the slowest
+#      timescale in the multi-timescale hierarchy: CMS > Titan > Attention.
 #
 #   2. RESET TITAN MEMORIES at each task boundary
 #      Stale memory states from previous tasks create interference with
@@ -31,11 +33,11 @@
 #      and carry the task-specific adaptation burden.
 #
 # Parameter budget during task training:
-#   Attention: ~18M params — FROZEN (0 trainable)
-#   Titan:     ~8M params  — trainable (reset at task start)
-#   CMS:       ~14M params — trainable (primary adaptation)
+#   Attention: ~18M params — soft-frozen (LR = 2.8e-6, slowest timescale)
+#   Titan:     ~8M params  — trainable (reset at task start, LR = 2.8e-4)
+#   CMS:       ~14M params — trainable (primary adaptation, LR = 1.4e-4)
 #   Other:     ~4M params  — trainable (projections, norms)
-#   → ~26M trainable / ~44M total (59% trainable)
+#   → ~44M all trainable, multi-timescale LR hierarchy
 #
 # REQUIRES: base checkpoint from Phase 8 hybrid run
 #   cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
@@ -58,7 +60,7 @@ defaults:
 # =============================================================================
 task_name: "cl_ac_hope_phase9"
 tags: ["cl", "continual_learning", "ac_hope_hybrid", "phase9",
-       "frozen_attention", "titan_reset", "cms_adaptation"]
+       "soft_freeze_attention", "titan_reset", "cms_adaptation"]
 seed: 42
 train: True
 test: False
@@ -209,22 +211,21 @@ cl:
 
   # ─── Phase 9: Task training with frozen attention + Titan reset ───
   task_training:
-    max_epochs: 15                # Safe with frozen attention (fewer params to tune)
+    max_epochs: 15                # Safe with soft-frozen attention (near-frozen drift)
     val_split: 0.0
     learning_rate: 1.4e-4         # Higher than Phase 8 selective_freeze (was 7e-5)
-                                  # because attention is fully frozen — no risk of drift
+                                  # attention has negligible LR (0.02×) — minimal drift risk
 
     warmup_pct: 0.05
     warmup_start_lr: 2.5e-5
 
-    # Attention is HARD FROZEN (requires_grad=False), so LR scale is irrelevant
-    # but we set it to 0.0 for clarity — these params won't be in the optimizer
-    attention_lr_scale: 0.0
+    # Attention gets a very small LR — slowest timescale for lifelong co-adaptation
+    attention_lr_scale: 0.02      # 1.4e-4 × 0.02 = 2.8e-6 (slow co-adaptation)
     # Titan gets aggressive LR — it's reset each task so no forgetting concern
     titan_lr_scale: 2.0           # 1.4e-4 × 2.0 = 2.8e-4
     # CMS is the primary adaptation mechanism
     cms_lr_scale: 1.0             # 1.4e-4 × 1.0 = 1.4e-4
 
     # ─── Phase 9 CL mechanisms (read by cl_train.py) ───
-    freeze_attention: true        # Hard freeze attention (requires_grad=False)
+    freeze_attention: false       # Soft freeze: trainable with very low LR (0.02×)
     reset_titan_memories: true    # Reset all Titan memories at task boundary

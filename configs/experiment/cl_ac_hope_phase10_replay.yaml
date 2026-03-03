@@ -2,14 +2,15 @@
 # =============================================================================
 # Continual Learning Pipeline — AC-HOPE-Hybrid-ViT Phase 10 (Replay)
 # =============================================================================
-# FROZEN ATTENTION + TITAN RESET + CMS ADAPTATION + EXPERIENCE REPLAY
+# SOFT-FROZEN ATTENTION + TITAN RESET + CMS ADAPTATION + EXPERIENCE REPLAY
 #
 # Phase 10 = Phase 9 (architectural CL mechanisms) + Experience Replay
 #
 # Phase 9 alone addresses:
-#   ✓ Forgetting: frozen attention preserves universal token mixing
+#   ✓ Forgetting: soft-frozen attention preserves token mixing (tiny LR)
 #   ✓ Plasticity: Titan reset removes stale memory interference
 #   ✓ Adaptation: CMS carries task-specific feature transforms
+#   ✓ Lifelong: attention slowly co-adapts with evolving CMS/Titan features
 #
 # But the fundamental bottleneck remains DATA ACCESS — the upper bound trains
 # on ALL data jointly. Phase 10 adds a replay buffer that samples from past
@@ -52,7 +53,7 @@ defaults:
 # =============================================================================
 task_name: "cl_ac_hope_phase10_replay"
 tags: ["cl", "continual_learning", "ac_hope_hybrid", "phase10",
-       "frozen_attention", "titan_reset", "cms_adaptation", "replay"]
+       "soft_freeze_attention", "titan_reset", "cms_adaptation", "replay"]
 seed: 42
 train: True
 test: False
@@ -210,15 +211,15 @@ cl:
     warmup_pct: 0.05
     warmup_start_lr: 2.5e-5
 
-    # Attention is HARD FROZEN
-    attention_lr_scale: 0.0
+    # Attention gets very small LR — slowest timescale for lifelong co-adaptation
+    attention_lr_scale: 0.02      # 1.4e-4 × 0.02 = 2.8e-6 (slow co-adaptation)
     # Titan gets aggressive LR — reset each task
     titan_lr_scale: 2.0           # 1.4e-4 × 2.0 = 2.8e-4
     # CMS is the primary adaptation mechanism
     cms_lr_scale: 1.0             # 1.4e-4 × 1.0 = 1.4e-4
 
     # Phase 9 CL mechanisms
-    freeze_attention: true
+    freeze_attention: false       # Soft freeze: trainable with very low LR (0.02×)
     reset_titan_memories: true
 
   # ─── Phase 10: Experience Replay Configuration ───

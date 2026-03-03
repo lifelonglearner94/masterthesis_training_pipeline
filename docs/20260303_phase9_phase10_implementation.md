@@ -23,20 +23,25 @@ The gap closure is only 10% because the forgetting improvement gets cancelled by
 
 ---
 
-## Phase 9: Frozen Attention + Titan Reset + CMS Adaptation
+## Phase 9: Soft-Frozen Attention + Titan Reset + CMS Adaptation
 
 **Config:** `configs/experiment/cl_ac_hope_phase9.yaml`
-**Targets:** Both forgetting AND plasticity
+**Targets:** Both forgetting AND plasticity, while enabling lifelong co-adaptation
 
 ### Three interventions
 
-#### 1. Hard-freeze attention during task training
+#### 1. Soft-freeze attention during task training (very low LR)
 
-Attention layers (~18M params) learned universal spatial-temporal token mixing (3D RoPE) during base training. The physics shifts between tasks (scaling, dissipation, kinematics) don't change spatial structure — they change feature dynamics. Hard-freezing (`requires_grad=False`) prevents ANY drift.
+Attention layers (~18M params) learned universal spatial-temporal token mixing (3D RoPE) during base training. Physics shifts mostly affect feature dynamics (CMS/Titan domain), not spatial structure. However, for lifelong learning, hard-freezing is too rigid — over many tasks, frozen attention becomes misaligned with the evolving CMS/Titan representations.
 
-**Implementation:** New methods on `ACHOPEHybridViT` in `src/models/hope/ac_hope_hybrid_vit.py`:
-- `freeze_attention()` — sets `requires_grad=False` on all `attn.*` and `norm1.*` parameters across all 12 HybridBlocks
-- `unfreeze_attention()` — restores trainability after task training
+Instead, attention is trained with a very small LR scale (`attention_lr_scale: 0.02`, effective LR = 1.4e-4 × 0.02 = 2.8e-6), making it the **slowest timescale** in the multi-timescale hierarchy:
+- Attention: 2.8e-6 (slowest — preserves structure, allows slow co-adaptation)
+- CMS: 1.4e-4 (medium — primary task adaptation)
+- Titan: 2.8e-4 (fastest — reset each task, aggressive learning)
+
+This follows the same multi-timescale principle already built into CMS (fast/medium/slow levels) and matches biological learning where even "slow-learning" brain regions still adapt.
+
+**Implementation:** The existing `attention_lr_scale` mechanism in optimizer parameter groups handles this — no `requires_grad=False` needed. Methods `freeze_attention()` / `unfreeze_attention()` remain available for ablation experiments.
 
 #### 2. Reset Titan memories at each task boundary
 
@@ -53,21 +58,19 @@ CMS multi-frequency MLPs (fast/medium/slow) carry the task-specific adaptation b
 
 ### Integration in `cl_train.py`
 
-The `run_task_training_finetune()` function reads two new config flags from `cl.task_training`:
-- `freeze_attention: true` → calls `model.model.freeze_attention()` before training
+The `run_task_training_finetune()` function reads config flags from `cl.task_training`:
+- `freeze_attention: false` + `attention_lr_scale: 0.02` → soft freeze via tiny optimizer LR
 - `reset_titan_memories: true` → calls `model.model.reset_titan_for_new_task()` before training
-
-After task training, attention is automatically unfrozen for evaluation.
 
 ### Parameter budget during task training
 
-| Component | Params | Trainable? |
-|-----------|-------:|:----------:|
-| Attention | ~18M | FROZEN |
-| Titan | ~8M | ✓ (reset at task start) |
-| CMS | ~14M | ✓ (primary adaptation) |
-| Projections/Norms | ~4M | ✓ |
-| **Total** | **~44M** | **~26M (59%)** |
+| Component | Params | Effective LR | Role |
+|-----------|-------:|:------------:|:----:|
+| Attention | ~18M | 2.8e-6 | Slow co-adaptation (soft freeze) |
+| Titan | ~8M | 2.8e-4 | Fast task learning (reset each task) |
+| CMS | ~14M | 1.4e-4 | Primary task adaptation |
+| Projections/Norms | ~4M | 1.4e-4 | Trainable |
+| **Total** | **~44M** | multi-scale | **All trainable, 3-timescale hierarchy** |
 
 ---
 

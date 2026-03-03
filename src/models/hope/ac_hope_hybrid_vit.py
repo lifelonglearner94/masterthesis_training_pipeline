@@ -523,13 +523,22 @@ class ACHOPEHybridViT(nn.Module):
         Unlike reset_all_memories() (which preserves longterm), this resets
         everything — the model starts each task with fresh meta-learned
         initial memory weights.
+
+        IMPORTANT: Uses clear_active_weights() (sets to None) instead of
+        reset_active_weights() (clones parameters) because this method is
+        called BEFORE trainer.fit() moves the model to the accelerator.
+        Plain tensor attributes (_active_w1/_active_w2) are NOT moved by
+        nn.Module.to(), so cloning here would leave them on CPU while
+        parameters move to GPU/MPS.  The next training_step() calls
+        reset_all_memories() → reset_memory_state(), which will properly
+        initialize the active weights on the correct device.
         """
         for blk in self.hybrid_blocks:
-            blk.M_memory.reset_active_weights()
+            blk.M_memory.clear_active_weights()
             blk.M_memory.reset_diagnostics()
             blk.cms.reset_step_counter()
             if blk.use_longterm_memory:
-                blk.M_longterm.reset_active_weights()
+                blk.M_longterm.clear_active_weights()
                 blk.M_longterm.reset_diagnostics()
         log.info(
             "Titan memories fully reset (clip-level + longterm) for new CL task"
