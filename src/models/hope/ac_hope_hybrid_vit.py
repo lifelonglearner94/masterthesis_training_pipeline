@@ -514,22 +514,25 @@ class ACHOPEHybridViT(nn.Module):
         )
 
     def reset_titan_for_new_task(self) -> None:
-        """Reset ALL Titan memories (clip-level AND longterm) for a new CL task.
+        """Reset clip-level Titan memories for a new CL task, preserving longterm.
 
-        Called at task boundaries to give Titan a clean slate for each new
-        distribution shift. This prevents stale memory states from interfering
-        with outer-loop gradient descent during task adaptation.
+        Called at task boundaries to give Titan's clip-level memory a clean
+        slate for each new distribution shift. This prevents stale memory
+        states from interfering with outer-loop gradient descent during task
+        adaptation.
 
-        Unlike reset_all_memories() (which preserves longterm), this resets
-        everything — the model starts each task with fresh meta-learned
-        initial memory weights.
+        M_longterm is PRESERVED (detached only) because it accumulates
+        cross-task knowledge that should persist across the CL sequence.
+        Resetting it would discard useful structural information learned
+        from prior tasks. Detaching prevents stale gradients but keeps
+        the learned weight values intact.
 
-        IMPORTANT: Uses clear_active_weights() (sets to None) instead of
-        reset_active_weights() (clones parameters) because this method is
-        called BEFORE trainer.fit() moves the model to the accelerator.
-        Plain tensor attributes (_active_w1/_active_w2) are NOT moved by
-        nn.Module.to(), so cloning here would leave them on CPU while
-        parameters move to GPU/MPS.  The next training_step() calls
+        IMPORTANT: Uses clear_active_weights() (sets to None) for clip-level
+        memory instead of reset_active_weights() (clones parameters) because
+        this method is called BEFORE trainer.fit() moves the model to the
+        accelerator. Plain tensor attributes (_active_w1/_active_w2) are NOT
+        moved by nn.Module.to(), so cloning here would leave them on CPU
+        while parameters move to GPU/MPS. The next training_step() calls
         reset_all_memories() → reset_memory_state(), which will properly
         initialize the active weights on the correct device.
         """
@@ -538,10 +541,11 @@ class ACHOPEHybridViT(nn.Module):
             blk.M_memory.reset_diagnostics()
             blk.cms.reset_step_counter()
             if blk.use_longterm_memory:
-                blk.M_longterm.clear_active_weights()
+                # Preserve longterm memory weights but detach gradient history
+                blk.M_longterm.detach_active_weights()
                 blk.M_longterm.reset_diagnostics()
         log.info(
-            "Titan memories fully reset (clip-level + longterm) for new CL task"
+            "Titan clip-level memories reset, longterm memories preserved (detached) for new CL task"
         )
 
     def get_aux_loss(self) -> Tensor:

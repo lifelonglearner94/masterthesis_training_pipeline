@@ -278,6 +278,12 @@ def evaluate_all_tasks(
     if is_hope:
         model.model.freeze_all_inner_loops()
 
+    # Ensure evaluation always uses L1 loss (training may use Huber)
+    _eval_original_loss_type = getattr(model, "loss_type", "l1")
+    model.loss_type = "l1"
+    if _eval_original_loss_type != "l1":
+        log.info(f"  [Eval] loss_type forced to 'l1' (was '{_eval_original_loss_type}')")
+
     # Evaluate on each partition
     model.eval()
     for partition in eval_partitions:
@@ -333,6 +339,9 @@ def evaluate_all_tasks(
     # Unfreeze HOPE inner loops after evaluation
     if is_hope:
         model.model.unfreeze_all_inner_loops()
+
+    # Restore original loss_type after evaluation
+    model.loss_type = _eval_original_loss_type
 
     # Compute and log CL metrics (both teacher and jump)
     cl_metrics = tracker.compute_all_metrics(train_exp_id)
@@ -591,8 +600,8 @@ def run_task_training_finetune(
         log.info(f"  Task LR override: {original_lr} → {task_lr}")
 
     # Override per-group LR scales for task fine-tuning if configured
-    # (allows different attention/titan/cms LR ratios for base vs task training)
-    _lr_scale_keys = ("attention_lr_scale", "titan_lr_scale", "cms_lr_scale")
+    # (allows different attention/titan/cms/projections LR ratios for base vs task training)
+    _lr_scale_keys = ("attention_lr_scale", "titan_lr_scale", "cms_lr_scale", "projections_lr_scale")
     _original_lr_scales: dict[str, float | None] = {}
     for key in _lr_scale_keys:
         _original_lr_scales[key] = getattr(model, key, None)
@@ -600,6 +609,28 @@ def run_task_training_finetune(
         if task_val is not None:
             setattr(model, key, task_val)
             log.info(f"  Task {key} override: {_original_lr_scales[key]} → {task_val}")
+
+    # Override LR schedule shape for task fine-tuning if configured
+    _schedule_keys = ("constant_pct", "decay_pct")
+    _original_schedule: dict[str, float | None] = {}
+    for key in _schedule_keys:
+        _original_schedule[key] = getattr(model, key, None)
+        task_val = task_train_cfg.get(key, None)
+        if task_val is not None:
+            setattr(model, key, task_val)
+            log.info(f"  Task {key} override: {_original_schedule[key]} → {task_val}")
+
+    # Override loss_type for training if configured (eval always uses L1)
+    _original_loss_type = getattr(model, "loss_type", None)
+    _original_huber_delta = getattr(model, "huber_delta", None)
+    task_loss_type = task_train_cfg.get("loss_type", None)
+    task_huber_delta = task_train_cfg.get("huber_delta", None)
+    if task_loss_type is not None:
+        model.loss_type = task_loss_type
+        log.info(f"  Task loss_type override: {_original_loss_type} → {task_loss_type}")
+    if task_huber_delta is not None:
+        model.huber_delta = task_huber_delta
+        log.info(f"  Task huber_delta override: {_original_huber_delta} → {task_huber_delta}")
 
     # Override warmup settings for task fine-tuning if configured.
     # Fixes a bug where warmup_start_lr from base training could exceed
@@ -675,6 +706,14 @@ def run_task_training_finetune(
         orig = _original_lr_scales[key]
         if orig is not None and getattr(model, key, None) != orig:
             setattr(model, key, orig)
+    for key in _schedule_keys:
+        orig = _original_schedule[key]
+        if orig is not None and getattr(model, key, None) != orig:
+            setattr(model, key, orig)
+    if _original_loss_type is not None and model.loss_type != _original_loss_type:
+        model.loss_type = _original_loss_type
+    if _original_huber_delta is not None and model.huber_delta != _original_huber_delta:
+        model.huber_delta = _original_huber_delta
     if original_warmup_pct is not None and (task_warmup_pct is not None or model.warmup_pct != original_warmup_pct):
         model.warmup_pct = original_warmup_pct
     if original_warmup_start_lr is not None and model.warmup_start_lr != original_warmup_start_lr:
@@ -981,7 +1020,7 @@ def run_task_training_finetune_with_replay(
         log.info(f"  Task LR override: {original_lr} → {task_lr}")
 
     # Override per-group LR scales
-    _lr_scale_keys = ("attention_lr_scale", "titan_lr_scale", "cms_lr_scale")
+    _lr_scale_keys = ("attention_lr_scale", "titan_lr_scale", "cms_lr_scale", "projections_lr_scale")
     _original_lr_scales: dict[str, float | None] = {}
     for key in _lr_scale_keys:
         _original_lr_scales[key] = getattr(model, key, None)
@@ -989,6 +1028,28 @@ def run_task_training_finetune_with_replay(
         if task_val is not None:
             setattr(model, key, task_val)
             log.info(f"  Task {key} override: {_original_lr_scales[key]} → {task_val}")
+
+    # Override LR schedule shape for task fine-tuning if configured
+    _schedule_keys = ("constant_pct", "decay_pct")
+    _original_schedule: dict[str, float | None] = {}
+    for key in _schedule_keys:
+        _original_schedule[key] = getattr(model, key, None)
+        task_val = task_train_cfg.get(key, None)
+        if task_val is not None:
+            setattr(model, key, task_val)
+            log.info(f"  Task {key} override: {_original_schedule[key]} → {task_val}")
+
+    # Override loss_type for training if configured (eval always uses L1)
+    _original_loss_type = getattr(model, "loss_type", None)
+    _original_huber_delta = getattr(model, "huber_delta", None)
+    task_loss_type = task_train_cfg.get("loss_type", None)
+    task_huber_delta = task_train_cfg.get("huber_delta", None)
+    if task_loss_type is not None:
+        model.loss_type = task_loss_type
+        log.info(f"  Task loss_type override: {_original_loss_type} → {task_loss_type}")
+    if task_huber_delta is not None:
+        model.huber_delta = task_huber_delta
+        log.info(f"  Task huber_delta override: {_original_huber_delta} → {task_huber_delta}")
 
     # Override warmup settings
     original_warmup_pct = getattr(model, "warmup_pct", None)
@@ -1069,6 +1130,14 @@ def run_task_training_finetune_with_replay(
         orig = _original_lr_scales[key]
         if orig is not None and getattr(model, key, None) != orig:
             setattr(model, key, orig)
+    for key in _schedule_keys:
+        orig = _original_schedule[key]
+        if orig is not None and getattr(model, key, None) != orig:
+            setattr(model, key, orig)
+    if _original_loss_type is not None and model.loss_type != _original_loss_type:
+        model.loss_type = _original_loss_type
+    if _original_huber_delta is not None and model.huber_delta != _original_huber_delta:
+        model.huber_delta = _original_huber_delta
     if original_warmup_pct is not None and (
         task_warmup_pct is not None or model.warmup_pct != original_warmup_pct
     ):

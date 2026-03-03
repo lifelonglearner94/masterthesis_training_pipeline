@@ -93,12 +93,12 @@ model:
   titan_grad_clip_inner: 1.0
   titan_grad_clip_backward: 1.0
   titan_detach_interval: 2
-  surprise_threshold: 0.1        # Back to Phase 8 default (was 0.2 in selective_freeze)
+  surprise_threshold: 0.0         # Disabled: all tokens update memory (avoids gating interference)
 
   # Longterm memory for cross-clip CL
   use_longterm_memory: true
   longterm_hidden_multiplier: 2
-  longterm_lr_scale: 0.1          # Back to Phase 8 default (was 0.03)
+  longterm_lr_scale: 0.05          # Conservative: slow longterm accumulation reduces forgetting
 
   # CMS — heterogeneous multi-frequency
   cms_use_chunk_scheduling: true
@@ -126,8 +126,9 @@ model:
 
   # Loss
   loss_weight_teacher: 1.0
-  loss_weight_jump: 1.0
-  loss_type: "l1"
+  loss_weight_jump: 1.5            # Upweight jump loss for better multi-step CL plasticity
+  loss_type: "l1"                  # Base training uses L1 (Huber only during task training)
+  huber_delta: 0.3                 # Used during task training via cl_train.py override
 
   # Curriculum — mild schedule
   curriculum_schedule:
@@ -161,6 +162,9 @@ model:
   constant_pct: 0.80
   decay_pct: 0.10
   warmup_start_lr: 7.5e-5
+
+  # Projections LR scale (base training uses 1.0, task training overrides)
+  projections_lr_scale: 1.0
 
   # TTA defaults
   tta_enabled: false
@@ -228,4 +232,16 @@ cl:
 
     # ─── Phase 9 CL mechanisms (read by cl_train.py) ───
     freeze_attention: false       # Soft freeze: trainable with very low LR (0.02×)
-    reset_titan_memories: true    # Reset all Titan memories at task boundary
+    reset_titan_memories: true    # Reset clip-level Titan memories at task boundary (longterm preserved)
+
+    # LR schedule shape — flat schedule for short task training (no decay waste)
+    constant_pct: 0.95            # Nearly all budget at peak LR
+    decay_pct: 0.0                # No decay phase for 15-epoch task training
+
+    # Projections LR — damped to reduce forgetting in shared layers
+    projections_lr_scale: 0.3     # 1.4e-4 × 0.3 = 4.2e-5 (moderate adaptation)
+
+    # Training loss — Huber for robustness to outlier gradients
+    # (evaluation always uses L1 — enforced by cl_train.py)
+    loss_type: "huber"
+    huber_delta: 0.3              # Tight delta: L1-like for large errors, smooth near zero

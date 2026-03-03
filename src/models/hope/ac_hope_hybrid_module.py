@@ -95,6 +95,7 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         attention_lr_scale: float = 1.0,
         titan_lr_scale: float = 0.1,
         cms_lr_scale: float = 0.6,
+        projections_lr_scale: float = 1.0,
         titan_weight_decay: float | None = None,
         aux_loss_weight: float = 0.0,  # Not needed for hybrid
         # Loss settings
@@ -205,6 +206,7 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         self.attention_lr_scale = attention_lr_scale
         self.titan_lr_scale = titan_lr_scale
         self.cms_lr_scale = cms_lr_scale
+        self.projections_lr_scale = projections_lr_scale
         self.titan_weight_decay = titan_weight_decay
         self.aux_loss_weight = aux_loss_weight
         self.optimizer_type = optimizer_type
@@ -561,7 +563,7 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
                 lr = self.learning_rate * self.cms_lr_scale
                 wd = self.weight_decay
             else:  # projections
-                lr = self.learning_rate
+                lr = self.learning_rate * self.projections_lr_scale
                 wd = self.weight_decay
 
             optimizer_groups.append({"params": params, "lr": lr, "weight_decay": wd})

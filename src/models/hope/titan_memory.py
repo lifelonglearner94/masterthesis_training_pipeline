@@ -270,6 +270,21 @@ class TitanMemory(nn.Module):
         self._active_w1 = None
         self._active_w2 = None
 
+    def detach_active_weights(self) -> None:
+        """Detach active weights from the computation graph, preserving values.
+
+        Used at CL task boundaries for longterm memory: keeps accumulated
+        cross-task knowledge but severs stale gradient history so the new
+        task's optimizer starts with a clean graph.
+
+        If active weights are None (not yet initialized), this is a no-op —
+        the next reset_active_weights() call will initialize them properly.
+        """
+        if self._active_w1 is not None:
+            self._active_w1 = self._active_w1.detach()
+        if self._active_w2 is not None:
+            self._active_w2 = self._active_w2.detach()
+
     # ──────────────────────────────────────────────────────────────────────
     # Forward (functional)
     # ──────────────────────────────────────────────────────────────────────
