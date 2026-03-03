@@ -479,6 +479,62 @@ class ACHOPEHybridViT(nn.Module):
             blk.freeze_inner_loop = False
         log.info("Hybrid inner-loop DGD unfrozen for all blocks (train mode)")
 
+    # ─── CL Phase 9: Attention freeze & Titan reset at task boundaries ───
+
+    def freeze_attention(self) -> None:
+        """Freeze all attention parameters (QKV, proj, norm1) across blocks.
+
+        Used during CL task training to preserve the universal spatial-temporal
+        token mixing learned during base training. The attention layers encode
+        general-purpose RoPE-based positional reasoning that should not drift
+        when adapting to new distribution shifts.
+        """
+        frozen_count = 0
+        for blk in self.hybrid_blocks:
+            for name, param in blk.named_parameters():
+                if any(p in name for p in ("attn.", "norm1.")):
+                    param.requires_grad = False
+                    frozen_count += 1
+        log.info(
+            f"Attention frozen: {frozen_count} parameter tensors set to "
+            f"requires_grad=False across {len(self.hybrid_blocks)} blocks"
+        )
+
+    def unfreeze_attention(self) -> None:
+        """Unfreeze all attention parameters (restore trainability)."""
+        unfrozen_count = 0
+        for blk in self.hybrid_blocks:
+            for name, param in blk.named_parameters():
+                if any(p in name for p in ("attn.", "norm1.")):
+                    param.requires_grad = True
+                    unfrozen_count += 1
+        log.info(
+            f"Attention unfrozen: {unfrozen_count} parameter tensors restored "
+            f"across {len(self.hybrid_blocks)} blocks"
+        )
+
+    def reset_titan_for_new_task(self) -> None:
+        """Reset ALL Titan memories (clip-level AND longterm) for a new CL task.
+
+        Called at task boundaries to give Titan a clean slate for each new
+        distribution shift. This prevents stale memory states from interfering
+        with outer-loop gradient descent during task adaptation.
+
+        Unlike reset_all_memories() (which preserves longterm), this resets
+        everything — the model starts each task with fresh meta-learned
+        initial memory weights.
+        """
+        for blk in self.hybrid_blocks:
+            blk.M_memory.reset_active_weights()
+            blk.M_memory.reset_diagnostics()
+            blk.cms.reset_step_counter()
+            if blk.use_longterm_memory:
+                blk.M_longterm.reset_active_weights()
+                blk.M_longterm.reset_diagnostics()
+        log.info(
+            "Titan memories fully reset (clip-level + longterm) for new CL task"
+        )
+
     def get_aux_loss(self) -> Tensor:
         """Return zero aux loss (hybrid doesn't need M_k/M_v aux loss).
 

@@ -44,6 +44,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.utils.cl_metrics import ContinualLearningMetricsTracker
 from src.utils.device_utils import log_device_info
+from src.utils.replay_buffer import ReplayBuffer
 
 # Fix for PyTorch 2.6+ security update
 torch.serialization.add_safe_globals([
@@ -570,12 +571,35 @@ def run_task_training_finetune(
     # Disable curriculum schedule during task fine-tuning (methodically cleaner)
     model.disable_curriculum = True
 
+    # ─── Phase 9 CL mechanisms: freeze attention + reset Titan ───
+    _attention_was_frozen = False
+    is_hybrid = hasattr(model, "model") and hasattr(model.model, "freeze_attention")
+    if is_hybrid:
+        if task_train_cfg.get("freeze_attention", False):
+            model.model.freeze_attention()
+            _attention_was_frozen = True
+            log.info("  [Phase 9] Attention FROZEN for task training")
+        if task_train_cfg.get("reset_titan_memories", False):
+            model.model.reset_titan_for_new_task()
+            log.info("  [Phase 9] Titan memories RESET for new task")
+
     # Override learning rate for task fine-tuning if configured
     original_lr = getattr(model, "learning_rate", None)
     task_lr = task_train_cfg.get("learning_rate", None)
     if task_lr is not None:
         model.learning_rate = task_lr
         log.info(f"  Task LR override: {original_lr} → {task_lr}")
+
+    # Override per-group LR scales for task fine-tuning if configured
+    # (allows different attention/titan/cms LR ratios for base vs task training)
+    _lr_scale_keys = ("attention_lr_scale", "titan_lr_scale", "cms_lr_scale")
+    _original_lr_scales: dict[str, float | None] = {}
+    for key in _lr_scale_keys:
+        _original_lr_scales[key] = getattr(model, key, None)
+        task_val = task_train_cfg.get(key, None)
+        if task_val is not None:
+            setattr(model, key, task_val)
+            log.info(f"  Task {key} override: {_original_lr_scales[key]} → {task_val}")
 
     # Override warmup settings for task fine-tuning if configured.
     # Fixes a bug where warmup_start_lr from base training could exceed
@@ -647,10 +671,428 @@ def run_task_training_finetune(
     model.disable_curriculum = False
     if task_lr is not None and original_lr is not None:
         model.learning_rate = original_lr
+    for key in _lr_scale_keys:
+        orig = _original_lr_scales[key]
+        if orig is not None and getattr(model, key, None) != orig:
+            setattr(model, key, orig)
     if original_warmup_pct is not None and (task_warmup_pct is not None or model.warmup_pct != original_warmup_pct):
         model.warmup_pct = original_warmup_pct
     if original_warmup_start_lr is not None and model.warmup_start_lr != original_warmup_start_lr:
         model.warmup_start_lr = original_warmup_start_lr
+
+    # ─── Phase 9: Unfreeze attention after task training ───
+    if _attention_was_frozen and is_hybrid:
+        model.model.unfreeze_attention()
+        log.info("  [Phase 9] Attention UNFROZEN after task training")
+
+    # Save checkpoint
+    ckpt_path = f"{output_dir}/checkpoints/task_{task_idx}_{task_cfg.name}.ckpt"
+    save_model_checkpoint(model, ckpt_path)
+
+    finish_wandb(wandb_logger)
+
+    return model, ckpt_path
+
+
+# =============================================================================
+# Replay-Aware Task Training (Phase 10)
+# =============================================================================
+
+
+def _create_replay_buffer(
+    cfg: DictConfig,
+) -> ReplayBuffer:
+    """Create and populate a replay buffer from base training clips.
+
+    Samples clips uniformly from the base training range using reservoir
+    sampling. The buffer can also accumulate clips from completed tasks
+    during the sequential pipeline.
+
+    Args:
+        cfg: Full Hydra config with cl.replay section.
+
+    Returns:
+        Populated ReplayBuffer.
+    """
+    replay_cfg = cfg.cl.replay
+    buffer = ReplayBuffer(
+        max_size=replay_cfg.get("buffer_size", 500),
+        seed=cfg.get("seed", 42),
+        replay_ratio=replay_cfg.get("replay_ratio", 0.3),
+    )
+
+    # Populate from base training clips
+    base_cfg = cfg.cl.base_training
+    eval_clips = cfg.cl.eval.clips_per_task
+    base_train_end = base_cfg.clip_end - eval_clips
+
+    data_cfg = cfg.data
+    buffer.populate_from_datamodule(
+        data_dir=str(cfg.paths.data_dir),
+        clip_start=base_cfg.clip_start,
+        clip_end=base_train_end,
+        task_name="base",
+        num_timesteps=data_cfg.get("num_timesteps", 8),
+        patches_per_frame=data_cfg.get("patches_per_frame", 256),
+        feature_map_name=data_cfg.get("feature_map_name", "vjepa2_vitl16"),
+        clip_prefix=data_cfg.get("clip_prefix", "clip_"),
+        use_extrinsics=data_cfg.get("use_extrinsics", False),
+    )
+
+    log.info(f"  [Replay] Buffer summary: {buffer.get_summary()}")
+    return buffer
+
+
+def _add_task_clips_to_buffer(
+    buffer: ReplayBuffer,
+    cfg: DictConfig,
+    task_cfg: DictConfig,
+    task_name: str,
+) -> None:
+    """Add completed task clips to the replay buffer.
+
+    Called after each task finishes to grow the buffer's diversity.
+    Reservoir sampling ensures uniform coverage across all past data.
+
+    Args:
+        buffer: Existing replay buffer.
+        cfg: Full Hydra config.
+        task_cfg: Task-specific config with clip_start/clip_end.
+        task_name: Name of the completed task.
+    """
+    eval_clips = cfg.cl.eval.clips_per_task
+    train_clip_end = task_cfg.clip_end - eval_clips
+    data_cfg = cfg.data
+
+    buffer.populate_from_datamodule(
+        data_dir=str(cfg.paths.data_dir),
+        clip_start=task_cfg.clip_start,
+        clip_end=train_clip_end,
+        task_name=task_name,
+        num_timesteps=data_cfg.get("num_timesteps", 8),
+        patches_per_frame=data_cfg.get("patches_per_frame", 256),
+        feature_map_name=data_cfg.get("feature_map_name", "vjepa2_vitl16"),
+        clip_prefix=data_cfg.get("clip_prefix", "clip_"),
+        use_extrinsics=data_cfg.get("use_extrinsics", False),
+    )
+
+
+class _ReplayInterleavedDataModule(L.LightningDataModule):
+    """DataModule that interleaves task data with replay buffer samples.
+
+    Each training batch is composed of:
+        - (1 - replay_ratio) × batch_size samples from the current task
+        - replay_ratio × batch_size samples from the replay buffer
+
+    The replay samples are drawn randomly each epoch, preventing overfitting.
+    Validation and test dataloaders pass through to the task DataModule.
+    """
+
+    def __init__(
+        self,
+        task_datamodule: L.LightningDataModule,
+        replay_buffer: ReplayBuffer,
+        batch_size: int = 16,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+    ) -> None:
+        super().__init__()
+        self.task_dm = task_datamodule
+        self.replay_buffer = replay_buffer
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        # Split batch: e.g. batch_size=16, ratio=0.3 → 5 replay + 11 task
+        replay_ratio = replay_buffer.replay_ratio
+        self.replay_batch_size = max(1, int(batch_size * replay_ratio))
+        self.task_batch_size = batch_size - self.replay_batch_size
+
+        log.info(
+            f"  [Replay] Interleaved batch: {self.task_batch_size} task + "
+            f"{self.replay_batch_size} replay = {batch_size} total "
+            f"(ratio={replay_ratio:.1%})"
+        )
+
+    def setup(self, stage: str | None = None) -> None:
+        """Set up underlying task DataModule."""
+        self.task_dm.setup(stage)
+
+    def train_dataloader(self) -> DataLoader:
+        """Create a training DataLoader that interleaves task + replay.
+
+        Returns a _CombinedLoader that merges batches from both sources.
+        """
+        from src.datamodules.precomputed_features import collate_fn
+
+        # Task dataloader with reduced batch size
+        task_dl = DataLoader(
+            self.task_dm.train_dataset,
+            batch_size=self.task_batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            collate_fn=collate_fn,
+        )
+
+        # Replay dataloader
+        replay_dl = self.replay_buffer.get_dataloader(
+            batch_size=self.replay_batch_size,
+            num_workers=0,  # Replay is in-memory, no need for workers
+            pin_memory=self.pin_memory,
+        )
+
+        return _CombinedReplayLoader(task_dl, replay_dl)
+
+    def val_dataloader(self) -> DataLoader | None:
+        """Pass through to task DataModule."""
+        return self.task_dm.val_dataloader()
+
+    def test_dataloader(self) -> DataLoader | None:
+        """Pass through to task DataModule."""
+        return self.task_dm.test_dataloader()
+
+
+class _CombinedReplayLoader:
+    """Iterator that merges batches from task and replay DataLoaders.
+
+    On each __next__(), draws one batch from each source and concatenates
+    them along the batch dimension. If the replay loader is exhausted before
+    the task loader, it restarts (replay buffer is small → cycles quickly).
+
+    This ensures every task training step sees both new data and replayed
+    old data, which is the core mechanism for fighting catastrophic forgetting.
+    """
+
+    def __init__(
+        self, task_loader: DataLoader, replay_loader: DataLoader
+    ) -> None:
+        self.task_loader = task_loader
+        self.replay_loader = replay_loader
+
+    def __iter__(self):
+        self._task_iter = iter(self.task_loader)
+        self._replay_iter = iter(self.replay_loader)
+        return self
+
+    def __next__(self) -> dict[str, torch.Tensor]:
+        # Get task batch
+        try:
+            task_batch = next(self._task_iter)
+        except StopIteration:
+            raise StopIteration
+
+        # Get replay batch (restart if exhausted)
+        try:
+            replay_batch = next(self._replay_iter)
+        except StopIteration:
+            self._replay_iter = iter(self.replay_loader)
+            try:
+                replay_batch = next(self._replay_iter)
+            except StopIteration:
+                # Buffer is empty — return task batch only
+                return task_batch
+
+        # Concatenate along batch dimension
+        merged: dict[str, Any] = {}
+        for key in task_batch:
+            if key == "clip_names":
+                # Handle list-type fields
+                task_names = task_batch.get("clip_names", [])
+                replay_names = replay_batch.get("clip_names", [])
+                merged[key] = task_names + replay_names
+            elif isinstance(task_batch[key], torch.Tensor):
+                merged[key] = torch.cat(
+                    [task_batch[key], replay_batch[key]], dim=0
+                )
+            else:
+                merged[key] = task_batch[key]
+        return merged
+
+    def __len__(self) -> int:
+        """Length is determined by the task loader (replay cycles)."""
+        return len(self.task_loader)
+
+
+def run_task_training_finetune_with_replay(
+    cfg: DictConfig,
+    model: LightningModule,
+    task_idx: int,
+    task_cfg: DictConfig,
+    wandb_group: str,
+    output_dir: str,
+    replay_buffer: ReplayBuffer,
+) -> tuple[LightningModule, str]:
+    """Run task training with experience replay.
+
+    Identical to run_task_training_finetune but each training batch is
+    composed of (1-replay_ratio) task samples + replay_ratio buffer samples.
+    This is the Phase 10 approach: architectural improvements (Phase 9)
+    PLUS data-level forgetting protection via replay.
+
+    Args:
+        cfg: Full Hydra config.
+        model: Model to fine-tune.
+        task_idx: 1-based task index.
+        task_cfg: Task config (name, clip_start, clip_end).
+        wandb_group: W&B group name.
+        output_dir: Output directory.
+        replay_buffer: Populated replay buffer.
+
+    Returns:
+        Tuple of (fine-tuned model, checkpoint path).
+    """
+    task_train_cfg = cfg.cl.task_training
+    replay_cfg = cfg.cl.replay
+
+    log.info("=" * 70)
+    log.info(f"TASK {task_idx}: {task_cfg.name} (finetune + replay)")
+    log.info(f"  Clips: {task_cfg.clip_start} - {task_cfg.clip_end}")
+    log.info(f"  Epochs: {task_train_cfg.max_epochs}")
+    log.info(f"  Replay buffer: {replay_buffer.size} clips, "
+             f"ratio={replay_buffer.replay_ratio:.1%}")
+    log.info("=" * 70)
+
+    # Eval clips reserved at end of range
+    eval_clips = cfg.cl.eval.clips_per_task
+    train_clip_end = task_cfg.clip_end - eval_clips
+
+    # Disable curriculum
+    model.disable_curriculum = True
+
+    # ─── Phase 9 CL mechanisms (also used in Phase 10) ───
+    _attention_was_frozen = False
+    is_hybrid = hasattr(model, "model") and hasattr(model.model, "freeze_attention")
+    if is_hybrid:
+        if task_train_cfg.get("freeze_attention", False):
+            model.model.freeze_attention()
+            _attention_was_frozen = True
+            log.info("  [Phase 9] Attention FROZEN for task training")
+        if task_train_cfg.get("reset_titan_memories", False):
+            model.model.reset_titan_for_new_task()
+            log.info("  [Phase 9] Titan memories RESET for new task")
+
+    # Override learning rate
+    original_lr = getattr(model, "learning_rate", None)
+    task_lr = task_train_cfg.get("learning_rate", None)
+    if task_lr is not None:
+        model.learning_rate = task_lr
+        log.info(f"  Task LR override: {original_lr} → {task_lr}")
+
+    # Override per-group LR scales
+    _lr_scale_keys = ("attention_lr_scale", "titan_lr_scale", "cms_lr_scale")
+    _original_lr_scales: dict[str, float | None] = {}
+    for key in _lr_scale_keys:
+        _original_lr_scales[key] = getattr(model, key, None)
+        task_val = task_train_cfg.get(key, None)
+        if task_val is not None:
+            setattr(model, key, task_val)
+            log.info(f"  Task {key} override: {_original_lr_scales[key]} → {task_val}")
+
+    # Override warmup settings
+    original_warmup_pct = getattr(model, "warmup_pct", None)
+    original_warmup_start_lr = getattr(model, "warmup_start_lr", None)
+    task_warmup_pct = task_train_cfg.get("warmup_pct", None)
+    task_warmup_start_lr = task_train_cfg.get("warmup_start_lr", None)
+    if task_warmup_pct is not None:
+        model.warmup_pct = task_warmup_pct
+    if task_warmup_start_lr is not None:
+        model.warmup_start_lr = task_warmup_start_lr
+    elif task_lr is not None and original_warmup_start_lr is not None:
+        if original_warmup_start_lr > task_lr:
+            model.warmup_start_lr = task_lr * 0.2
+
+    # Create task datamodule
+    val_split = task_train_cfg.get("val_split", 0.0)
+    task_dm = create_datamodule(
+        cfg,
+        clip_start=task_cfg.clip_start,
+        clip_end=train_clip_end,
+        val_split=val_split,
+    )
+
+    # Wrap in replay-interleaved DataModule
+    batch_size = cfg.data.get("batch_size", 16)
+    combined_dm = _ReplayInterleavedDataModule(
+        task_datamodule=task_dm,
+        replay_buffer=replay_buffer,
+        batch_size=batch_size,
+        num_workers=cfg.data.get("num_workers", 4),
+        pin_memory=cfg.data.get("pin_memory", True),
+    )
+
+    # Create W&B logger
+    train_tags = list(cfg.get("tags", [])) + [
+        f"task_{task_idx}", task_cfg.name, "finetune", "replay",
+    ]
+    wandb_logger = create_wandb_logger(
+        cfg,
+        run_name=f"task_{task_idx}_{task_cfg.name}_replay",
+        group=wandb_group,
+        job_type="task_training_replay",
+        tags=train_tags,
+        save_dir=f"{output_dir}/task_{task_idx}",
+    )
+
+    # Log replay buffer state to W&B
+    if wandb_logger.experiment is not None:
+        wandb_logger.experiment.log({
+            f"replay/buffer_size_task_{task_idx}": replay_buffer.size,
+            f"replay/total_seen_task_{task_idx}": replay_buffer._total_seen,
+        })
+
+    no_val = val_split == 0.0
+
+    trainer = create_trainer(
+        cfg,
+        wandb_logger,
+        max_epochs=task_train_cfg.max_epochs,
+        output_dir=f"{output_dir}/task_{task_idx}",
+        enable_checkpointing=False,
+        gradient_clip_val=OmegaConf.select(
+            cfg, "trainer.gradient_clip_val", default=3.0
+        ),
+        precision=OmegaConf.select(cfg, "trainer.precision", default="32"),
+        num_sanity_val_steps=0 if no_val else None,
+        limit_val_batches=0 if no_val else 1.0,
+    )
+
+    # Train with interleaved replay
+    trainer.fit(model=model, datamodule=combined_dm)
+
+    # Restore original settings
+    model.disable_curriculum = False
+    if task_lr is not None and original_lr is not None:
+        model.learning_rate = original_lr
+    for key in _lr_scale_keys:
+        orig = _original_lr_scales[key]
+        if orig is not None and getattr(model, key, None) != orig:
+            setattr(model, key, orig)
+    if original_warmup_pct is not None and (
+        task_warmup_pct is not None or model.warmup_pct != original_warmup_pct
+    ):
+        model.warmup_pct = original_warmup_pct
+    if (
+        original_warmup_start_lr is not None
+        and model.warmup_start_lr != original_warmup_start_lr
+    ):
+        model.warmup_start_lr = original_warmup_start_lr
+
+    # Unfreeze attention
+    if _attention_was_frozen and is_hybrid:
+        model.model.unfreeze_attention()
+        log.info("  [Phase 9] Attention UNFROZEN after task training")
+
+    # ─── Phase 10: Add completed task clips to replay buffer ───
+    if replay_cfg.get("add_task_clips", True):
+        _add_task_clips_to_buffer(
+            replay_buffer, cfg, task_cfg, task_cfg.name,
+        )
+        log.info(
+            f"  [Replay] Buffer after task {task_idx}: "
+            f"{replay_buffer.get_summary()}"
+        )
 
     # Save checkpoint
     ckpt_path = f"{output_dir}/checkpoints/task_{task_idx}_{task_cfg.name}.ckpt"
@@ -850,6 +1292,13 @@ def _run_sequential_pipeline(cfg: DictConfig) -> None:
         is_hope=is_hope,
     )
 
+    # ─── Phase 10: Create replay buffer if configured ───
+    use_replay = cl_cfg.get("replay", None) is not None
+    replay_buffer: ReplayBuffer | None = None
+    if use_replay:
+        log.info("\n--- Initializing Experience Replay Buffer ---")
+        replay_buffer = _create_replay_buffer(cfg)
+
     # PHASES 1-N: SEQUENTIAL TASKS
     for task_idx_0based, task in enumerate(cl_cfg.tasks):
         task_idx = task_idx_0based + 1
@@ -865,14 +1314,25 @@ def _run_sequential_pipeline(cfg: DictConfig) -> None:
                 output_dir=output_dir,
             )
         elif task_training_mode == "finetune":
-            model, ckpt_path = run_task_training_finetune(
-                cfg=cfg,
-                model=model,
-                task_idx=task_idx,
-                task_cfg=task,
-                wandb_group=wandb_group,
-                output_dir=output_dir,
-            )
+            if use_replay and replay_buffer is not None:
+                model, ckpt_path = run_task_training_finetune_with_replay(
+                    cfg=cfg,
+                    model=model,
+                    task_idx=task_idx,
+                    task_cfg=task,
+                    wandb_group=wandb_group,
+                    output_dir=output_dir,
+                    replay_buffer=replay_buffer,
+                )
+            else:
+                model, ckpt_path = run_task_training_finetune(
+                    cfg=cfg,
+                    model=model,
+                    task_idx=task_idx,
+                    task_cfg=task,
+                    wandb_group=wandb_group,
+                    output_dir=output_dir,
+                )
         else:
             raise ValueError(f"Unknown task_training_mode: {task_training_mode}")
 

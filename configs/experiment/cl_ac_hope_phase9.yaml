@@ -1,0 +1,230 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-HOPE-Hybrid-ViT Phase 9
+# =============================================================================
+# FROZEN ATTENTION + TITAN RESET + CMS ADAPTATION
+#
+# Core insight from Phase 8 analysis:
+#   The Hybrid closes only ~10% of the LB→UB gap. Forgetting improved (37%
+#   reduction vs naive), but plasticity DEGRADED (0.3007 → 0.3145).
+#   Titan's inner-loop DGD interferes with outer-loop gradient descent.
+#
+# Phase 9 strategy — three complementary interventions:
+#
+#   1. FREEZE ATTENTION during task training (requires_grad=False)
+#      Attention learned universal spatial-temporal token mixing (3D RoPE)
+#      during base training. Physics shifts (scaling, dissipation, kinematics)
+#      don't change spatial structure — they change feature dynamics captured
+#      by CMS and Titan. Hard freeze prevents ANY drift of the ~18M attention
+#      parameters, providing maximum forgetting protection.
+#
+#   2. RESET TITAN MEMORIES at each task boundary
+#      Stale memory states from previous tasks create interference with
+#      outer-loop gradient descent on new tasks (the plasticity problem).
+#      Resetting to fresh meta-learned initial weights gives each task a
+#      clean Titan slate. The meta-learned initialisation IS the useful
+#      knowledge — it was learned during base training with full gradients.
+#
+#   3. KEEP CMS FULLY ADAPTABLE
+#      CMS multi-frequency MLPs (fast/medium/slow) are the primary mechanism
+#      for learning new feature transforms. They get the highest effective LR
+#      and carry the task-specific adaptation burden.
+#
+# Parameter budget during task training:
+#   Attention: ~18M params — FROZEN (0 trainable)
+#   Titan:     ~8M params  — trainable (reset at task start)
+#   CMS:       ~14M params — trainable (primary adaptation)
+#   Other:     ~4M params  — trainable (projections, norms)
+#   → ~26M trainable / ~44M total (59% trainable)
+#
+# REQUIRES: base checkpoint from Phase 8 hybrid run
+#   cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase9 \
+#     cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt \
+#     paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_hope_hybrid_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase9"
+tags: ["cl", "continual_learning", "ac_hope_hybrid", "phase9",
+       "frozen_attention", "titan_reset", "cms_adaptation"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-Hybrid-ViT Phase 9
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false
+  action_embed_dim: 2
+
+  # ─── Hybrid architecture (unchanged from Phase 8) ───
+  depth: 12
+  num_heads: 16
+
+  # Titan memory
+  titan_hidden_multiplier: 2
+  titan_layers: 2
+  titan_activation: "gelu"
+  titan_grad_clip_inner: 1.0
+  titan_grad_clip_backward: 1.0
+  titan_detach_interval: 2
+  surprise_threshold: 0.1        # Back to Phase 8 default (was 0.2 in selective_freeze)
+
+  # Longterm memory for cross-clip CL
+  use_longterm_memory: true
+  longterm_hidden_multiplier: 2
+  longterm_lr_scale: 0.1          # Back to Phase 8 default (was 0.03)
+
+  # CMS — heterogeneous multi-frequency
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+
+  # Attention settings
+  qkv_bias: true
+  attn_drop_rate: 0.0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+  diagnostics_log_interval: 50
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum — mild schedule
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # Regularization
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # Optimizer — AdamW (base LR for base training)
+  optimizer_type: "adamw"
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # ─── Per-group LR scaling for BASE TRAINING ───
+  attention_lr_scale: 1.0         # Full LR during base training
+  titan_lr_scale: 0.1             # Slow Titan during base
+  cms_lr_scale: 0.6               # Moderate CMS during base
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.0
+
+  # LR schedule — iteration-based
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 7.5e-5
+
+  # TTA defaults
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS
+# =============================================================================
+trainer:
+  max_epochs: 45
+  precision: 32
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_phase9_frozen_attn_${now:%Y%m%d_%H%M%S}"
+  task_training_mode: "finetune"
+  resume_from_base_checkpoint: null    # SET THIS to your base checkpoint path
+
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 45
+    val_split: 0.1
+
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  eval:
+    clips_per_task: 100
+
+  # ─── Phase 9: Task training with frozen attention + Titan reset ───
+  task_training:
+    max_epochs: 15                # Safe with frozen attention (fewer params to tune)
+    val_split: 0.0
+    learning_rate: 1.4e-4         # Higher than Phase 8 selective_freeze (was 7e-5)
+                                  # because attention is fully frozen — no risk of drift
+
+    warmup_pct: 0.05
+    warmup_start_lr: 2.5e-5
+
+    # Attention is HARD FROZEN (requires_grad=False), so LR scale is irrelevant
+    # but we set it to 0.0 for clarity — these params won't be in the optimizer
+    attention_lr_scale: 0.0
+    # Titan gets aggressive LR — it's reset each task so no forgetting concern
+    titan_lr_scale: 2.0           # 1.4e-4 × 2.0 = 2.8e-4
+    # CMS is the primary adaptation mechanism
+    cms_lr_scale: 1.0             # 1.4e-4 × 1.0 = 1.4e-4
+
+    # ─── Phase 9 CL mechanisms (read by cl_train.py) ───
+    freeze_attention: true        # Hard freeze attention (requires_grad=False)
+    reset_titan_memories: true    # Reset all Titan memories at task boundary

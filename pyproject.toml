@@ -27,6 +27,7 @@ dev = [
     "ipykernel",
     "matplotlib",
     "scikit-learn",
+    "vastai"
 ]
 
 [build-system]
