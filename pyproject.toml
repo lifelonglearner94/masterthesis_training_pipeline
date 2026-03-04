@@ -30,12 +30,22 @@ dev = [
     "vastai"
 ]
 # Extra dependencies for standard comparison architectures (Transformer++, RetNet, GatedDeltaNet).
+# This installs cleanly on any platform — pure Triton/Python, no CUDA compilation.
 # Install with: uv sync --extra comparison-architectures
 comparison-architectures = [
-    "einops",
-    "flash-attn>=2.0.0",
-    "causal-conv1d>=1.2.0",
-    "flash-linear-attention",  # fla — required by GatedDeltaNet
+    "einops>=0.8.0",
+    "flash-linear-attention>=0.4.0",  # fla — pure Triton, provides RetNet, GatedDeltaNet, conv1d ops
+]
+# Optional CUDA-compiled extensions for extra inference performance.
+# These require a CUDA toolkit matching your PyTorch CUDA version.
+# Install with: uv sync --extra comparison-architectures-cuda
+# To speed up builds, first run: export TORCH_CUDA_ARCH_LIST="9.0"  (use your GPU's compute cap)
+# If no prebuilt wheels exist for your PyTorch+CUDA combo, they compile from source (~30-60 min).
+comparison-architectures-cuda = [
+    "einops>=0.8.0",
+    "flash-linear-attention>=0.4.0",
+    "flash-attn>=2.8.0",       # FlashAttention-2 — only needed for fast KV-cache inference
+    "causal-conv1d>=1.5.0",    # Fused CUDA conv1d — code has pure-PyTorch fallback
 ]
 
 [build-system]
@@ -44,6 +54,7 @@ build-backend = "hatchling.build"
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]
+causal-conv1d = ["torch"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
