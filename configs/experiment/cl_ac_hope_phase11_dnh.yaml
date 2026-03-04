@@ -1,0 +1,218 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Pipeline — AC-DNH-HOPE-Hybrid-ViT Phase 11
+# =============================================================================
+# ARCHITECTURE: DNH-Hybrid = Attention + DNH Memory Hierarchy + Dynamic CMS
+#
+# Building on Phase 8 (best so far), applies Dynamic Nested Hierarchies
+# (Jafari 2025) to make the memory and CMS components structurally adaptive:
+#
+#   Phase A: ACRoPEAttention — UNCHANGED from Phase 8
+#   Phase B: DynamicNestedHierarchy — 2–5 self-modifying memory (SMM) levels
+#            with meta-networks g_ψ and structural evolution (add/prune/LSS)
+#   Phase C: DynamicCMS — 3–5 frequency levels with add/prune capability
+#
+# Key differences from Phase 8:
+#   • Titan memory wrapped in SMM with meta-network modulation
+#   • Multiple SMM levels per block (2–5) vs single Titan
+#   • StructuralEvolutionController adds/prunes levels + modulates frequencies
+#   • Meta-loss drives evolution decisions
+#   • 5 optimizer groups (attention, dnh_memory, dnh_controller, cms, projections)
+#   • ~60M param budget (vs Phase 8's ~44M)
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase11_dnh paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data: precomputed_features
+  - override /model: ac_dnh_hope_hybrid_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase11"
+tags: ["cl", "continual_learning", "ac_dnh_hope_hybrid", "phase11",
+       "dnh", "smm", "self_modifying", "structural_evolution",
+       "attention", "titan", "dynamic_cms", "rope"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16                  # Slightly smaller than Phase 8 (more params)
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-DNH-HOPE-Hybrid-ViT Phase 11 (depth=12, ~60M params)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false
+  action_embed_dim: 2
+
+  # ─── Architecture ───
+  depth: 12
+  num_heads: 16
+
+  # ─── DNH Memory (Phase B) ───
+  dnh_L_init: 2                   # 2 SMM levels at start (grow via evolution)
+  dnh_L_max: 5                    # Up to 5 levels per block
+  dnh_L_min: 2                    # Never fewer than 2
+
+  titan_hidden_multiplier: 2
+  titan_layers: 2
+  titan_activation: "gelu"
+  titan_grad_clip_inner: 1.0
+  titan_grad_clip_backward: 1.0
+  titan_detach_interval: 2
+  surprise_threshold: 0.1
+  meta_hidden_dim: null           # null → dim (384)
+
+  # ─── DynamicCMS (Phase C) ───
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+  cms_L_max: 5
+  cms_L_min: 2
+
+  # ─── Longterm Memory (CL enabler) ───
+  use_longterm_memory: true
+  longterm_hidden_multiplier: 2
+  longterm_lr_scale: 0.1
+
+  # ─── Structural Evolution ───
+  dnh_tau_add: 0.5
+  dnh_epsilon_prune: 0.01
+  dnh_gamma_freq: 0.1
+  dnh_eta_freq: 0.01
+  dnh_beta_momentum: 0.9
+  dnh_evolution_interval: 50
+  dnh_evolution_warmup: 200
+  dnh_enable_addition: true
+  dnh_enable_pruning: true
+  dnh_enable_freq_modulation: true
+  dnh_meta_lambda: 0.01
+  dnh_meta_mu: 0.001
+
+  # ─── Attention ───
+  qkv_bias: true
+  attn_drop_rate: 0.0
+
+  # ─── Diagnostics ───
+  log_hope_diagnostics: true
+  diagnostics_log_interval: 50
+
+  # ─── Loss ───
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # ─── Curriculum ───
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # ─── Regularization ───
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # ─── Optimizer — AdamW ───
+  optimizer_type: "adamw"
+  learning_rate: 3e-4             # DNH paper: 3×10⁻⁴
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling (5 groups)
+  attention_lr_scale: 1.0         # 3e-4 — match ViT baseline
+  dnh_memory_lr_scale: 0.1        # 3e-5 — slow, inner-loop memories
+  dnh_controller_lr_scale: 0.05   # 1.5e-5 — very slow, frequency/evolution
+  cms_lr_scale: 0.6               # 1.8e-4 — feature transforms
+  projections_lr_scale: 1.0       # 3e-4 — encoder/decoder
+  titan_weight_decay: 0.005
+  dnh_controller_weight_decay: 0.0
+  aux_loss_weight: 0.0
+
+  # LR schedule — iteration-based
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 7.5e-5
+
+  # TTA
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER DEFAULTS
+# =============================================================================
+trainer:
+  max_epochs: 45
+  precision: 32
+  gradient_clip_val: 1.5
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+
+# =============================================================================
+# CONTINUAL LEARNING PIPELINE CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_ac_hope_phase11_dnh_${now:%Y%m%d_%H%M%S}"
+  task_training_mode: "finetune"
+  resume_from_base_checkpoint: null
+
+  base_training:
+    clip_start: 0
+    clip_end: 5000
+    max_epochs: 45
+    val_split: 0.1
+
+  tasks:
+    - name: "scaling_shift"
+      clip_start: 5000
+      clip_end: 6000
+    - name: "dissipation_shift"
+      clip_start: 6000
+      clip_end: 7000
+    - name: "discretization_shift"
+      clip_start: 7000
+      clip_end: 8000
+    - name: "kinematics_shift"
+      clip_start: 8000
+      clip_end: 9000
+    - name: "compositional_ood"
+      clip_start: 9000
+      clip_end: 10000
+
+  eval:
+    clips_per_task: 100
+
+  task_training:
+    max_epochs: 10
+    val_split: 0.0
+    learning_rate: 1.0e-4         # Slightly lower than Phase 8 (more params)
+    warmup_pct: 0.05
+    warmup_start_lr: 2.5e-5
