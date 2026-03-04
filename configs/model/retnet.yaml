@@ -1,0 +1,60 @@
+# @package _global_
+
+# RetNet Model Configuration
+# Action-Conditioned RetNet for CL experiments
+#
+# Architecture: Retentive Network with multi-scale retention + chunkwise recurrence
+#   - Encoder: 1×1 Conv (1024 → embed_dim)
+#   - Stacked RetNetDecoderLayers: MultiScaleRetention + GatedLinearUnit
+#   - Decoder: 1×1 Conv (embed_dim → 1024) with residual connection
+#
+# Reference: Sun et al., "Retentive Network: A Successor to Transformer
+#            for Large Language Models", 2023
+# Pure PyTorch implementation — no extra GPU kernels required.
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.retnet.RetNetLitModule
+
+  # Model architecture
+  input_dim: 1024         # V-JEPA2 feature dimension
+  embed_dim: 768          # Internal embedding dimension
+  value_dim: 1280         # Value projection dimension
+  action_dim: 2           # 2D actions for this dataset
+  spatial_size: 16        # 16×16 spatial grid (256 patches)
+  n_layers: 6             # Number of stacked RetNet decoder layers
+  n_heads: 4              # Retention heads
+  ffn_dim: 1280           # GLU feed-forward dimension
+  recurrent_chunk_size: 64 # Chunk size for chunkwise-recurrent mode
+  chunkwise_recurrent: true
+  num_timesteps: 8        # Encoded timesteps (must match data)
+  dropout: 0.0
+  layernorm_eps: 1.0e-6
+
+  # Loss settings (same as other CL models for fair comparison)
+  T_teacher: 7            # Teacher-forcing prediction steps
+  jump_k: 7               # Number of candidate jump targets
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  normalize_reps: true    # Apply layer norm after predictor steps (V-JEPA2 paper)
+  loss_type: "l1"         # Loss function: "l1", "l2", or "huber"
+  huber_delta: 1.0
+
+  # Curriculum learning schedule (null = disabled)
+  curriculum_schedule: null
+
+  # Optimizer settings (same as other CL models)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+  warmup_epochs: 10
+  max_epochs: 100
+
+  # LR schedule (iteration-based, same as other models)
+  use_iteration_scheduler: false
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5

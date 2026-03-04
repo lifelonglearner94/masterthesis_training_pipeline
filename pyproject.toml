@@ -29,6 +29,14 @@ dev = [
     "scikit-learn",
     "vastai"
 ]
+# Extra dependencies for standard comparison architectures (Transformer++, RetNet, GatedDeltaNet).
+# Install with: uv sync --extra comparison-architectures
+comparison-architectures = [
+    "einops",
+    "flash-attn>=2.0.0",
+    "causal-conv1d>=1.2.0",
+    "flash-linear-attention",  # fla — required by GatedDeltaNet
+]
 
 [build-system]
 requires = ["hatchling"]

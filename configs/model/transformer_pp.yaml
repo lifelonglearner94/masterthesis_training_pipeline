@@ -1,0 +1,58 @@
+# @package _global_
+
+# Transformer++ Model Configuration
+# Action-Conditioned Transformer++ for CL experiments
+#
+# Architecture: Pre-norm Transformer with RoPE + GatedMLP + optional Flash Attention
+#   - Encoder: 1×1 Conv (1024 → d_model)
+#   - Stacked TransformerPPBlocks: RMSNorm → MHA(RoPE,Flash) → RMSNorm → GatedMLP
+#   - Decoder: 1×1 Conv (d_model → 1024) with residual connection
+#
+# Reference: Mamba paper baseline (Transformer++ from Gu & Dao, 2023)
+# Requires: pip install flash-attn causal-conv1d
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.transformer_pp.TransformerPPLitModule
+
+  # Model architecture
+  input_dim: 1024         # V-JEPA2 feature dimension
+  d_model: 768            # Internal working dimension
+  action_dim: 2           # 2D actions for this dataset
+  spatial_size: 16        # 16×16 spatial grid (256 patches)
+  n_layers: 6             # Number of stacked Transformer++ blocks
+  n_heads: 12             # Attention heads
+  d_conv: 4               # Depthwise conv width in MHA
+  rotary_emb_dim: 64      # RoPE embedding dimension
+  mlp_hidden: 2048        # GatedMLP hidden dimension
+  num_timesteps: 8        # Encoded timesteps (must match data)
+  dropout: 0.0
+  layernorm_eps: 1.0e-6
+
+  # Loss settings (same as other CL models for fair comparison)
+  T_teacher: 7            # Teacher-forcing prediction steps
+  jump_k: 7               # Number of candidate jump targets
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  normalize_reps: true    # Apply layer norm after predictor steps (V-JEPA2 paper)
+  loss_type: "l1"         # Loss function: "l1", "l2", or "huber"
+  huber_delta: 1.0
+
+  # Curriculum learning schedule (null = disabled)
+  curriculum_schedule: null
+
+  # Optimizer settings (same as other CL models)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+  warmup_epochs: 10
+  max_epochs: 100
+
+  # LR schedule (iteration-based, same as other models)
+  use_iteration_scheduler: false
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5

@@ -55,23 +55,10 @@ After each phase, a **full evaluation** (no weight updates) runs on fixed valida
 
 ### Running the full CL experiments
 
-# Run all 5 CL experiments sequentially
-```bash
-./run_all_cl_experiments.sh /path/to/clips
-```
-```bash
-# AC-ViT + TTA (tasks via test-time adaptation)
-uv run src/cl_train.py experiment=cl_ac_vit paths.data_dir=/path/to/clips
+## For comparison architectures
 
-# AC-HOPE-ViT (tasks via finetuning, eval with frozen inner-loop)
-uv run src/cl_train.py experiment=cl_ac_hope paths.data_dir=/path/to/clips
-
-# Lower Bound — naive sequential finetuning (no CL mechanisms)
-uv run src/cl_train.py experiment=cl_lower_bound paths.data_dir=/path/to/clips
-
-# Upper Bound — joint training on all data (i.i.d., best-case ceiling)
-uv run src/cl_train.py experiment=cl_upper_bound paths.data_dir=/path/to/clips
-```
+### Install optional deps (on GPU machine):
+uv sync --extra comparison-architectures
 
 Each experiment creates **separate W&B runs per phase**, grouped under a single experiment group for easy comparison.
 
