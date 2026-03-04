@@ -280,12 +280,15 @@ class MACTitanLayer(nn.Module):
         # Persistent memory (scaled-down init to avoid large attention scores)
         self.persistent_memory = nn.Parameter(0.02 * torch.randn(pm_len, hidden_dim))
 
-        # Attention core
+        # Attention core — pre-norm (norm_first=True) is critical for
+        # stability at hidden_dim=768.  Post-norm lets raw activations
+        # enter attention / FFN, which causes explosion after ~1k steps.
         self.att_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=2,
             activation=nn.SiLU(),
             batch_first=True,
+            norm_first=True,
         )
 
         # Query projection for NMM retrieval
@@ -306,6 +309,11 @@ class MACTitanLayer(nn.Module):
         # extract only the input-position tokens and project per-token.
         self.final_layer = nn.Linear(hidden_dim, hidden_dim)
 
+        # Normalisation layers — keep activations bounded across the
+        # MAC layer to prevent the delayed NaN collapse.
+        self.norm_nmm = nn.LayerNorm(hidden_dim)   # NMM retrieved context
+        self.norm_gate = nn.LayerNorm(hidden_dim)   # before output gating
+
         self.silu = nn.SiLU()
         self.sigmoid = nn.Sigmoid()
 
@@ -323,13 +331,16 @@ class MACTitanLayer(nn.Module):
             self.Q(x.reshape(-1, self.hidden_dim)), dim=-1, eps=1e-6
         ))
         nmm_vals = self.nm_module.retrieve(queries).view(B, -1, self.hidden_dim)
+        # Normalise NMM context to keep attention scores bounded.
+        nmm_vals = self.norm_nmm(nmm_vals)
 
         # 2. Prepend persistent memory + NMM tokens
         pm = self.persistent_memory.unsqueeze(0).expand(B, -1, -1)
         x_cat = torch.cat([pm, nmm_vals, x], dim=1)  # [B, pm_len+2*seq_len, hidden_dim]
 
-        # 3. Attention over the full concatenated sequence
-        att_out = self.silu(self.att_layer(x_cat))
+        # 3. Attention (pre-norm TransformerEncoderLayer — no extra SiLU).
+        #    The layer already has internal activations + LayerNorm.
+        att_out = self.att_layer(x_cat)
 
         # 4. Extract only the input-position tokens (last seq_len tokens)
         #    PM and NMM tokens served as context; we discard their outputs.
@@ -342,7 +353,10 @@ class MACTitanLayer(nn.Module):
         # 6. Gate with post-update retrieval (retrieve uses updated _running_params)
         queries_post = normalize(self.Q(x_flat), dim=-1, eps=1e-6)
         y = self.nm_module.retrieve(queries_post)
-        gated = (x_flat * self.sigmoid(y)).view(B, self.seq_len, self.hidden_dim)
+        # Normalise before gating to avoid unbounded activations.
+        gated = (self.norm_gate(x_flat) * self.sigmoid(y)).view(
+            B, self.seq_len, self.hidden_dim
+        )
 
         return gated
 
@@ -419,6 +433,13 @@ class TitansBackbone(nn.Module):
             for _ in range(n_layers)
         ])
 
+        # Pre-norm LayerNorms for each MAC layer (stabilises residual stack)
+        self.mac_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(n_layers)
+        ])
+        # Final norm after all MAC layers
+        self.final_norm = nn.LayerNorm(hidden_dim)
+
         # 1×1 Conv decoder: hidden_dim → input_dim (residual)
         self.decoder = nn.Conv2d(hidden_dim, input_dim, kernel_size=1)
         nn.init.zeros_(self.decoder.weight)
@@ -483,9 +504,10 @@ class TitansBackbone(nn.Module):
             combined = combined.permute(0, 2, 1)  # [B, N, hid+act]
             tokens = self.action_proj(combined)    # [B, N, hidden_dim]
 
-            # Process through MAC layers (residual connections)
-            for mac_layer in self.mac_layers:
-                tokens = tokens + self.silu(mac_layer(tokens))
+            # Process through MAC layers (pre-norm residual connections)
+            for mac_layer, norm in zip(self.mac_layers, self.mac_norms):
+                tokens = tokens + mac_layer(norm(tokens))
+            tokens = self.final_norm(tokens)
 
             # Decode residual: [B, N, hidden_dim] → [B, D, H, W]
             dec_in = tokens.permute(0, 2, 1).reshape(B, self.hidden_dim, H, W)
