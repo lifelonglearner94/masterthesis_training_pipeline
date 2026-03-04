@@ -18,7 +18,7 @@
 #   • StructuralEvolutionController adds/prunes levels + modulates frequencies
 #   • Meta-loss drives evolution decisions
 #   • 5 optimizer groups (attention, dnh_memory, dnh_controller, cms, projections)
-#   • ~60M param budget (vs Phase 8's ~44M)
+#   • ~42M param budget (scaled-down from ~77M; close to Phase 8's ~44M)
 #
 # Usage:
 #   uv run src/cl_train.py experiment=cl_ac_hope_phase11_dnh paths.data_dir=/path/to/clips
@@ -46,12 +46,12 @@ test: False
 # DATA DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 data:
-  batch_size: 16                  # Slightly smaller than Phase 8 (more params)
+  batch_size: 16                  # Can increase with fewer params (~42M vs 77M)
   num_workers: 4
   pin_memory: true
 
 # =============================================================================
-# MODEL: AC-DNH-HOPE-Hybrid-ViT Phase 11 (depth=12, ~60M params)
+# MODEL: AC-DNH-HOPE-Hybrid-ViT Phase 11 (depth=10, ~42M params)
 # =============================================================================
 model:
   T_teacher: 7
@@ -60,7 +60,7 @@ model:
   action_embed_dim: 2
 
   # ─── Architecture ───
-  depth: 12
+  depth: 12                       # 12→10: saves ~17% across all groups
   num_heads: 16
 
   # ─── DNH Memory (Phase B) ───
@@ -68,36 +68,36 @@ model:
   dnh_L_max: 5                    # Up to 5 levels per block
   dnh_L_min: 2                    # Never fewer than 2
 
-  titan_hidden_multiplier: 2
+  titan_hidden_multiplier: 1      # 2→1: halves TitanMemory MLP, DGD dynamics preserved
   titan_layers: 2
   titan_activation: "gelu"
   titan_grad_clip_inner: 1.0
   titan_grad_clip_backward: 1.0
   titan_detach_interval: 2
   surprise_threshold: 0.1
-  meta_hidden_dim: null           # null → dim (384)
+  meta_hidden_dim: 192            # null(=384)→192: bottleneck meta-net, still Tanh-bounded
 
   # ─── DynamicCMS (Phase C) ───
   cms_use_chunk_scheduling: true
   cms_level_specs:
     - name: "fast"
       update_period: 1
-      hidden_multiplier: 2.0
+      hidden_multiplier: 1.5        # 2.0→1.5
       warmup_steps: 0
     - name: "medium"
       update_period: 3
-      hidden_multiplier: 2.5
+      hidden_multiplier: 2.0        # 2.5→2.0
       warmup_steps: 0
     - name: "slow"
       update_period: 7
-      hidden_multiplier: 3.0
+      hidden_multiplier: 2.5        # 3.0→2.5
       warmup_steps: 0
   cms_L_max: 5
   cms_L_min: 2
 
   # ─── Longterm Memory (CL enabler) ───
   use_longterm_memory: true
-  longterm_hidden_multiplier: 2
+  longterm_hidden_multiplier: 1      # 2→1: slimmer longterm memory
   longterm_lr_scale: 0.1
 
   # ─── Structural Evolution ───
