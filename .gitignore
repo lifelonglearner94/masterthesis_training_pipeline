@@ -123,5 +123,5 @@ tmp/
 
 .env
 
-data/clip_00000/
-data/clip_15101/
+
+data/
