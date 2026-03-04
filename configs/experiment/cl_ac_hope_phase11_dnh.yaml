@@ -46,7 +46,7 @@ test: False
 # DATA DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 data:
-  batch_size: 8                  # Can increase with fewer params (~42M vs 77M)
+  batch_size: 8                   # With grad_accum=2 → effective batch 16
   num_workers: 4
   pin_memory: true
 
@@ -56,7 +56,7 @@ data:
 model:
   T_teacher: 7
   jump_k: 3
-  use_activation_checkpointing: false
+  use_activation_checkpointing: true   # Trades ~20% compute for ~40% less activation memory
   action_embed_dim: 2
 
   # ─── Architecture ───
@@ -171,10 +171,10 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 45
-  precision: 32
+  precision: "bf16-mixed"            # fp32→bf16-mixed: ~40% VRAM savings
   gradient_clip_val: 1.5
   gradient_clip_algorithm: norm
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 2          # Effective batch = batch_size × 2
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
