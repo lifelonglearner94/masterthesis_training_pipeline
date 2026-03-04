@@ -402,6 +402,7 @@ class TitansBackbone(nn.Module):
         alpha: float = DEFAULT_ALPHA,
         eta: float = DEFAULT_ETA,
         theta: float = DEFAULT_THETA,
+        num_timesteps: int = DEFAULT_NUM_TIMESTEPS,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -409,6 +410,7 @@ class TitansBackbone(nn.Module):
         self.action_dim = action_dim
         self.spatial_size = spatial_size
         self.pm_len = pm_len
+        self.num_timesteps = num_timesteps
 
         N = spatial_size * spatial_size  # 256 patches
 
@@ -418,6 +420,13 @@ class TitansBackbone(nn.Module):
         # Each timestep produces hidden_dim + action_dim channels after concat
         # We project back to hidden_dim before feeding into MAC layers
         self.action_proj = nn.Linear(hidden_dim + action_dim, hidden_dim)
+
+        # Learned temporal position embedding — tells the model *which*
+        # timestep it is currently predicting.  Crucial for jump prediction
+        # where only frame 0 is given and the model must predict frame τ.
+        # Supports positions 0 … num_timesteps (inclusive) so that
+        # target_timestep values up to T work without out-of-range errors.
+        self.temporal_embed = nn.Embedding(num_timesteps + 1, hidden_dim)
 
         # Stacked MAC layers — seq_len = N (spatial patches per frame)
         self.mac_layers = nn.ModuleList([
@@ -463,6 +472,7 @@ class TitansBackbone(nn.Module):
         actions: Tensor,
         states: Tensor | None = None,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
         """Forward pass — predict next frames given context and actions.
 
@@ -471,6 +481,11 @@ class TitansBackbone(nn.Module):
             actions:  [B, T, action_dim]
             states:   unused (API compat)
             extrinsics: unused (API compat)
+            target_timestep: When set (jump prediction), all frames use
+                temporal position ``target_timestep - 1`` so the output
+                corresponds to the prediction for frame ``target_timestep``.
+                When ``None`` (teacher forcing), frame *t* uses temporal
+                position *t*.
 
         Returns:
             Predicted features [B, T*N, D]
@@ -503,6 +518,21 @@ class TitansBackbone(nn.Module):
             combined = combined.reshape(B, self.hidden_dim + self.action_dim, N)
             combined = combined.permute(0, 2, 1)  # [B, N, hid+act]
             tokens = self.action_proj(combined)    # [B, N, hidden_dim]
+
+            # Add temporal position embedding.
+            # During teacher forcing: position = t (natural loop index).
+            # During jump prediction: position = target_timestep - 1
+            #   (the model's output corresponds to frame target_timestep,
+            #    so we place at position target_timestep - 1, matching how
+            #    AC-ViT uses RoPE for jump conditioning).
+            if target_timestep is not None:
+                time_pos = min(target_timestep - 1, self.num_timesteps)
+            else:
+                time_pos = min(t, self.num_timesteps)
+            time_pos_idx = torch.tensor(
+                [time_pos], dtype=torch.long, device=z.device
+            )
+            tokens = tokens + self.temporal_embed(time_pos_idx)  # broadcast [1, hidden_dim] over [B, N, hidden_dim]
 
             # Process through MAC layers (pre-norm residual connections)
             for mac_layer, norm in zip(self.mac_layers, self.mac_norms):
@@ -597,6 +627,7 @@ class TitansLitModule(ACPredictorLossMixin, L.LightningModule):
             alpha=alpha,
             eta=eta,
             theta=theta,
+            num_timesteps=num_timesteps,
         )
 
         # Loss hyperparameters (required by mixin)
@@ -726,8 +757,9 @@ class TitansLitModule(ACPredictorLossMixin, L.LightningModule):
         actions: Tensor,
         states: Tensor | None = None,
         extrinsics: Tensor | None = None,
+        target_timestep: int | None = None,
     ) -> Tensor:
-        return self.model(features, actions, states, extrinsics)
+        return self.model(features, actions, states, extrinsics, target_timestep=target_timestep)
 
     def _step_predictor(
         self,
@@ -740,10 +772,10 @@ class TitansLitModule(ACPredictorLossMixin, L.LightningModule):
         """Single predictor step with optional layer normalization.
 
         Required by ACPredictorLossMixin.
-        Note: ``target_timestep`` is accepted for interface compatibility
-        but ignored (no RoPE in Titans backbone).
+        Passes ``target_timestep`` through to the backbone so that
+        temporal position embeddings encode which frame to predict.
         """
-        z_pred = self.model(z, actions, states, extrinsics)
+        z_pred = self.model(z, actions, states, extrinsics, target_timestep=target_timestep)
         if self.normalize_reps:
             z_pred = F.layer_norm(z_pred, (z_pred.size(-1),), eps=LAYER_NORM_EPS)
         return z_pred
