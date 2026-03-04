@@ -88,6 +88,12 @@ class NeuralMemory(nn.Module):
     This implements the *test-time training* (TTT) inner loop from the Titans
     paper (Algorithm 1).
 
+    Important: During the forward pass, only the internal ``_running_params``
+    dict is modified — **never** the actual ``nn.Parameter`` tensors.  This
+    avoids corrupting the outer autograd graph during training.  The
+    ``nn.Parameter`` tensors serve as *learned initial weights* and are
+    updated only by the outer optimizer.
+
     Args:
         emb_dim: Embedding / key-value dimension.
         n_layers: Number of hidden layers in the MLP.
@@ -96,6 +102,9 @@ class NeuralMemory(nn.Module):
         eta: Surprise momentum.
         theta: Surprise learning rate.
     """
+
+    # Maximum absolute gradient magnitude in the TTT inner loop.
+    GRAD_CLIP: Final = 1.0
 
     def __init__(
         self,
@@ -131,64 +140,107 @@ class NeuralMemory(nn.Module):
 
         self.silu = nn.SiLU()
         self.surprise: dict[str, Tensor] = {}
+        # Running (TTT-adapted) params — kept separate from nn.Parameters
+        # so that the outer autograd graph is never corrupted.
+        self._running_params: dict[str, Tensor] | None = None
+
+    # ── helpers ─────────────────────────────────────────────────────
+
+    def _init_running_params(self) -> dict[str, Tensor]:
+        """Create detached copies of current parameters for TTT adaptation."""
+        return {
+            name: param.detach().clone()
+            for name, param in self.named_parameters()
+        }
+
+    # ── public API ──────────────────────────────────────────────────
 
     def retrieve(self, x: Tensor) -> Tensor:
-        """Retrieve from the NMM using current parameters (functional call)."""
-        return functional_call(self, dict(self.named_parameters()), x)
+        """Retrieve from the NMM using running (TTT-adapted) parameters."""
+        if self._running_params is None:
+            self._running_params = self._init_running_params()
+        return functional_call(self, self._running_params, x)
 
     def forward(self, x: Tensor) -> Tensor:
         for layer in self.layers:
             x = layer(x)
         return x
 
-    def update(self, x: Tensor) -> tuple[float, dict[str, Tensor]]:
+    def update(self, x: Tensor) -> float:
         """Surprise-gated weight update (inner loop / TTT step).
+
+        Updates ``_running_params`` only — the actual ``nn.Parameter``
+        tensors are **never** modified here.  This is critical: mutating
+        ``.data`` of parameters that participate in the outer computation
+        graph causes stale tensor references ➜ NaN gradients.
 
         Args:
             x: Input tokens used to compute keys/values for the NMM loss.
 
         Returns:
-            (loss_value, updated_params_dict)
+            loss_value (float)
 
         Note:
             Uses ``torch.enable_grad()`` internally so the NMM inner loop
             works even when the outer context is ``torch.no_grad()``
             (e.g. during validation/test).
         """
+        if self._running_params is None:
+            self._running_params = self._init_running_params()
+
         z = x.detach()
+        param_names = list(self._running_params.keys())
 
         with torch.enable_grad():
-            # Ensure temporary copies require grad for autograd
-            keys = normalize(self.silu(self.K(z)))
-            vals = self.silu(self.V(z))
+            # Create fresh leaf tensors for gradient computation.
+            # These are detached from _running_params so that the inner-loop
+            # graph does not interfere with the outer training graph.
+            grad_params: dict[str, Tensor] = {
+                name: self._running_params[name].detach().requires_grad_(True)
+                for name in param_names
+            }
 
-            # Propagate keys through the MLP to get predicted values
-            pred = keys
-            for layer in self.layers:
-                pred = layer(pred)
+            # K / V projections using the leaf tensors
+            keys = normalize(
+                self.silu(F.linear(z, grad_params["K.weight"])),
+                dim=-1, eps=1e-6,
+            )
+            vals = self.silu(F.linear(z, grad_params["V.weight"]))
+
+            # Forward through MLP body using functional_call
+            pred = functional_call(self, grad_params, keys)
 
             # Associative recall loss: ||M(keys) − vals||²
             loss = ((pred - vals) ** 2).mean(dim=0).sum()
 
-            grads = torch.autograd.grad(loss, self.parameters(), create_graph=False)
+            # Compute gradients w.r.t. the leaf tensors
+            grad_list = torch.autograd.grad(
+                loss,
+                [grad_params[name] for name in param_names],
+                create_graph=False,
+            )
 
-        updated_params: dict[str, Tensor] = {}
-        for (name, param), grad in zip(self.named_parameters(), grads):
-            if self.surprise.get(name) is None:
+        # Update _running_params via surprise-gated momentum
+        for name, grad in zip(param_names, grad_list):
+            # Clip gradients for numerical stability
+            grad = grad.clamp(-self.GRAD_CLIP, self.GRAD_CLIP)
+
+            if name not in self.surprise:
                 self.surprise[name] = torch.zeros_like(grad)
             self.surprise[name] = self.surprise[name] * self.eta - self.theta * grad
-            # Don't update K/V projections (only the MLP body)
-            if name[0] in ("K", "V"):
-                updated_params[name] = param.data
-            else:
-                updated_params[name] = self.alpha * param.data + self.surprise[name]
-            param.data = updated_params[name]
 
-        return loss.item(), updated_params
+            # Don't update K/V projections (only the MLP body)
+            if not (name.startswith("K") or name.startswith("V")):
+                self._running_params[name] = (
+                    self.alpha * self._running_params[name] + self.surprise[name]
+                )
+
+        return loss.item()
 
     def reset_surprise(self) -> None:
-        """Reset surprise accumulators (call between sequences)."""
+        """Reset surprise accumulators and running params (call between sequences)."""
         self.surprise = {}
+        self._running_params = None
 
 
 class MACTitanLayer(nn.Module):
@@ -225,8 +277,8 @@ class MACTitanLayer(nn.Module):
         self.pm_len = pm_len
         self.hidden_dim = hidden_dim
 
-        # Persistent memory
-        self.persistent_memory = nn.Parameter(torch.randn(pm_len, hidden_dim))
+        # Persistent memory (scaled-down init to avoid large attention scores)
+        self.persistent_memory = nn.Parameter(0.02 * torch.randn(pm_len, hidden_dim))
 
         # Attention core
         self.att_layer = nn.TransformerEncoderLayer(
@@ -266,8 +318,10 @@ class MACTitanLayer(nn.Module):
         """
         B = x.shape[0]
 
-        # 1. Retrieve from NMM
-        queries = self.silu(normalize(self.Q(x.reshape(-1, self.hidden_dim))))
+        # 1. Retrieve from NMM (uses _running_params, not nn.Parameters)
+        queries = self.silu(normalize(
+            self.Q(x.reshape(-1, self.hidden_dim)), dim=-1, eps=1e-6
+        ))
         nmm_vals = self.nm_module.retrieve(queries).view(B, -1, self.hidden_dim)
 
         # 2. Prepend persistent memory + NMM tokens
@@ -282,11 +336,12 @@ class MACTitanLayer(nn.Module):
         x_out = att_out[:, self.pm_len + self.seq_len :, :]  # [B, seq_len, hidden_dim]
         x_flat = self.final_layer(x_out).reshape(-1, self.hidden_dim)
 
-        # 5. Update NMM
-        _, new_params = self.nm_module.update(x_flat)
+        # 5. Update NMM (modifies _running_params only, not nn.Parameters)
+        self.nm_module.update(x_flat)
 
-        # 6. Gate with post-update retrieval
-        y = functional_call(self.nm_module, new_params, normalize(self.Q(x_flat)))
+        # 6. Gate with post-update retrieval (retrieve uses updated _running_params)
+        queries_post = normalize(self.Q(x_flat), dim=-1, eps=1e-6)
+        y = self.nm_module.retrieve(queries_post)
         gated = (x_flat * self.sigmoid(y)).view(B, self.seq_len, self.hidden_dim)
 
         return gated
