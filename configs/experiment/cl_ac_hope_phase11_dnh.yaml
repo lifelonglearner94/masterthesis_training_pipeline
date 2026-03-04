@@ -60,7 +60,7 @@ model:
   action_embed_dim: 2
 
   # ─── Architecture ───
-  depth: 12                       # 12→10: saves ~17% across all groups
+  depth: 10                       # 12→10: saves ~17% across all groups
   num_heads: 16
 
   # ─── DNH Memory (Phase B) ───
