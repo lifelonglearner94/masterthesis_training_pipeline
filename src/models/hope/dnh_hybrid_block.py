@@ -189,6 +189,31 @@ class DNHHybridBlock(nn.Module):
             [B, N_total, D] output tokens.
         """
         # ─── Phase A: Self-Attention (with 3D RoPE) ───
+        x = self._phase_a(x, mask, attn_mask, T, H, W, action_tokens, target_timestep)
+
+        # ─── Phase B: Dynamic Nested Hierarchy ───
+        # NOT safe for activation checkpointing (DGD mutates memory state)
+        y = self.norm2(x)
+        y = self.dnh(y)
+        x = x + self.drop_path(y)
+
+        # ─── Phase C: Dynamic CMS ───
+        x = self._phase_c(x, T, H, W, action_tokens)
+
+        return x
+
+    def _phase_a(
+        self,
+        x: Tensor,
+        mask: Tensor | None,
+        attn_mask: Tensor | None,
+        T: int | None,
+        H: int | None,
+        W: int | None,
+        action_tokens: int,
+        target_timestep: int | None,
+    ) -> Tensor:
+        """Phase A: Self-Attention with 3D RoPE (pure, checkpoint-safe)."""
         y = self.norm1(x)
         y = self.attn(
             y, mask=mask, attn_mask=attn_mask,
@@ -196,22 +221,23 @@ class DNHHybridBlock(nn.Module):
             action_tokens=action_tokens,
             target_timestep=target_timestep,
         )
-        x = x + self.drop_path(y)
+        return x + self.drop_path(y)
 
-        # ─── Phase B: Dynamic Nested Hierarchy ───
-        y = self.norm2(x)
-        y = self.dnh(y)
-        x = x + self.drop_path(y)
-
-        # ─── Phase C: Dynamic CMS ───
+    def _phase_c(
+        self,
+        x: Tensor,
+        T: int | None,
+        H: int | None,
+        W: int | None,
+        action_tokens: int,
+    ) -> Tensor:
+        """Phase C: Dynamic CMS (pure, checkpoint-safe)."""
         y = self.norm3(x)
         tokens_per_frame = (
             (action_tokens + H * W) if H is not None and W is not None else None
         )
         y = self.dynamic_cms(y, T=T, tokens_per_frame=tokens_per_frame)
-        x = x + self.drop_path(y)
-
-        return x
+        return x + self.drop_path(y)
 
     # ─── CL lifecycle hooks ───
 

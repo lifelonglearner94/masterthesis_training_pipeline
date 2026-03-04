@@ -431,10 +431,24 @@ class ACDNHHOPEHybridViT(nn.Module):
 
         for i, blk in enumerate(self.dnh_blocks):
             if self.use_activation_checkpointing:
+                # Phase A (attention) — pure, checkpoint-safe
                 x = torch.utils.checkpoint.checkpoint(
-                    blk, x, None, attn_mask, T,
+                    blk._phase_a, x, None, attn_mask, T,
                     self.grid_height, self.grid_width,
                     cond_tokens, target_timestep,
+                    use_reentrant=False,
+                )
+
+                # Phase B (DNH memory) — stateful DGD, NOT checkpointable
+                y = blk.norm2(x)
+                y = blk.dnh(y)
+                x = x + blk.drop_path(y)
+
+                # Phase C (CMS) — pure, checkpoint-safe
+                x = torch.utils.checkpoint.checkpoint(
+                    blk._phase_c, x, T,
+                    self.grid_height, self.grid_width,
+                    cond_tokens,
                     use_reentrant=False,
                 )
             else:
