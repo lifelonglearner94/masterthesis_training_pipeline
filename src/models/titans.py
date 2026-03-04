@@ -147,11 +147,17 @@ class NeuralMemory(nn.Module):
     # ── helpers ─────────────────────────────────────────────────────
 
     def _init_running_params(self) -> dict[str, Tensor]:
-        """Create detached copies of current parameters for TTT adaptation."""
-        return {
-            name: param.detach().clone()
-            for name, param in self.named_parameters()
-        }
+        """Create detached copies of current parameters for TTT adaptation.
+
+        Wrapped in ``inference_mode(False)`` so that the cloned tensors are
+        *never* inference tensors — even when called from ``retrieve()``
+        inside Lightning's test/eval ``inference_mode()`` context.
+        """
+        with torch.inference_mode(False):
+            return {
+                name: param.detach().clone()
+                for name, param in self.named_parameters()
+            }
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -181,61 +187,72 @@ class NeuralMemory(nn.Module):
             loss_value (float)
 
         Note:
-            Uses ``torch.enable_grad()`` internally so the NMM inner loop
-            works even when the outer context is ``torch.no_grad()``
-            (e.g. during validation/test).
+            Uses ``torch.inference_mode(False)`` + ``torch.enable_grad()``
+            internally so the NMM inner loop works even when the outer
+            context is ``torch.inference_mode()`` (Lightning's default
+            for test/eval) or ``torch.no_grad()``.
+
+            ``inference_mode`` is stricter than ``no_grad`` — it cannot
+            be overridden by ``enable_grad`` alone, so we must explicitly
+            exit it first.
         """
-        if self._running_params is None:
-            self._running_params = self._init_running_params()
+        # The entire body runs under inference_mode(False) so that:
+        #   1. _running_params are never inference tensors
+        #   2. The momentum update produces normal tensors
+        #   3. torch.enable_grad() can work for the inner-loop gradient
+        with torch.inference_mode(False):
+            if self._running_params is None:
+                self._running_params = self._init_running_params()
 
-        z = x.detach()
-        param_names = list(self._running_params.keys())
+            z = x.detach().clone()  # clone escapes inference tensor status
+            param_names = list(self._running_params.keys())
 
-        with torch.enable_grad():
-            # Create fresh leaf tensors for gradient computation.
-            # These are detached from _running_params so that the inner-loop
-            # graph does not interfere with the outer training graph.
-            grad_params: dict[str, Tensor] = {
-                name: self._running_params[name].detach().requires_grad_(True)
-                for name in param_names
-            }
+            with torch.enable_grad():
+                # Create fresh leaf tensors for gradient computation.
+                # These are detached from _running_params so that the inner-loop
+                # graph does not interfere with the outer training graph.
+                grad_params: dict[str, Tensor] = {
+                    name: self._running_params[name].detach().requires_grad_(True)
+                    for name in param_names
+                }
 
-            # K / V projections using the leaf tensors
-            keys = normalize(
-                self.silu(F.linear(z, grad_params["K.weight"])),
-                dim=-1, eps=1e-6,
-            )
-            vals = self.silu(F.linear(z, grad_params["V.weight"]))
+                # K / V projections using the leaf tensors
+                keys = normalize(
+                    self.silu(F.linear(z, grad_params["K.weight"])),
+                    dim=-1, eps=1e-6,
+                )
+                vals = self.silu(F.linear(z, grad_params["V.weight"]))
 
-            # Forward through MLP body using functional_call
-            pred = functional_call(self, grad_params, keys)
+                # Forward through MLP body using functional_call
+                pred = functional_call(self, grad_params, keys)
 
-            # Associative recall loss: ||M(keys) − vals||²
-            loss = ((pred - vals) ** 2).mean(dim=0).sum()
+                # Associative recall loss: ||M(keys) − vals||²
+                loss = ((pred - vals) ** 2).mean(dim=0).sum()
 
-            # Compute gradients w.r.t. the leaf tensors
-            grad_list = torch.autograd.grad(
-                loss,
-                [grad_params[name] for name in param_names],
-                create_graph=False,
-            )
-
-        # Update _running_params via surprise-gated momentum
-        for name, grad in zip(param_names, grad_list):
-            # Clip gradients for numerical stability
-            grad = grad.clamp(-self.GRAD_CLIP, self.GRAD_CLIP)
-
-            if name not in self.surprise:
-                self.surprise[name] = torch.zeros_like(grad)
-            self.surprise[name] = self.surprise[name] * self.eta - self.theta * grad
-
-            # Don't update K/V projections (only the MLP body)
-            if not (name.startswith("K") or name.startswith("V")):
-                self._running_params[name] = (
-                    self.alpha * self._running_params[name] + self.surprise[name]
+                # Compute gradients w.r.t. the leaf tensors
+                grad_list = torch.autograd.grad(
+                    loss,
+                    [grad_params[name] for name in param_names],
+                    create_graph=False,
                 )
 
-        return loss.item()
+            # Update _running_params via surprise-gated momentum
+            # (still inside inference_mode(False) so results are normal tensors)
+            for name, grad in zip(param_names, grad_list):
+                # Clip gradients for numerical stability
+                grad = grad.clamp(-self.GRAD_CLIP, self.GRAD_CLIP)
+
+                if name not in self.surprise:
+                    self.surprise[name] = torch.zeros_like(grad)
+                self.surprise[name] = self.surprise[name] * self.eta - self.theta * grad
+
+                # Don't update K/V projections (only the MLP body)
+                if not (name.startswith("K") or name.startswith("V")):
+                    self._running_params[name] = (
+                        self.alpha * self._running_params[name] + self.surprise[name]
+                    )
+
+            return loss.item()
 
     def reset_surprise(self) -> None:
         """Reset surprise accumulators and running params (call between sequences)."""
