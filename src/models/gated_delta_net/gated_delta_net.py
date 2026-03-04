@@ -149,9 +149,9 @@ class GatedDeltaNet(nn.Module):
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        q = self.q_conv1d(q, attention_mask, conv_state_q)
-        k = self.k_conv1d(k, attention_mask, conv_state_k)
-        v = self.v_conv1d(v, attention_mask, conv_state_v)
+        q, conv_state_q = self.q_conv1d(q, mask=attention_mask, cache=conv_state_q)
+        k, conv_state_k = self.k_conv1d(k, mask=attention_mask, cache=conv_state_k)
+        v, conv_state_v = self.v_conv1d(v, mask=attention_mask, cache=conv_state_v)
         # dealing with left-padding
         if attention_mask is not None:
             v = v.mul_(attention_mask.unsqueeze(-1))
