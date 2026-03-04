@@ -103,8 +103,14 @@ def create_trainer(
     precision: str | int = "16-mixed",
     num_sanity_val_steps: int | None = None,
     limit_val_batches: int | float = 1.0,
+    accumulate_grad_batches: int = 1,
 ) -> Trainer:
     """Create a Trainer for a single CL phase."""
+    log.info(
+        f"[create_trainer] precision={precision}, "
+        f"accumulate_grad_batches={accumulate_grad_batches}, "
+        f"max_epochs={max_epochs}, gradient_clip_val={gradient_clip_val}"
+    )
     callbacks: list[Callback] = [RichProgressBar()]
 
     if enable_checkpointing:
@@ -127,6 +133,7 @@ def create_trainer(
         deterministic=cfg.get("deterministic", True),
         gradient_clip_val=gradient_clip_val,
         gradient_clip_algorithm="norm",
+        accumulate_grad_batches=accumulate_grad_batches,
         callbacks=callbacks,
         logger=wandb_logger,
         log_every_n_steps=log_every_n_steps,
@@ -272,6 +279,7 @@ def evaluate_all_tasks(
         enable_checkpointing=False,
         log_every_n_steps=1,
         precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
+        accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
     )
 
     # Freeze HOPE inner loops for pure inference
@@ -428,6 +436,7 @@ def run_base_training(
         output_dir=f"{output_dir}/base_training",
         gradient_clip_val=OmegaConf.select(cfg, "trainer.gradient_clip_val", default=1.01),
         precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
+        accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
     )
 
     # ─── HOPE warm-start: disable inner-loop DGD + aux loss for base task ───
@@ -533,6 +542,7 @@ def run_task_training_tta(
         enable_checkpointing=False,
         log_every_n_steps=1,
         precision=OmegaConf.select(cfg, "trainer.precision", default="32"),
+        accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
     )
 
     # Run TTA — this processes clips and accumulates weight updates
@@ -693,6 +703,7 @@ def run_task_training_finetune(
         precision=OmegaConf.select(cfg, "trainer.precision", default="32"),
         num_sanity_val_steps=0 if no_val else None,
         limit_val_batches=0 if no_val else 1.0,
+        accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
     )
 
     # Train on task data
@@ -1117,6 +1128,7 @@ def run_task_training_finetune_with_replay(
         precision=OmegaConf.select(cfg, "trainer.precision", default="32"),
         num_sanity_val_steps=0 if no_val else None,
         limit_val_batches=0 if no_val else 1.0,
+        accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
     )
 
     # Train with interleaved replay
@@ -1242,6 +1254,7 @@ def run_joint_training(
             cfg, "trainer.gradient_clip_val", default=1.01
         ),
         precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
+        accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
     )
 
     # Train on all data
@@ -1565,6 +1578,7 @@ def _run_cross_validation_pipeline(cfg: DictConfig) -> None:
                 cfg, "trainer.gradient_clip_val", default=1.01
             ),
             precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
+            accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
         )
 
         # Train
