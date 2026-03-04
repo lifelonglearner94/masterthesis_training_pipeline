@@ -1,0 +1,58 @@
+# @package _global_
+
+# Titans MAC (Memory as a Context) Model Configuration
+# Action-Conditioned Titans baseline for CL experiments
+#
+# Architecture: MAC-Titan with Neural Memory Module + Persistent Memory
+#   - Encoder: 1×1 Conv (1024 → hidden_dim)
+#   - Stacked MACTitanLayers: Attention + NMM + Persistent Memory
+#   - Decoder: 1×1 Conv (hidden_dim → 1024) with residual connection
+#
+# Reference: Ali et al., "Titans: Learning to Memorize at Test Time", 2024
+
+defaults:
+  - /model/_empty  # Override empty default
+
+model:
+  _target_: src.models.titans.TitansLitModule
+
+  # Model architecture
+  input_dim: 1024         # V-JEPA2 feature dimension
+  hidden_dim: 768         # Internal working dimension (~43M params, param-matched)
+  action_dim: 2           # 2D actions for this dataset
+  spatial_size: 16        # 16×16 spatial grid (256 patches)
+  pm_len: 4               # Number of persistent memory tokens
+  n_layers: 4             # Number of stacked MAC layers
+  n_layers_nmm: 2         # Depth of NMM MLP
+  num_timesteps: 8        # Encoded timesteps (must match data)
+
+  # NMM hyper-parameters (Titans paper defaults)
+  alpha: 0.999            # Weight decay towards initial weights
+  eta: 0.8                # Surprise momentum
+  theta: 0.3              # Surprise learning rate
+
+  # Loss settings (same as other CL models for fair comparison)
+  T_teacher: 7            # Teacher-forcing prediction steps
+  jump_k: 7               # Number of candidate jump targets
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  normalize_reps: true    # Apply layer norm after predictor steps (V-JEPA2 paper)
+  loss_type: "l1"         # Loss function: "l1", "l2", or "huber"
+  huber_delta: 1.0
+
+  # Curriculum learning schedule (null = disabled)
+  curriculum_schedule: null
+
+  # Optimizer settings (same as other CL models)
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+  warmup_epochs: 10
+  max_epochs: 100
+
+  # LR schedule (iteration-based, same as other models)
+  use_iteration_scheduler: false
+  warmup_pct: 0.085
+  constant_pct: 0.83
+  decay_pct: 0.085
+  warmup_start_lr: 7.5e-5
