@@ -111,6 +111,9 @@ uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hy
 # Phase 8 Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid # DONE only seed 42
 
+# Vanilla HOPE on Split CIFAR-100 (~9.26M backbone params)
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hope
+
 # Phase 11 DNH-Hybrid on Split CIFAR-100
 uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh # DONE only seed 42 -> Needs to be reran with new early stopping !
 
@@ -160,6 +163,20 @@ configs/experiment/
 ├── ac_hope_vit_param_matched.yaml  # Single-phase HOPE training
 └── test_ac_predictor_tta.yaml      # TTA evaluation
 ```
+
+## FLOPs / Computational Cost Profiling
+
+Compare per-step FLOPs, wall-clock time, memory, and parameter counts across all architectures:
+
+```bash
+# Full comparison on GPU (recommended)
+uv run python src/flops_profiler.py --device cuda --batch-size 4 --warmup 3 --repeats 10
+
+# Specific models only
+uv run python src/flops_profiler.py --device cuda --models ac_vit,titans,ac_hope,ac_hope_hybrid,ac_dnh_hope_hybrid,gated_delta_net,transformer_pp
+```
+
+Available models: `ac_vit`, `ac_hope`, `ac_hope_hybrid`, `ac_dnh_hope_hybrid`, `titans`, `retnet`, `gated_delta_net`, `transformer_pp`.
 
 ## Configuration
 
