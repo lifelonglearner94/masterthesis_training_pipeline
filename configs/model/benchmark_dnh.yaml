@@ -30,7 +30,7 @@ model:
 
   # -- AC-DNH-HOPE-Hybrid-ViT Backbone (Phase 11) --
   backbone:
-    _target_: src.models.hope.ac_dnh_hope_hybrid_vit.ac_dnh_hope_hybrid_vit
+    _target_: src.models.hope.ACDNHHOPEHybridViT
     img_size: [32, 32]             # 32/4 = 8×8 = 64 patches per frame
     patch_size: 4
     num_timesteps: 1               # Single image = 1 timestep
