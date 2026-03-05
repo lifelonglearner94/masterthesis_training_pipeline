@@ -1,0 +1,83 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Benchmark — Permuted MNIST
+# =============================================================================
+# Domain-incremental CL: 10 tasks, each with a different pixel permutation.
+# Task 0 = original MNIST; tasks 1-9 = unique random permutations.
+# Standard naive fine-tuning to measure forgetting.
+#
+# Usage (pick any architecture):
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_dnh
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_titans
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_ac_vit
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hope
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gated_delta_net
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_retnet
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_transformer_pp
+#
+# Metric: Top-1 accuracy, BWT, FWT, Average Forgetting
+# =============================================================================
+
+defaults:
+  - override /data: permuted_mnist
+  - override /model: benchmark_titans      # Default arch — override via CLI
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_permuted_mnist"
+tags: ["cl", "benchmark", "permuted_mnist"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA  (paper: batch_size=512, reduced for 24 GB GPU)
+# =============================================================================
+data:
+  batch_size: 256
+  num_workers: 4
+  num_tasks: 10
+  val_split: 0.1
+
+# =============================================================================
+# MODEL: Backbone classifier for MNIST (1×28×28 → pad to 32×32, 10 classes)
+# Paper: AdamW, lr=3e-4, up to 100 epochs
+# =============================================================================
+model:
+  in_channels: 1
+  img_size: 32
+  patch_size: 4
+  pad_to: 32               # Pad MNIST 28×28 → 32×32
+  num_classes: 10
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  warmup_epochs: 5
+  max_epochs: 100
+
+# =============================================================================
+# TRAINER
+# =============================================================================
+trainer:
+  max_epochs: 100
+  precision: 32
+
+# =============================================================================
+# CONTINUAL LEARNING CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_permuted_mnist_${now:%Y%m%d_%H%M%S}"
+  pipeline_mode: "sequential"
+
+  # Task structure
+  num_tasks: 10
+
+  # Training settings (paper: "up to 100 epochs")
+  base_epochs: 100         # Epochs for task 0 (original MNIST)
+  task_epochs: 100         # Epochs for permuted tasks
+  task_learning_rate: null  # null = same LR throughout
+  val_split: 0.1

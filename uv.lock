@@ -881,6 +881,10 @@ dependencies = [
 
 [package.optional-dependencies]
 comparison-architectures = [
+    { name = "einops" },
+    { name = "flash-linear-attention" },
+]
+comparison-architectures-cuda = [
     { name = "causal-conv1d" },
     { name = "einops" },
     { name = "flash-attn" },
@@ -898,10 +902,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "causal-conv1d", marker = "extra == 'comparison-architectures'", specifier = ">=1.2.0" },
-    { name = "einops", marker = "extra == 'comparison-architectures'" },
-    { name = "flash-attn", marker = "extra == 'comparison-architectures'", specifier = ">=2.0.0" },
-    { name = "flash-linear-attention", marker = "extra == 'comparison-architectures'" },
+    { name = "causal-conv1d", marker = "extra == 'comparison-architectures-cuda'", specifier = ">=1.5.0" },
+    { name = "einops", marker = "extra == 'comparison-architectures'", specifier = ">=0.8.0" },
+    { name = "einops", marker = "extra == 'comparison-architectures-cuda'", specifier = ">=0.8.0" },
+    { name = "flash-attn", marker = "extra == 'comparison-architectures-cuda'", specifier = ">=2.8.0" },
+    { name = "flash-linear-attention", marker = "extra == 'comparison-architectures'", specifier = ">=0.4.0" },
+    { name = "flash-linear-attention", marker = "extra == 'comparison-architectures-cuda'", specifier = ">=0.4.0" },
     { name = "hydra-colorlog", specifier = ">=1.2.0" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "hydra-optuna-sweeper", specifier = ">=1.2.0" },
@@ -922,7 +928,7 @@ requires-dist = [
     { name = "vastai", marker = "extra == 'dev'" },
     { name = "wandb", specifier = ">=0.16.0" },
 ]
-provides-extras = ["dev", "comparison-architectures"]
+provides-extras = ["dev", "comparison-architectures", "comparison-architectures-cuda"]
 
 [[package]]
 name = "httpcore"

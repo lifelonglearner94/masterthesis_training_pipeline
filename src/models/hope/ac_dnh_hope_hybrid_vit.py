@@ -397,8 +397,10 @@ class ACDNHHOPEHybridViT(nn.Module):
         else:
             return torch.cat([a, s, x], dim=2).flatten(1, 2)
 
-    def _prepare_attention_mask(self, x: Tensor) -> Tensor:
+    def _prepare_attention_mask(self, x: Tensor) -> Tensor | None:
         """Prepare attention mask for current sequence length."""
+        if self.attn_mask is None:
+            return None
         seq_len = x.size(1)
         return self.attn_mask[:seq_len, :seq_len].to(
             device=x.device, non_blocking=True

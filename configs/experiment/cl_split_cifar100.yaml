@@ -1,0 +1,82 @@
+# @package _global_
+# =============================================================================
+# Continual Learning Benchmark — Split CIFAR-100
+# =============================================================================
+# Class-incremental CL: 100 classes split into 10 tasks of 10 classes each.
+# Standard naive fine-tuning (no replay, no regularization) to measure forgetting.
+#
+# Usage (pick any architecture):
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_ac_vit
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hope
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_gated_delta_net
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_retnet
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_transformer_pp
+#
+# Metric: Top-1 accuracy, BWT, FWT, Average Forgetting
+# =============================================================================
+
+defaults:
+  - override /data: split_cifar100
+  - override /model: benchmark_titans      # Default arch — override via CLI
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_split_cifar100"
+tags: ["cl", "benchmark", "split_cifar100"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA  (paper: batch_size=512, reduced for 24 GB GPU)
+# =============================================================================
+data:
+  batch_size: 128
+  num_workers: 4
+  total_classes: 100
+  val_split: 0.1
+
+# =============================================================================
+# MODEL: Backbone classifier for CIFAR-100 (3×32×32, 100 classes)
+# Paper: AdamW, lr=3e-4, up to 100 epochs
+# =============================================================================
+model:
+  in_channels: 3
+  img_size: 32
+  patch_size: 4
+  num_classes: 100
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  warmup_epochs: 5
+  max_epochs: 100
+
+# =============================================================================
+# TRAINER
+# =============================================================================
+trainer:
+  max_epochs: 100
+  precision: 32
+
+# =============================================================================
+# CONTINUAL LEARNING CONFIGURATION
+# =============================================================================
+cl:
+  wandb_group: "cl_split_cifar100_${now:%Y%m%d_%H%M%S}"
+  pipeline_mode: "sequential"
+
+  # Task structure
+  num_tasks: 10
+  classes_per_task: 10
+
+  # Training settings (paper: "up to 100 epochs")
+  base_epochs: 100         # Epochs for the first task
+  task_epochs: 100         # Epochs for subsequent tasks
+  task_learning_rate: null  # null = use same LR; set lower to reduce forgetting
+  val_split: 0.1

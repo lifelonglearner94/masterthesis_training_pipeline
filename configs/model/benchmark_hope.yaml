@@ -1,0 +1,53 @@
+# Benchmark Classification Wrapper — HOPE (AC-HOPE-ViT) Backbone
+# Usage: uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hope
+
+defaults:
+  - /model/_empty
+
+model:
+  _target_: src.models.benchmark_classifier.BackboneClassifierModule
+
+  # -- Patch Embedding & Image --
+  in_channels: 3
+  img_size: 32
+  patch_size: 4
+  embed_dim: 384
+
+  # -- Classification --
+  num_classes: 100
+  action_dim: 1
+
+  # -- Optimizer (paper: AdamW, lr=3e-4) --
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  warmup_epochs: 5
+  max_epochs: 100
+
+  # -- AC-HOPE-ViT Backbone --
+  backbone:
+    _target_: src.models.hope.ac_hope_vit
+    img_size: [32, 32]
+    patch_size: 4
+    num_timesteps: 1
+    embed_dim: 384
+    predictor_embed_dim: 192
+    depth: 6
+    num_heads: 6
+    action_embed_dim: 1
+    use_rope: true
+    is_frame_causal: true
+    use_activation_checkpointing: false
+    use_extrinsics: false
+    # HOPE-specific
+    titan_hidden_multiplier: 4
+    titan_layers: 2
+    titan_activation: gelu
+    titan_grad_clip_inner: 1.0
+    titan_grad_clip_backward: 1.0
+    chunk_size: 0
+    use_spatial_mixing: false
+    use_longterm_memory: false
+    drop_rate: 0.0
+    drop_path_rate: 0.0
+    log_hope_diagnostics: false
