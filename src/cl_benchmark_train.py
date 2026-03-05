@@ -31,6 +31,7 @@ import gc
 import json
 import logging
 import os
+import resource
 import shutil
 import time
 from pathlib import Path
@@ -58,6 +59,19 @@ torch.serialization.add_safe_globals([
 ])
 
 log = logging.getLogger(__name__)
+
+# ── Raise open-file limit ──
+# CL benchmarks create many Trainer+DataLoader instances across tasks ×
+# evaluations. Each DataLoader with num_workers>0 opens shared-memory FDs.
+# Default ulimit (1024) is often too low → "Too many open files".
+_soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+_target = min(65536, _hard)
+if _soft < _target:
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_target, _hard))
+        log.info(f"Raised RLIMIT_NOFILE: {_soft} → {_target} (hard={_hard})")
+    except (ValueError, OSError) as e:
+        log.warning(f"Could not raise RLIMIT_NOFILE from {_soft}: {e}")
 
 
 # =============================================================================
@@ -422,6 +436,14 @@ def evaluate_on_all_tasks(
             dm = create_datamodule_for_task(
                 cfg, task_id=eval_id, val_split=0.0, for_eval=True,
             )
+
+        # ── Prevent FD leak: disable multiprocessing workers for eval ──
+        # Each DataLoader with num_workers>0 spawns persistent OS processes
+        # holding shared-memory FDs.  Over 10 tasks × 10 evals = 100 Trainers
+        # this exhausts the open-file limit. Eval on MNIST/CIFAR is fast
+        # enough in the main process.
+        dm.num_workers = 0
+        dm.persistent_workers = False
 
         eval_trainer = Trainer(
             accelerator="auto",
