@@ -23,7 +23,7 @@
 # =============================================================================
 
 defaults:
-  - override /data: precomputed_features
+  - override /data_settings@data: precomputed_features
   - override /model: ac_predictor
   - override /trainer: default
   - override /callbacks: null  # Disable default callbacks (no checkpointing needed for testing)

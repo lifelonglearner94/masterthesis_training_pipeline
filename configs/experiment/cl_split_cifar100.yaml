@@ -19,7 +19,7 @@
 # =============================================================================
 
 defaults:
-  - override /data: split_cifar100
+  - override /data_settings@data: split_cifar100
   - override /model: benchmark_titans      # Default arch — override via CLI
   - override /trainer: default
   - override /callbacks: default

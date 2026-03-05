@@ -1,0 +1,26 @@
+# Split CIFAR-100 data configuration
+# Class-incremental CL benchmark: 100 classes split into N tasks
+#
+# Default: 10 tasks × 10 classes each.
+# Downloads CIFAR-100 automatically via torchvision.
+
+_target_: src.datamodules.SplitCIFAR100DataModule
+
+# Data paths (will be downloaded here)
+data_dir: ${paths.data_dir}
+
+# Total classes in CIFAR-100
+total_classes: 100
+
+# Whether to remap labels per-task to [0, classes_per_task).
+# False = keep original CIFAR-100 label space (required for class-incremental eval).
+remap_labels: false
+
+# Validation split (fraction of train set)
+val_split: 0.1
+
+# DataLoader settings
+batch_size: 128
+num_workers: 4
+pin_memory: true
+persistent_workers: true

@@ -42,7 +42,7 @@
 # =============================================================================
 
 defaults:
-  - override /data: precomputed_features
+  - override /data_settings@data: precomputed_features
   - override /model: ac_hope_hybrid_vit
   - override /trainer: default
   - override /callbacks: default

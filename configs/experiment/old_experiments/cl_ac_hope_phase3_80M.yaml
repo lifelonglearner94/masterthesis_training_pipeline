@@ -4,7 +4,7 @@
 
 # higher DEPTH
 defaults:
-  - override /data: precomputed_features
+  - override /data_settings@data: precomputed_features
   - override /model: ac_hope_vit
   - override /trainer: default
   - override /callbacks: default

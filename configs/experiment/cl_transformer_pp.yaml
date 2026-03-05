@@ -19,7 +19,7 @@
 # =============================================================================
 
 defaults:
-  - override /data: precomputed_features
+  - override /data_settings@data: precomputed_features
   - override /model: transformer_pp
   - override /trainer: default
   - override /callbacks: default

@@ -2,7 +2,7 @@
 
 defaults:
   - _self_
-  - data: default
+  - data_settings@data: default   # folder=data_settings, mounts under cfg.data
   - model: null          # Keeps src/models agnostic
   - callbacks: default
   - logger: wandb

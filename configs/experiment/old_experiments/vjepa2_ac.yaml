@@ -5,7 +5,7 @@
 # Use as: uv run src/train.py experiment=vjepa2_ac paths.data_dir=/path/to/clips
 #
 # This file consolidates ALL important settings. Edit values here, not in
-# configs/model/ac_predictor.yaml or configs/data/precomputed_features.yaml.
+# configs/model/ac_predictor.yaml or configs/data_settings/precomputed_features.yaml.
 #
 # TEMPORAL DIMENSIONS:
 #   - Original video: 16 frames
@@ -15,7 +15,7 @@
 # =============================================================================
 
 defaults:
-  - override /data: precomputed_features
+  - override /data_settings@data: precomputed_features
   - override /model: ac_predictor
   - override /trainer: default
   - override /callbacks: default

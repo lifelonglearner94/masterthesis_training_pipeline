@@ -1,0 +1,26 @@
+# Permuted MNIST data configuration
+# Domain-incremental CL benchmark: each task applies a different pixel permutation
+#
+# Default: 10 tasks (task 0 = original MNIST, tasks 1-9 = permuted).
+# Downloads MNIST automatically via torchvision.
+
+_target_: src.datamodules.PermutedMNISTDataModule
+
+# Data paths (will be downloaded here)
+data_dir: ${paths.data_dir}
+
+# Task settings (overridden per task by cl_benchmark_train.py)
+task_id: 0
+num_tasks: 10
+
+# Reproducibility
+seed: 42
+
+# Validation split (fraction of train set)
+val_split: 0.1
+
+# DataLoader settings
+batch_size: 256
+num_workers: 4
+pin_memory: true
+persistent_workers: true

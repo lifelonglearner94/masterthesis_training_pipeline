@@ -4,7 +4,7 @@
 
 
 defaults:
-  - override /data: default
+  - override /data_settings@data: default
   - override /trainer: default
   - override /callbacks: default
   - override /logger: wandb

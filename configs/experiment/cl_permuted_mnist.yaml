@@ -20,7 +20,7 @@
 # =============================================================================
 
 defaults:
-  - override /data: permuted_mnist
+  - override /data_settings@data: permuted_mnist
   - override /model: benchmark_titans      # Default arch — override via CLI
   - override /trainer: default
   - override /callbacks: default
