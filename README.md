@@ -106,13 +106,13 @@ uv run src/eval.py experiment=test_ac_predictor_tta_extended \
 ## Benchmarks
 ```bash
 # Phase 8 Hybrid on Split CIFAR-100
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid # DONE only seed 42
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid # DONE only seed 42 -> Needs to be reran with new early stopping !
 
 # Phase 8 Hybrid on Permuted MNIST
-uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid # DONE only seed 42
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid # STARTED only seed 42 - MAYBE WE STOP IT
 
 # Phase 11 DNH-Hybrid on Split CIFAR-100
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh # DONE only seed 42
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh # DONE only seed 42 -> Needs to be reran with new early stopping !
 
 # Phase 11 DNH-Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_dnh
@@ -126,13 +126,13 @@ Comparison baselines from the DNH paper (Anbar Jafari et al., 2025 Table 2), par
 uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_gdn  # STARTED only seed 42
 
 # GatedDeltaNet on Permuted MNIST
-uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gdn  # STARTED (QUEUED) only seed 42
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gdn # (QUEUED) only seed 42
 
 # Titans (MAC/LMM) on Split CIFAR-100 (~9.39M backbone params)
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans # STARTED (QUEUED) only seed 42
 
 # Titans (MAC/LMM) on Permuted MNIST
-uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_titans
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_titans # (QUEUED) only seed 42
 ```
 
 ## Project Structure

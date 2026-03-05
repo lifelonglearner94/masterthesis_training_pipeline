@@ -233,6 +233,10 @@ def create_trainer(
             f"patience={es_cfg.get('patience', 10)}, min_delta={es_cfg.get('min_delta', 0.001)}"
         )
 
+    accumulate_grad_batches = OmegaConf.select(
+        cfg, "trainer.accumulate_grad_batches", default=1,
+    )
+
     return Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
@@ -240,6 +244,7 @@ def create_trainer(
         precision=precision,
         deterministic=cfg.get("deterministic", True),
         gradient_clip_val=gradient_clip_val,
+        accumulate_grad_batches=accumulate_grad_batches,
         callbacks=callbacks,
         logger=wandb_logger,
         log_every_n_steps=log_every_n_steps,
