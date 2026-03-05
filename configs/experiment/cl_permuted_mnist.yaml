@@ -36,10 +36,10 @@ train: True
 test: False
 
 # =============================================================================
-# DATA  (paper: batch_size=512, reduced for 24 GB GPU)
+# DATA  (paper: AdamW, batch_size=512 — Anbar Jafari et al. 2025, Section 5.1)
 # =============================================================================
 data:
-  batch_size: 256
+  batch_size: 512
   num_workers: 4
   num_tasks: 10
   val_split: 0.1
@@ -73,10 +73,13 @@ cl:
   wandb_group: "cl_permuted_mnist_${now:%Y%m%d_%H%M%S}"
   pipeline_mode: "sequential"
 
+  # Multi-seed averaging (paper: "averaged over three independent runs")
+  seeds: [42, 123, 7]
+
   # Task structure
   num_tasks: 10
 
-  # Training settings (paper: "up to 100 epochs")
+  # Training settings (paper: "up to 100 epochs", AdamW lr=3e-4)
   base_epochs: 100         # Epochs for task 0 (original MNIST)
   task_epochs: 100         # Epochs for permuted tasks
   task_learning_rate: null  # null = same LR throughout

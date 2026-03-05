@@ -35,10 +35,10 @@ train: True
 test: False
 
 # =============================================================================
-# DATA  (paper: batch_size=512, reduced for 24 GB GPU)
+# DATA  (paper: AdamW, batch_size=512 — Anbar Jafari et al. 2025, Section 5.1)
 # =============================================================================
 data:
-  batch_size: 128
+  batch_size: 512
   num_workers: 4
   total_classes: 100
   val_split: 0.1
@@ -71,11 +71,14 @@ cl:
   wandb_group: "cl_split_cifar100_${now:%Y%m%d_%H%M%S}"
   pipeline_mode: "sequential"
 
+  # Multi-seed averaging (paper: "averaged over three independent runs")
+  seeds: [42, 123, 7]
+
   # Task structure
   num_tasks: 10
   classes_per_task: 10
 
-  # Training settings (paper: "up to 100 epochs")
+  # Training settings (paper: "up to 100 epochs", AdamW lr=3e-4)
   base_epochs: 100         # Epochs for the first task
   task_epochs: 100         # Epochs for subsequent tasks
   task_learning_rate: null  # null = use same LR; set lower to reduce forgetting

@@ -176,7 +176,7 @@ def create_trainer(
     max_epochs: int,
     output_dir: str,
     enable_checkpointing: bool = True,
-    log_every_n_steps: int = 50,
+    log_every_n_steps: int = 10,
     gradient_clip_val: float | None = None,
     precision: str | int = "32",
     num_sanity_val_steps: int | None = None,
@@ -187,8 +187,8 @@ def create_trainer(
         callbacks.append(
             ModelCheckpoint(
                 dirpath=f"{output_dir}/checkpoints",
-                filename="checkpoint_e{epoch:04d}",
-                save_last=True,
+                filename="best",
+                save_last=False,
                 monitor="val/acc",
                 mode="max",
                 save_top_k=1,
@@ -229,7 +229,16 @@ def save_model_checkpoint(model: LightningModule, path: str) -> None:
 def load_checkpoint_weights(model: LightningModule, ckpt_path: str) -> None:
     log.info(f"Loading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(checkpoint["state_dict"])
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    model.load_state_dict(state_dict)
+
+
+def _get_best_checkpoint_path(trainer: Trainer) -> str | None:
+    """Extract the best checkpoint path from a finished Trainer's ModelCheckpoint."""
+    for cb in trainer.callbacks:
+        if isinstance(cb, ModelCheckpoint) and cb.best_model_path:
+            return cb.best_model_path
+    return None
 
 
 # =============================================================================
@@ -444,6 +453,9 @@ def run_task(
         save_dir=f"{output_dir}/task_{task_id}",
     )
 
+    # Sync scheduler max_epochs with per-task epoch budget
+    model.max_epochs = max_epochs
+
     no_val = val_split == 0.0
     trainer = create_trainer(
         cfg,
@@ -458,7 +470,18 @@ def run_task(
 
     trainer.fit(model=model, datamodule=dm)
 
-    # Save checkpoint
+    # ── Best-epoch model selection ──
+    # Reload the checkpoint with the highest val/acc (not last epoch).
+    # This aligns with standard CL benchmark protocol: evaluate the
+    # best-performing model from each task's training phase.
+    best_ckpt = _get_best_checkpoint_path(trainer)
+    if best_ckpt and os.path.isfile(best_ckpt):
+        log.info(f"Loading best checkpoint for eval: {best_ckpt}")
+        load_checkpoint_weights(model, best_ckpt)
+    else:
+        log.warning("No best checkpoint found — evaluating last-epoch model.")
+
+    # Save final task checkpoint (best-epoch weights)
     ckpt_path = f"{output_dir}/checkpoints/task_{task_id}_{task_name}.ckpt"
     save_model_checkpoint(model, ckpt_path)
 
@@ -482,20 +505,32 @@ def run_task(
 # =============================================================================
 
 
-def _run_sequential_benchmark(cfg: DictConfig) -> None:
-    """Sequential CL benchmark: Task 0 → Task 1 → ... → Task N-1."""
+def _run_single_seed(
+    cfg: DictConfig,
+    seed: int,
+    run_idx: int,
+    num_runs: int,
+) -> dict[str, Any]:
+    """Run a complete CL benchmark for one seed.  Returns metrics + R-matrix."""
+    L.seed_everything(seed, workers=True)
+
     cl_cfg = cfg.cl
-    output_dir = str(cfg.paths.output_dir)
+    base_output_dir = str(cfg.paths.output_dir)
+    output_dir = f"{base_output_dir}/seed_{seed}" if num_runs > 1 else base_output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
     wandb_group = cl_cfg.get(
         "wandb_group",
         f"cl_benchmark_{cfg.get('task_name', 'unknown')}_{time.strftime('%Y%m%d_%H%M%S')}",
     )
+    if num_runs > 1:
+        wandb_group = f"{wandb_group}_s{seed}"
 
     task_schedule = build_task_schedule(cfg)
     num_tasks = len(task_schedule)
 
     log.info("=" * 70)
-    log.info("CONTINUAL LEARNING BENCHMARK (Sequential)")
+    log.info(f"CONTINUAL LEARNING BENCHMARK (seed={seed}, run {run_idx+1}/{num_runs})")
     log.info(f"  Task name: {cfg.get('task_name', 'unknown')}")
     log.info(f"  Number of tasks: {num_tasks}")
     log.info(f"  W&B group: {wandb_group}")
@@ -504,7 +539,7 @@ def _run_sequential_benchmark(cfg: DictConfig) -> None:
 
     tracker = BenchmarkCLMetricsTracker(num_tasks=num_tasks)
 
-    # Instantiate model
+    # Instantiate model (fresh for each seed)
     model: LightningModule = hydra.utils.instantiate(cfg.model)
 
     # Base training settings
@@ -530,10 +565,10 @@ def _run_sequential_benchmark(cfg: DictConfig) -> None:
             learning_rate_override=lr_override,
         )
 
-    # ─── Final Summary ───
+    # ─── Per-seed Summary ───
     cl_metrics = tracker.compute_all()
     log.info("\n" + "=" * 70)
-    log.info("FINAL CL METRICS")
+    log.info(f"CL METRICS (seed={seed})")
     log.info("=" * 70)
     for k, v in cl_metrics.items():
         log.info(f"  {k}: {v:.4f}")
@@ -541,10 +576,10 @@ def _run_sequential_benchmark(cfg: DictConfig) -> None:
     # Log summary to W&B
     summary_logger = create_wandb_logger(
         cfg,
-        run_name="summary",
+        run_name=f"summary_s{seed}",
         group=wandb_group,
         job_type="summary",
-        tags=list(cfg.get("tags", [])) + ["summary"],
+        tags=list(cfg.get("tags", [])) + ["summary", f"seed_{seed}"],
         save_dir=f"{output_dir}/summary",
     )
     if summary_logger.experiment is not None:
@@ -552,11 +587,12 @@ def _run_sequential_benchmark(cfg: DictConfig) -> None:
         summary_logger.experiment.log({"cl/R_matrix": tracker.R.tolist()})
     finish_wandb(summary_logger)
 
-    # Save results JSON
+    # Save per-seed results JSON
     results_path = f"{output_dir}/cl_results.json"
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
     with open(results_path, "w") as f:
         json.dump({
+            "seed": seed,
             "R_matrix": tracker.R.tolist(),
             "metrics": cl_metrics,
             "task_schedule": [
@@ -565,6 +601,80 @@ def _run_sequential_benchmark(cfg: DictConfig) -> None:
             ],
         }, f, indent=2, default=str)
     log.info(f"Results saved to: {results_path}")
+
+    return {"seed": seed, "metrics": cl_metrics, "R_matrix": tracker.R}
+
+
+def _run_sequential_benchmark(cfg: DictConfig) -> None:
+    """Sequential CL benchmark with multi-seed averaging.
+
+    Paper protocol (Anbar Jafari et al., 2025): "All results are averaged
+    over three independent runs, with standard deviations reported."
+
+    Seeds are specified via ``cl.seeds`` (list) or fall back to the single
+    ``seed`` field for backward compatibility.
+    """
+    cl_cfg = cfg.cl
+    seeds: list[int] = list(cl_cfg.get("seeds", [cfg.get("seed", 42)]))
+    num_runs = len(seeds)
+
+    log.info(f"Running {num_runs} seed(s): {seeds}")
+
+    all_results: list[dict[str, Any]] = []
+    for i, seed in enumerate(seeds):
+        result = _run_single_seed(cfg, seed=seed, run_idx=i, num_runs=num_runs)
+        all_results.append(result)
+
+    # ─── Aggregate across seeds ───
+    metric_keys = list(all_results[0]["metrics"].keys())
+    agg: dict[str, dict[str, float]] = {}
+    for key in metric_keys:
+        vals = [r["metrics"][key] for r in all_results if not np.isnan(r["metrics"][key])]
+        agg[key] = {
+            "mean": float(np.mean(vals)) if vals else float("nan"),
+            "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+        }
+
+    log.info("\n" + "=" * 70)
+    log.info(f"FINAL CL METRICS (averaged over {num_runs} seeds)")
+    log.info("=" * 70)
+    for key, stats in agg.items():
+        log.info(f"  {key}: {stats['mean']:.4f} ± {stats['std']:.4f}")
+
+    # Save aggregated results
+    output_dir = str(cfg.paths.output_dir)
+    agg_path = f"{output_dir}/cl_results_aggregated.json"
+    os.makedirs(os.path.dirname(agg_path), exist_ok=True)
+    with open(agg_path, "w") as f:
+        json.dump({
+            "seeds": seeds,
+            "num_runs": num_runs,
+            "aggregated_metrics": {k: v for k, v in agg.items()},
+            "per_seed": [
+                {"seed": r["seed"], "metrics": r["metrics"], "R_matrix": r["R_matrix"].tolist()}
+                for r in all_results
+            ],
+        }, f, indent=2, default=str)
+    log.info(f"Aggregated results saved to: {agg_path}")
+
+    # Log aggregate to W&B
+    wandb_group = cl_cfg.get(
+        "wandb_group",
+        f"cl_benchmark_{cfg.get('task_name', 'unknown')}_{time.strftime('%Y%m%d_%H%M%S')}",
+    )
+    agg_logger = create_wandb_logger(
+        cfg,
+        run_name="aggregate",
+        group=wandb_group,
+        job_type="aggregate",
+        tags=list(cfg.get("tags", [])) + ["aggregate"],
+        save_dir=f"{output_dir}/aggregate",
+    )
+    if agg_logger.experiment is not None:
+        flat_metrics = {f"{k}/mean": v["mean"] for k, v in agg.items()}
+        flat_metrics.update({f"{k}/std": v["std"] for k, v in agg.items()})
+        agg_logger.experiment.log(flat_metrics)
+    finish_wandb(agg_logger)
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config.yaml")

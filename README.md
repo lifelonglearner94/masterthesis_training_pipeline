@@ -111,10 +111,10 @@ uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hy
 # Phase 8 Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid
 
-# Phase 11 DNH on Split CIFAR-100
+# Phase 11 DNH-Hybrid on Split CIFAR-100
 uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh
 
-# Phase 11 DNH on Permuted MNIST
+# Phase 11 DNH-Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_dnh
 
 ## Project Structure
