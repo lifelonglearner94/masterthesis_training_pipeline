@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import copy
+import gc
 import json
 import logging
 import os
@@ -454,6 +455,13 @@ def evaluate_on_all_tasks(
 
         log.info(f"  Eval task {eval_id} ({eval_task['name']}): acc={acc:.4f}")
 
+        # ── Teardown: release DataLoader workers & shared memory ──
+        # Without this, each eval Trainer leaks multiprocessing workers
+        # and /dev/shm file descriptors, hitting ulimit after ~90 evals.
+        dm.teardown(stage="test")
+        del eval_trainer, dm
+        gc.collect()
+
 
 # =============================================================================
 # Phase Runners
@@ -535,6 +543,11 @@ def run_task(
     )
 
     trainer.fit(model=model, datamodule=dm)
+
+    # ── Teardown training DataLoader workers to free file descriptors ──
+    dm.teardown(stage="fit")
+    del dm
+    gc.collect()
 
     # Log actual epochs trained (may be less than max_epochs due to early stopping)
     actual_epochs = trainer.current_epoch
