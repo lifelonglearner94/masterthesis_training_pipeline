@@ -31,6 +31,7 @@ import gc
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -589,6 +590,34 @@ def run_task(
 # =============================================================================
 
 
+def _find_resume_checkpoints(resume_dir: str, task_schedule: list[dict[str, Any]]) -> dict[int, str]:
+    """Scan a previous run's output directory for per-task checkpoints.
+
+    Returns:
+        Dict mapping task_id → checkpoint path for all tasks that have
+        a saved checkpoint.
+    """
+    ckpt_dir = os.path.join(resume_dir, "checkpoints")
+    found: dict[int, str] = {}
+
+    if not os.path.isdir(ckpt_dir):
+        log.warning(f"Resume checkpoint dir not found: {ckpt_dir}")
+        return found
+
+    for task in task_schedule:
+        tid = task["task_id"]
+        name = task["name"]
+        ckpt_path = os.path.join(ckpt_dir, f"task_{tid}_{name}.ckpt")
+        if os.path.isfile(ckpt_path):
+            found[tid] = ckpt_path
+
+    log.info(f"Resume: found {len(found)}/{len(task_schedule)} task checkpoints in {ckpt_dir}")
+    for tid, path in sorted(found.items()):
+        log.info(f"  task {tid}: {path}")
+
+    return found
+
+
 def _run_single_seed(
     cfg: DictConfig,
     seed: int,
@@ -613,12 +642,27 @@ def _run_single_seed(
     task_schedule = build_task_schedule(cfg)
     num_tasks = len(task_schedule)
 
+    # ── Resume support ──
+    # Set cl.resume_dir to the output directory of a crashed run to skip
+    # already-completed tasks and reload their checkpoints.
+    # For multi-seed runs the resume_dir should point to the seed sub-folder,
+    # e.g. outputs/2026-03-05/09-02-48/seed_42
+    resume_dir: str | None = cl_cfg.get("resume_dir", None)
+    resume_ckpts: dict[int, str] = {}
+    if resume_dir:
+        resume_ckpts = _find_resume_checkpoints(resume_dir, task_schedule)
+        if not resume_ckpts:
+            log.warning("resume_dir was set but no checkpoints were found — starting from scratch.")
+
     log.info("=" * 70)
     log.info(f"CONTINUAL LEARNING BENCHMARK (seed={seed}, run {run_idx+1}/{num_runs})")
     log.info(f"  Task name: {cfg.get('task_name', 'unknown')}")
     log.info(f"  Number of tasks: {num_tasks}")
     log.info(f"  W&B group: {wandb_group}")
     log.info(f"  Output dir: {output_dir}")
+    if resume_dir:
+        log.info(f"  RESUMING from: {resume_dir}")
+        log.info(f"  Completed tasks with checkpoints: {sorted(resume_ckpts.keys())}")
     log.info("=" * 70)
 
     tracker = BenchmarkCLMetricsTracker(num_tasks=num_tasks)
@@ -633,8 +677,47 @@ def _run_single_seed(
     val_split = cl_cfg.get("val_split", 0.1)
 
     for task in task_schedule:
-        epochs = base_epochs if task["task_id"] == 0 else task_epochs
-        lr_override = task_lr if task["task_id"] > 0 else None
+        task_id = task["task_id"]
+        epochs = base_epochs if task_id == 0 else task_epochs
+        lr_override = task_lr if task_id > 0 else None
+
+        # ── Resume: skip training for tasks that already have a checkpoint ──
+        if task_id in resume_ckpts:
+            log.info("=" * 70)
+            log.info(f"RESUME: Skipping training for task {task_id} ({task['name']})")
+            log.info(f"  Loading checkpoint: {resume_ckpts[task_id]}")
+            log.info("=" * 70)
+            load_checkpoint_weights(model, resume_ckpts[task_id])
+
+            # Copy checkpoint to new output dir so the run is self-contained
+            new_ckpt = f"{output_dir}/checkpoints/task_{task_id}_{task['name']}.ckpt"
+            os.makedirs(os.path.dirname(new_ckpt), exist_ok=True)
+            if not os.path.isfile(new_ckpt):
+                shutil.copy2(resume_ckpts[task_id], new_ckpt)
+                log.info(f"  Copied checkpoint → {new_ckpt}")
+
+            # Still need to run eval to populate R-matrix
+            model_tag = _get_model_tag(cfg)
+            tags = list(cfg.get("tags", [])) + [f"task_{task_id}", task["name"], model_tag, "resumed"]
+            eval_logger = create_wandb_logger(
+                cfg,
+                run_name=f"task_{task_id}_{task['name']}_resumed",
+                group=wandb_group,
+                job_type="resumed_eval",
+                tags=tags,
+                save_dir=f"{output_dir}/task_{task_id}",
+            )
+            log.info(f"\n--- Evaluation after Task {task_id} ({task['name']}) [resumed] ---")
+            evaluate_on_all_tasks(
+                model=model,
+                cfg=cfg,
+                task_schedule=task_schedule,
+                train_task_id=task_id,
+                tracker=tracker,
+                wandb_logger=eval_logger,
+            )
+            finish_wandb(eval_logger)
+            continue
 
         model = run_task(
             cfg=cfg,
