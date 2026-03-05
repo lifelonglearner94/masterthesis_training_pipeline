@@ -258,6 +258,7 @@ def create_datamodule_for_task(
         for_eval: If True, sets up for test-only evaluation.
     """
     data_cfg = copy.deepcopy(cfg.data)
+    OmegaConf.set_struct(data_cfg, False)
     target = OmegaConf.select(data_cfg, "_target_", default="")
 
     if "PermutedMNIST" in target:
