@@ -104,22 +104,36 @@ uv run src/eval.py experiment=test_ac_predictor_tta_extended \
 ```
 
 ## Benchmarks
-
+```bash
 # Phase 8 Hybrid on Split CIFAR-100
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid # DONE
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid # DONE only seed 42
 
 # Phase 8 Hybrid on Permuted MNIST
-uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid # DONE only seed 42
 
 # Phase 11 DNH-Hybrid on Split CIFAR-100
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh # DONE
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh # DONE only seed 42
 
 # Phase 11 DNH-Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_dnh
-
+```
 ## Benchmarking Standard models
 
+Comparison baselines from the DNH paper (Anbar Jafari et al., 2025 Table 2), parameter-matched to our HOPE benchmarks (~9.3–9.4M backbone params). Requires `uv sync --extra comparison-architectures`.
 
+```bash
+# GatedDeltaNet on Split CIFAR-100 (~9.30M backbone params)
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_gdn
+
+# GatedDeltaNet on Permuted MNIST
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gdn
+
+# Titans (MAC/LMM) on Split CIFAR-100 (~9.39M backbone params)
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans
+
+# Titans (MAC/LMM) on Permuted MNIST
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_titans
+```
 
 ## Project Structure
 

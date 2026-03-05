@@ -1,7 +1,14 @@
 # @package _global_
 
-# Benchmark Classification Wrapper — Titans MAC Backbone
-# Usage: uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans
+# Benchmark Classification Wrapper — Titans (MAC / LMM) Backbone
+# Memory-as-a-Context with Neural Memory Module (NMM) for test-time adaptation.
+# Parameter-matched to benchmark_hybrid (~9.4M backbone params).
+#
+# Reference: Ali et al., "Titans: Learning to Memorize at Test Time", 2024
+#
+# Usage:
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_titans
 
 defaults:
   - /model/_empty
@@ -10,33 +17,33 @@ model:
   _target_: src.models.benchmark_classifier.BackboneClassifierModule
 
   # -- Patch Embedding & Image --
-  in_channels: 3            # 3=RGB (CIFAR-100), overridden to 1 for MNIST
+  in_channels: 3
   img_size: 32
-  patch_size: 4             # 32/4 = 8 → 64 patches
-  embed_dim: 384            # Patch embedding output dim = backbone input_dim
+  patch_size: 4
+  embed_dim: 384                   # PatchEmbed output dim = backbone input_dim
 
   # -- Classification --
-  num_classes: 100           # Overridden per dataset
-  action_dim: 1              # Dummy (zero actions)
+  num_classes: 100
+  action_dim: 1
 
-  # -- Optimizer --
+  # -- Optimizer (paper: AdamW, lr=3e-4) --
   learning_rate: 3e-4
   weight_decay: 1e-4
   betas: [0.9, 0.999]
   warmup_epochs: 5
   max_epochs: 100
 
-  # -- Titans Backbone (Hydra recursive instantiation) --
+  # -- Titans (MAC) Backbone (~9.39M params) --
   backbone:
     _target_: src.models.titans.TitansBackbone
-    input_dim: 384
-    hidden_dim: 256
-    action_dim: 1
-    spatial_size: 8          # sqrt(num_patches) = sqrt(64)
-    pm_len: 4
-    n_layers: 3
-    n_layers_nmm: 2
-    alpha: 0.999
-    eta: 0.8
-    theta: 0.3
-    num_timesteps: 1
+    input_dim: 384                 # Must match embed_dim
+    hidden_dim: 224                # Tuned for ~9.4M param budget
+    action_dim: 1                  # Dummy action (zeroed out)
+    spatial_size: 8                # 32/4 = 8×8 = 64 patches
+    pm_len: 4                      # Persistent memory tokens
+    n_layers: 6                    # 6 MAC layers
+    n_layers_nmm: 2                # 2-layer NMM MLP
+    alpha: 0.999                   # Weight decay towards initial weights
+    eta: 0.8                       # Surprise momentum
+    theta: 0.3                     # Surprise learning rate
+    num_timesteps: 1               # Single image = 1 timestep

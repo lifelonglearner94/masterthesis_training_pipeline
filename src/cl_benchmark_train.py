@@ -145,6 +145,27 @@ class BenchmarkCLMetricsTracker:
 # =============================================================================
 
 
+def _get_model_tag(cfg: DictConfig) -> str:
+    """Derive a short model name tag from the backbone's Hydra _target_.
+
+    Examples:
+        src.models.titans.TitansBackbone          → "Titans"
+        src.models.gated_delta_net.GatedDeltaNetBackbone → "GatedDeltaNet"
+        src.models.hope.ACHOPEHybridViT            → "ACHOPEHybrid"
+        src.models.hope.ACDNHHOPEHybridViT         → "ACDNHHOPEHybrid"
+    """
+    target = OmegaConf.select(cfg, "model.backbone._target_", default="")
+    if not target:
+        # Fallback: try top-level model target
+        target = OmegaConf.select(cfg, "model._target_", default="unknown")
+    class_name = target.rsplit(".", 1)[-1] if target else "unknown"
+    # Strip common suffixes for cleaner tags
+    for suffix in ("Backbone", "Module", "ViT"):
+        if class_name.endswith(suffix) and class_name != suffix:
+            class_name = class_name[: -len(suffix)]
+    return class_name
+
+
 def create_wandb_logger(
     cfg: DictConfig,
     run_name: str,
@@ -464,7 +485,8 @@ def run_task(
         model.learning_rate = learning_rate_override
 
     # W&B logger
-    tags = list(cfg.get("tags", [])) + [f"task_{task_id}", task_name]
+    model_tag = _get_model_tag(cfg)
+    tags = list(cfg.get("tags", [])) + [f"task_{task_id}", task_name, model_tag]
     wandb_logger = create_wandb_logger(
         cfg,
         run_name=f"task_{task_id}_{task_name}",
@@ -600,7 +622,7 @@ def _run_single_seed(
         run_name=f"summary_s{seed}",
         group=wandb_group,
         job_type="summary",
-        tags=list(cfg.get("tags", [])) + ["summary", f"seed_{seed}"],
+        tags=list(cfg.get("tags", [])) + ["summary", f"seed_{seed}", _get_model_tag(cfg)],
         save_dir=f"{output_dir}/summary",
     )
     if summary_logger.experiment is not None:
@@ -688,7 +710,7 @@ def _run_sequential_benchmark(cfg: DictConfig) -> None:
         run_name="aggregate",
         group=wandb_group,
         job_type="aggregate",
-        tags=list(cfg.get("tags", [])) + ["aggregate"],
+        tags=list(cfg.get("tags", [])) + ["aggregate", _get_model_tag(cfg)],
         save_dir=f"{output_dir}/aggregate",
     )
     if agg_logger.experiment is not None:
