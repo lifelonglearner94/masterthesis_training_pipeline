@@ -238,12 +238,12 @@ def chunk_linear_attn_fwd_kernel_o(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=1),
     ],
     key=["BT", "BK", "BV"],
 )
