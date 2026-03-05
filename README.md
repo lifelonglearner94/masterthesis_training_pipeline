@@ -123,10 +123,10 @@ Comparison baselines from the DNH paper (Anbar Jafari et al., 2025 Table 2), par
 
 ```bash
 # GatedDeltaNet on Split CIFAR-100 (~9.30M backbone params)
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_gdn
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_gdn  # STARTED only seed 42
 
 # GatedDeltaNet on Permuted MNIST
-uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gdn
+uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gdn  # STARTED (QUEUED) only seed 42
 
 # Titans (MAC/LMM) on Split CIFAR-100 (~9.39M backbone params)
 uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans

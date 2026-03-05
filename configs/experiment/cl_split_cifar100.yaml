@@ -85,3 +85,13 @@ cl:
   task_epochs: 100         # Epochs for subsequent tasks
   task_learning_rate: null  # null = use same LR; set lower to reduce forgetting
   val_split: 0.1
+
+  # Early stopping — prevents overfitting at small model scales (~9M params)
+  # The paper says "up to 100 epochs" which implies early stopping was used.
+  # At 9M params models converge much faster than 340M+ param models.
+  early_stopping:
+    enabled: true
+    monitor: "val/acc"
+    mode: "max"
+    patience: 10             # Stop after 10 epochs with no val/acc improvement
+    min_delta: 0.001         # Minimum improvement to count as progress

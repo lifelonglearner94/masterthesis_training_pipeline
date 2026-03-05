@@ -40,7 +40,7 @@ import numpy as np
 import omegaconf
 import torch
 from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint, RichProgressBar
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -215,6 +215,24 @@ def create_trainer(
                 save_top_k=1,
             )
         )
+
+    # Early stopping — prevent overfitting on small models
+    es_cfg = cfg.cl.get("early_stopping", {})
+    if es_cfg.get("enabled", False):
+        callbacks.append(
+            EarlyStopping(
+                monitor=es_cfg.get("monitor", "val/acc"),
+                mode=es_cfg.get("mode", "max"),
+                patience=es_cfg.get("patience", 10),
+                min_delta=es_cfg.get("min_delta", 0.001),
+                verbose=True,
+            )
+        )
+        log.info(
+            f"  Early stopping enabled: monitor={es_cfg.get('monitor', 'val/acc')}, "
+            f"patience={es_cfg.get('patience', 10)}, min_delta={es_cfg.get('min_delta', 0.001)}"
+        )
+
     return Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
@@ -512,6 +530,11 @@ def run_task(
     )
 
     trainer.fit(model=model, datamodule=dm)
+
+    # Log actual epochs trained (may be less than max_epochs due to early stopping)
+    actual_epochs = trainer.current_epoch
+    log.info(f"  Training completed: {actual_epochs}/{max_epochs} epochs"
+             f"{' (early stopped)' if actual_epochs < max_epochs else ''}")
 
     # ── Best-epoch model selection ──
     # Reload the checkpoint with the highest val/acc (not last epoch).

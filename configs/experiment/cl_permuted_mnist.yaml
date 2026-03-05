@@ -86,3 +86,11 @@ cl:
   task_epochs: 100         # Epochs for permuted tasks
   task_learning_rate: null  # null = same LR throughout
   val_split: 0.1
+
+  # Early stopping — prevents overfitting at small model scales (~9M params)
+  early_stopping:
+    enabled: true
+    monitor: "val/acc"
+    mode: "max"
+    patience: 10             # Stop after 10 epochs with no val/acc improvement
+    min_delta: 0.001         # Minimum improvement to count as progress
