@@ -106,16 +106,20 @@ uv run src/eval.py experiment=test_ac_predictor_tta_extended \
 ## Benchmarks
 
 # Phase 8 Hybrid on Split CIFAR-100
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hybrid # DONE
 
 # Phase 8 Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hybrid
 
 # Phase 11 DNH-Hybrid on Split CIFAR-100
-uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh
+uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_dnh # DONE
 
 # Phase 11 DNH-Hybrid on Permuted MNIST
 uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_dnh
+
+## Benchmarking Standard models
+
+
 
 ## Project Structure
 

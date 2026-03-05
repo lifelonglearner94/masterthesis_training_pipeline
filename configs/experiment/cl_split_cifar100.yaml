@@ -72,7 +72,9 @@ cl:
   pipeline_mode: "sequential"
 
   # Multi-seed averaging (paper: "averaged over three independent runs")
-  seeds: [42, 123, 7]
+  # seeds: [42, 123, 7]
+  # Reduced to save time and money!
+  seeds: [42]
 
   # Task structure
   num_tasks: 10
