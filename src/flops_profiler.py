@@ -33,6 +33,12 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Project root on path
 # ---------------------------------------------------------------------------
@@ -475,10 +481,35 @@ def profile_all(
     batch_size: int = 4,
     warmup: int = 3,
     repeats: int = 10,
+    use_wandb: bool = False,
+    wandb_project: str = "flops-profiler",
+    wandb_name: str | None = None,
 ):
     """Profile all selected models and print comparison table."""
     device = torch.device(device_str)
     dtype = torch.float32
+
+    # ── W&B initialization ──────────────────────────────────────────────
+    wb_run = None
+    if use_wandb:
+        if not _WANDB_AVAILABLE:
+            print("[WARN] wandb not installed, skipping W&B logging.")
+        else:
+            gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+            wb_run = wandb.init(
+                project=wandb_project,
+                name=wandb_name or f"flops-profiler-{gpu_name.replace(' ', '_')}",
+                config={
+                    "device": device_str,
+                    "gpu": gpu_name,
+                    "batch_size": batch_size,
+                    "warmup": warmup,
+                    "repeats": repeats,
+                    "models": models_to_profile,
+                },
+                tags=["profiling"],
+            )
+            print(f"  W&B run: {wb_run.url}")
 
     print("=" * 90)
     print("  ISO-FLOP PROFILER — Computational Cost Comparison")
@@ -589,6 +620,22 @@ def profile_all(
             "total_train_flops": total_train_flops,
         }
 
+        # ── Log per-model metrics to W&B ────────────────────────────────
+        if wb_run is not None:
+            prefix = f"models/{model_key}"
+            wb_run.summary[f"{prefix}/total_params"] = total_params
+            wb_run.summary[f"{prefix}/trainable_params"] = train_params
+            wb_run.summary[f"{prefix}/fwd_flops"] = fwd_flops
+            wb_run.summary[f"{prefix}/train_flops"] = train_flops
+            wb_run.summary[f"{prefix}/fwd_ms"] = timing["fwd_mean_ms"]
+            wb_run.summary[f"{prefix}/fwd_std_ms"] = timing["fwd_std_ms"]
+            wb_run.summary[f"{prefix}/fwd_bwd_ms"] = timing["fwd_bwd_mean_ms"]
+            wb_run.summary[f"{prefix}/fwd_bwd_std_ms"] = timing["fwd_bwd_std_ms"]
+            wb_run.summary[f"{prefix}/peak_memory_gib"] = timing["peak_memory_gib"]
+            wb_run.summary[f"{prefix}/estimated_hours"] = total_time_s / 3600
+            if total_train_flops:
+                wb_run.summary[f"{prefix}/total_train_flops"] = total_train_flops
+
         # Cleanup
         del model, inputs
         gc.collect()
@@ -676,6 +723,64 @@ def profile_all(
     print("      for comparing relative costs across architectures.")
     print()
 
+    # ── Log summary table to W&B ────────────────────────────────────────
+    if wb_run is not None and len(results) >= 1:
+        columns = [
+            "Model", "Trainable Params", "Fwd FLOPs", "Train FLOPs",
+            "Fwd (ms)", "Fwd+Bwd (ms)", "Peak VRAM (GiB)",
+            "Est. CL Hours", "Total Train FLOPs",
+        ]
+        table = wandb.Table(columns=columns)
+        for key in models_to_profile:
+            if key not in results:
+                continue
+            r = results[key]
+            table.add_data(
+                r["name"],
+                r["train_params"],
+                r["fwd_flops"],
+                r["train_flops"],
+                round(r["fwd_ms"], 2),
+                round(r["fwd_bwd_ms"], 2),
+                round(r["peak_gib"], 3),
+                round(r["estimated_hours"], 2),
+                r["total_train_flops"],
+            )
+        wb_run.log({"comparison_table": table})
+
+        # Log bar charts for quick visual comparison
+        model_names = [results[k]["name"] for k in models_to_profile if k in results]
+        fwd_bwd_times = [results[k]["fwd_bwd_ms"] for k in models_to_profile if k in results]
+        train_flops_vals = [results[k]["train_flops"] or 0 for k in models_to_profile if k in results]
+        param_counts = [results[k]["train_params"] for k in models_to_profile if k in results]
+
+        wb_run.log({
+            "fwd_bwd_ms": wandb.plot.bar(
+                wandb.Table(
+                    data=list(zip(model_names, fwd_bwd_times)),
+                    columns=["Model", "Fwd+Bwd (ms)"],
+                ),
+                "Model", "Fwd+Bwd (ms)", title="Forward+Backward Time (ms)",
+            ),
+            "train_flops_chart": wandb.plot.bar(
+                wandb.Table(
+                    data=list(zip(model_names, train_flops_vals)),
+                    columns=["Model", "Train FLOPs"],
+                ),
+                "Model", "Train FLOPs", title="Training FLOPs per Step",
+            ),
+            "trainable_params_chart": wandb.plot.bar(
+                wandb.Table(
+                    data=list(zip(model_names, param_counts)),
+                    columns=["Model", "Trainable Params"],
+                ),
+                "Model", "Trainable Params", title="Trainable Parameters",
+            ),
+        })
+
+        wb_run.finish()
+        print(f"  W&B run finished: {wb_run.url}")
+
     return results
 
 
@@ -709,6 +814,18 @@ def main():
         help="Comma-separated list of models to profile. "
              f"Available: {','.join(MODEL_REGISTRY.keys())}. Default: all.",
     )
+    parser.add_argument(
+        "--wandb", action="store_true", default=False,
+        help="Log results to Weights & Biases.",
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default="flops-profiler",
+        help="W&B project name (default: flops-profiler).",
+    )
+    parser.add_argument(
+        "--wandb-name", type=str, default=None,
+        help="W&B run name (default: auto-generated from GPU name).",
+    )
 
     args = parser.parse_args()
 
@@ -723,6 +840,9 @@ def main():
         batch_size=args.batch_size,
         warmup=args.warmup,
         repeats=args.repeats,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
     )
 
 

@@ -173,7 +173,10 @@ Compare per-step FLOPs, wall-clock time, memory, and parameter counts across all
 uv run python src/flops_profiler.py --device cuda --batch-size 4 --warmup 3 --repeats 10
 
 # Specific models only
-uv run python src/flops_profiler.py --device cuda --models ac_vit,titans,ac_hope,ac_hope_hybrid,ac_dnh_hope_hybrid,gated_delta_net,transformer_pp
+uv run python src/flops_profiler.py --device cuda --models ac_vit,titans,ac_hope,ac_hope_hybrid,ac_dnh_hope_hybrid,gated_delta_net,transformer_pp --wandb
+
+# Log results to W&B (comparison table + bar charts)
+uv run python src/flops_profiler.py --device cuda --wandb --wandb-project flops-profiler
 ```
 
 Available models: `ac_vit`, `ac_hope`, `ac_hope_hybrid`, `ac_dnh_hope_hybrid`, `titans`, `retnet`, `gated_delta_net`, `transformer_pp`.
