@@ -208,6 +208,10 @@ def create_trainer(
         check_val_every_n_epoch=1,
         num_sanity_val_steps=num_sanity_val_steps,
         limit_val_batches=limit_val_batches,
+        # HOPE / Titan memory calls torch.autograd.grad() in the forward pass
+        # (DGD inner-loop). inference_mode=True (default) cannot be overridden
+        # by torch.enable_grad(), so the validation loop would also crash.
+        inference_mode=False,
     )
 
 
@@ -380,6 +384,11 @@ def evaluate_on_all_tasks(
             deterministic=cfg.get("deterministic", True),
             logger=False,
             enable_checkpointing=False,
+            # HOPE / Titan memory calls torch.autograd.grad() during the
+            # forward pass (DGD inner-loop). inference_mode=True (the default)
+            # is a hard context that cannot be overridden by
+            # torch.enable_grad(), causing "does not require grad" errors.
+            inference_mode=False,
         )
 
         model.eval()
