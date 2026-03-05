@@ -1,3 +1,5 @@
+# @package _global_
+
 # Benchmark Classification Wrapper — AC-HOPE-Hybrid-ViT (Phase 8) Backbone
 # Attention + Titan Memory + CMS adapted for image classification benchmarks.
 #

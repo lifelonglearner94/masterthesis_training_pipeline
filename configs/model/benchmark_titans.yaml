@@ -1,3 +1,5 @@
+# @package _global_
+
 # Benchmark Classification Wrapper — Titans MAC Backbone
 # Usage: uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans
 

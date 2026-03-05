@@ -1,3 +1,5 @@
+# @package _global_
+
 # Benchmark Classification Wrapper — AC-DNH-HOPE-Hybrid-ViT (Phase 11) Backbone
 # Attention + DNH Memory Hierarchy + Dynamic CMS adapted for image classification.
 #
