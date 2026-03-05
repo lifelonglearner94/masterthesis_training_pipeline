@@ -38,7 +38,7 @@ test: False
 # DATA DEFAULTS (overridden per phase by cl_train.py)
 # =============================================================================
 data:
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   pin_memory: true
 
@@ -91,7 +91,8 @@ trainer:
   max_epochs: 40
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm
-  precision: 32
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION
