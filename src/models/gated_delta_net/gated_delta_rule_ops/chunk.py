@@ -13,19 +13,19 @@ from fla.utils import contiguous
 from torch.cuda.amp import custom_bwd, custom_fwd
 from .wy_fast import fwd_recompute_w_u, fwd_prepare_wy_repr, bwd_prepare_wy_repr
 from einops import rearrange
-import torch.nn.functional as F 
+import torch.nn.functional as F
 
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=1),
     ],
-    key=["BT", "BK", "BV"], 
+    key=["BT", "BK", "BV"],
 )
 @triton.jit
 def fwd_prepare_du_kernel(
@@ -49,14 +49,14 @@ def fwd_prepare_du_kernel(
     BV: tl.constexpr
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    
+
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
         p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_q = tl.load(p_q, boundary_check=(0, 1)) 
+        b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_k.dtype)
         b_A += tl.dot(b_k, b_q, allow_tf32=False)
     b_g = tl.load(g + i_bh * T + i_t * BT + tl.arange(0, BT))
@@ -80,7 +80,7 @@ def fwd_prepare_du(q, k, g, do, BT):
     BV = min(triton.next_power_of_2(V), 64)
     fwd_prepare_du_kernel[(NT, B*H)](
         q, k, g, do, dv,
-        k.stride(1), k.stride(2), k.stride(3), 
+        k.stride(1), k.stride(2), k.stride(3),
         do.stride(1), do.stride(2), do.stride(3),
         T, K, V, K**-0.5, BT, BK, BV
     )
@@ -88,23 +88,23 @@ def fwd_prepare_du(q, k, g, do, BT):
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=1),
     ],
-    key=["BT", "BK", "BV"], 
+    key=["BT", "BK", "BV"],
 )
 
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h(
     k,
     v,
-    w, 
+    w,
     v_new,
-    g, 
+    g,
     h,
     initial_state,  # initial state of the chunk [B, H, D_head_K, D_head_V]
     final_state,  # final state of the chunk [B, H, D_head_K, D_head_V]
@@ -142,14 +142,14 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         tl.store(p_h, b_h.to(p_h.dtype.element_ty), boundary_check=(0, 1))
         b_h_cumsum = tl.zeros([BK, BV], dtype=tl.float32)
         b_g_last = tl.load(g + i_bh * T + i_t * BT + BT - 1)
-        
+
         # since we need to make all DK in the SRAM. we face serve SRAM memory burden. By subchunking we allievate such burden
         for i_c in range(tl.cdiv(BT, BC)):
             p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT + i_c * BC), (BK, BC), (0, 1))
             p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT + i_c * BC, i_k * BK), (BC, BK), (1, 0))
-            p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))            
-            b_g = tl.load(g + i_bh * T + i_t * BT + i_c * BC + tl.arange(0, BC)) 
-            p_v_new = tl.make_block_ptr(v_new + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))   
+            p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))
+            b_g = tl.load(g + i_bh * T + i_t * BT + i_c * BC + tl.arange(0, BC))
+            p_v_new = tl.make_block_ptr(v_new + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             # [BT, BK]
             b_w = tl.load(p_w, boundary_check=(0, 1))
@@ -160,24 +160,24 @@ def chunk_gated_delta_rule_fwd_kernel_h(
             # [BK, BV]
             tl.store(p_v_new, b_v.to(p_v_new.dtype.element_ty), boundary_check=(0, 1))
             b_k = (b_k * tl.math.exp2(b_g_last - b_g)[None, :]).to(p_k.dtype.element_ty)
-            b_h_cumsum += tl.dot(b_k, b_v.to(b_k.dtype), allow_tf32=False)        
+            b_h_cumsum += tl.dot(b_k, b_v.to(b_k.dtype), allow_tf32=False)
         b_h *= tl.math.exp2(b_g_last)
-        b_h += b_h_cumsum      
-        
+        b_h += b_h_cumsum
+
     if STORE_FINAL_STATE:
         p_ht = tl.make_block_ptr(final_state + i_bh * K * V, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=1),
     ],
-    key=["BT", "BK", "BV"], 
+    key=["BT", "BK", "BV"],
 )
 @triton.jit
 def chunk_linear_attn_fwd_kernel_o(
@@ -215,7 +215,7 @@ def chunk_linear_attn_fwd_kernel_o(
         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
         p_h = tl.make_block_ptr(h + i_bh * s_h_h + i_t * K * V, (K, V), (s_h_t, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
         # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1)) 
+        b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_q.dtype)
         # [BK, BT]
         b_k = tl.load(p_k, boundary_check=(0, 1))
@@ -232,7 +232,7 @@ def chunk_linear_attn_fwd_kernel_o(
     b_s = tl.where(m_s, b_s, 0)
     p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_o = (b_o + tl.dot(b_s.to(b_v.dtype), b_v, allow_tf32=False)) 
+    b_o = (b_o + tl.dot(b_s.to(b_v.dtype), b_v, allow_tf32=False))
     p_o = tl.make_block_ptr(o + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
@@ -245,7 +245,7 @@ def chunk_linear_attn_fwd_kernel_o(
         triton.Config({}, num_warps=16),
         triton.Config({}, num_warps=32),
     ],
-    key=["BT", "BK", "BV"], 
+    key=["BT", "BK", "BV"],
 )
 @triton.jit
 def chunk_gated_delta_rule_bwd_kernel_dhu(
@@ -297,13 +297,13 @@ def chunk_gated_delta_rule_bwd_kernel_dhu(
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_q = (b_q * scale * tl.math.exp2(b_g)[None, :]).to(b_q.dtype)
             b_do = tl.load(p_do, boundary_check=(0, 1))
-            b_dh_tmp += tl.dot(b_q, b_do.to(b_q.dtype), allow_tf32=False) 
+            b_dh_tmp += tl.dot(b_q, b_do.to(b_q.dtype), allow_tf32=False)
             # b_q = b_do = None
             # [BT, BK]
 
-            b_k = tl.load(p_k, boundary_check=(0, 1))            
-            b_k = (b_k * tl.math.exp2(bg_last - b_g)[:, None]).to(b_k.dtype)            
-            b_w = tl.load(p_w, boundary_check=(0, 1))        
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_k = (b_k * tl.math.exp2(bg_last - b_g)[:, None]).to(b_k.dtype)
+            b_w = tl.load(p_w, boundary_check=(0, 1))
             b_w = (b_w * tl.math.exp2(b_g)[None, :]).to(b_w.dtype)
             # [BT, V]
             b_dv = tl.load(p_dv, boundary_check=(0, 1))
@@ -318,21 +318,21 @@ def chunk_gated_delta_rule_bwd_kernel_dhu(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=1),
     ],
-    key=["BT", "BK", "BV"], 
+    key=["BT", "BK", "BV"],
 )
 @triton.jit
 def chunk_gated_delta_rule_bwd_kernel_dqkw(
     q,
     k,
     v,
-    w, 
+    w,
     g,
     h,
     do,
@@ -363,7 +363,7 @@ def chunk_gated_delta_rule_bwd_kernel_dqkw(
 ):
     i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     o_i = tl.arange(0, BT)
-    
+
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
     b_dw = tl.zeros([BT, BK], dtype=tl.float32)
@@ -386,12 +386,12 @@ def chunk_gated_delta_rule_bwd_kernel_dqkw(
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # [BK, BV]
         b_dh = tl.load(p_dh, boundary_check=(0, 1))
-        # [BT]        
-        b_dg_last += (tl.sum(b_h * b_dh))               
+        # [BT]
+        b_dg_last += (tl.sum(b_h * b_dh))
         # [BT, BT]
         b_ds += tl.dot(b_do, tl.trans(b_v), allow_tf32=False)
         # [BT, BK]
-        b_dq += tl.dot(b_do, b_h.to(b_do.dtype), allow_tf32=False)  
+        b_dq += tl.dot(b_do, b_h.to(b_do.dtype), allow_tf32=False)
         b_dk += tl.dot(b_v, b_dh.to(b_v.dtype), allow_tf32=False)
         b_dv = tl.load(p_dv, boundary_check=(0, 1))
         b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype), allow_tf32=False)
@@ -401,7 +401,7 @@ def chunk_gated_delta_rule_bwd_kernel_dqkw(
     p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(g + i_bh * T + i_t * BT + tl.arange(0, BT))    
+    b_g = tl.load(g + i_bh * T + i_t * BT + tl.arange(0, BT))
     b_w = tl.load(p_w, boundary_check=(0, 1))
 
     b_g_exp_qw = tl.math.exp2(b_g)
@@ -416,7 +416,7 @@ def chunk_gated_delta_rule_bwd_kernel_dqkw(
     # [BT, BT]
     b_ds = tl.where(o_i[:, None] >= o_i[None, :], b_ds * scale * tl.math.exp2(b_g[:, None] - b_g[None, :]), 0).to(b_q.dtype)
     # gradient wrt
-    b_dg_mask = tl.dot(b_q, tl.trans(b_k), allow_tf32=False) * b_ds 
+    b_dg_mask = tl.dot(b_q, tl.trans(b_k), allow_tf32=False) * b_ds
     b_dg += tl.sum(b_dg_mask, axis=1)
     b_dg -= tl.sum(b_dg_mask, axis=0)
 
@@ -443,9 +443,9 @@ def chunk_fwd_h_fn(k, w, u, g, BT, initial_state, final_state, state_in_fp32=Fal
 
     BK = triton.next_power_of_2(K)
     assert BK <= 256, "current kernel does not support head dimension larger than 256."
-    BV = 16 if BK > 128 else 32        
+    BV = 16 if BK > 128 else 32
     BV = 64 if BK <= 64 else BV
-    BC = 16 if BK > 128 else 32 
+    BC = 16 if BK > 128 else 32
     BC = 64 if BK <= 64 else BC
     BC = min(BT, BC)
     NT, NK, NV = triton.cdiv(T, BT), triton.cdiv(K, BK), triton.cdiv(V, BV)
@@ -466,16 +466,16 @@ def chunk_fwd_h_fn(k, w, u, g, BT, initial_state, final_state, state_in_fp32=Fal
         STORE_FINAL_STATE=final_state is not None,
         )
     return h, v_new
-    
+
 
 def chunk_bwd_dhu_fn(q, k, w, g, do, dv, BT):
     B, H, T, K, V = *q.shape, do.shape[-1]
 
     BK = triton.next_power_of_2(K)
     assert BK <= 256, "current kernel does not support head dimension being larger than 256."
-    BV = 16 if BK > 128 else 32        
+    BV = 16 if BK > 128 else 32
     BV = 64 if BK <= 64 else BV
-    BC = 16 if BK > 128 else 32 
+    BC = 16 if BK > 128 else 32
     BC = 64 if BK <= 64 else BC
     BC = min(BT, BC)
     NT, NK, NV = triton.cdiv(T, BT), triton.cdiv(K, BK), triton.cdiv(V, BV)
@@ -529,8 +529,8 @@ def chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT):
     NT = triton.cdiv(T, BT)
     grid = (NK, NT, B * H)
     dq = torch.empty_like(q)
-    dk = torch.empty_like(k) 
-    dw = torch.empty_like(w) 
+    dk = torch.empty_like(k)
+    dw = torch.empty_like(w)
     dg = torch.zeros(NK, *g.shape, dtype=torch.float32, device=g.device)
     chunk_gated_delta_rule_bwd_kernel_dqkw[grid](
         q, k, v_new, w, g, h, do, dh, dq, dk, du, dw, dg,
@@ -549,22 +549,22 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @staticmethod
     @custom_fwd
     @contiguous
-    def forward(ctx, q, k, v, beta, g, BT, initial_state, output_final_state):        
+    def forward(ctx, q, k, v, beta, g, BT, initial_state, output_final_state):
         g = g.float()
         #currently we force the length to be multiple of BT
         # assert g.shape[-1] % BT == 0
         g = rearrange(g, 'b h (n c) -> b h n c', c=BT)
-        # change the base of log from e to 2, i.e., ln->log2. To use tl.math.exp2 inside the kernel. 
+        # change the base of log from e to 2, i.e., ln->log2. To use tl.math.exp2 inside the kernel.
         g = g.cumsum(-1) * 1.44269504
         g = rearrange(g, 'b h n c -> b h (n c)')
 
         ### obtain WY representation. u is actually the new v.
         w, u, A_w, A_u, A_w_original, A_u_original = fwd_prepare_wy_repr(k, v, beta, g, BT)
-        ### forward_h 
+        ### forward_h
         final_state = None
         # state will convert to bf16 to do matmul anyway so we don't need fp32 state in the forward pass.
-        h, v_new = chunk_fwd_h_fn(k, w, u, g, BT, initial_state, final_state, state_in_fp32=False)                
-        ## obtain output 
+        h, v_new = chunk_fwd_h_fn(k, w, u, g, BT, initial_state, final_state, state_in_fp32=False)
+        ## obtain output
         o = chunk_fwd_o_fn(q, k, v_new, g, h, BT)
         # save memory
         # if checkpoint_level == 1:
@@ -710,7 +710,7 @@ def recurrent_gated_delta_rule_ref(
         o[:, :, i] = torch.einsum('bhd,bhdm->bhm', _q, S)
     return o
 
-    
+
 if __name__ == '__main__':
     B = 4
     H = 2
@@ -732,7 +732,7 @@ if __name__ == '__main__':
     do2 = torch.randn_like(o2)
     o2.backward(do2)
 
-    q_grad, q.grad = q.grad, None 
+    q_grad, q.grad = q.grad, None
     k_grad, k.grad = k.grad, None
     v_grad, v.grad = v.grad, None
     beta_grad, beta.grad = beta.grad, None
@@ -744,5 +744,3 @@ if __name__ == '__main__':
     print( (v.grad - v_grad).abs().max())
     print( (beta.grad - beta_grad).abs().max())
     print( (decay.grad - decay_grad).abs().max())
-
-
