@@ -517,7 +517,7 @@ def profile_all(
     print(f"  Device:     {device}")
     if device.type == "cuda":
         print(f"  GPU:        {torch.cuda.get_device_name(device)}")
-        print(f"  VRAM:       {torch.cuda.get_device_properties(device).total_mem / 1e9:.1f} GB")
+        print(f"  VRAM:       {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
     print(f"  Batch size: {batch_size}")
     print(f"  Sequence:   [B, {8*256}, 1024]  (T=8, N=256 patches, D=1024)")
     print(f"  Warmup:     {warmup} iterations")
