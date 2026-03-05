@@ -301,6 +301,17 @@ def cuda_memory_tracker(device):
         torch.cuda.synchronize(device)
 
 
+def _maybe_reset_memories(model: nn.Module) -> None:
+    """Reset HOPE memory states if the model supports it.
+
+    HOPE-based models require reset_all_memories() before each forward pass
+    to initialize active weights from meta-learned parameters. Without this,
+    Titan memory raises 'Active weights not initialized'.
+    """
+    if hasattr(model, "reset_all_memories"):
+        model.reset_all_memories()
+
+
 def measure_forward_flops(model: nn.Module, inputs: tuple, device: torch.device):
     """
     Measure forward-pass FLOPs using torch.profiler.
@@ -317,6 +328,7 @@ def measure_forward_flops(model: nn.Module, inputs: tuple, device: torch.device)
             record_shapes=True,
         ) as prof:
             with torch.no_grad():
+                _maybe_reset_memories(model)
                 _ = model(features, actions, states)
 
         # Sum up all estimated FLOPs from profiler events
@@ -350,6 +362,7 @@ def measure_training_step(
     # Warmup
     for _ in range(warmup):
         model.zero_grad(set_to_none=True)
+        _maybe_reset_memories(model)
         out = model(features, actions, states)
         loss = loss_fn(out, target)
         loss.backward()
@@ -368,6 +381,7 @@ def measure_training_step(
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         with torch.no_grad():
+            _maybe_reset_memories(model)
             _ = model(features, actions, states)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -380,6 +394,7 @@ def measure_training_step(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
+        _maybe_reset_memories(model)
         out = model(features, actions, states)
         loss = loss_fn(out, target)
         loss.backward()
@@ -418,6 +433,7 @@ def measure_training_flops(model: nn.Module, inputs: tuple, device: torch.device
             with_flops=True,
             record_shapes=True,
         ) as prof:
+            _maybe_reset_memories(model)
             out = model(features, actions, states)
             loss = loss_fn(out, target)
             loss.backward()
