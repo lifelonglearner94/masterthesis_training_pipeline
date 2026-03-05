@@ -219,6 +219,19 @@ class BackboneClassifierModule(L.LightningModule):
         return self.head(pooled)
 
     # --------------------------------------------------------------------- #
+    # Task-incremental evaluation support
+    # --------------------------------------------------------------------- #
+
+    _eval_task_classes: list[int] | None = None
+    """Set before test to enable task-incremental eval (logit masking).
+
+    When set, test_step masks logits to only these class indices before
+    computing argmax. This matches the standard task-incremental CL
+    evaluation protocol used in DNH (Anbar Jafari et al. 2025, Table 2).
+    Set to None for class-incremental (full 100-way) evaluation.
+    """
+
+    # --------------------------------------------------------------------- #
     # Training / Validation / Test steps
     # --------------------------------------------------------------------- #
 
@@ -227,8 +240,24 @@ class BackboneClassifierModule(L.LightningModule):
     ) -> Tensor:
         images, labels = batch
         logits = self(images)
-        loss = F.cross_entropy(logits, labels)
-        preds = logits.argmax(dim=-1)
+
+        # Task-incremental eval: mask logits to current task's classes.
+        # During test, only the task's class logits are visible to argmax,
+        # eliminating head bias from recently trained classes.
+        # Training and validation always use the full logit space.
+        if (
+            stage == "test"
+            and self._eval_task_classes is not None
+            and len(self._eval_task_classes) < logits.size(-1)
+        ):
+            mask = torch.full_like(logits, float("-inf"))
+            mask[:, self._eval_task_classes] = 0.0
+            logits_for_pred = logits + mask
+        else:
+            logits_for_pred = logits
+
+        loss = F.cross_entropy(logits, labels)  # loss uses full logits
+        preds = logits_for_pred.argmax(dim=-1)
 
         acc_metric = getattr(self, f"{stage}_acc")
         acc_metric(preds, labels)

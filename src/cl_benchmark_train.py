@@ -392,9 +392,21 @@ def evaluate_on_all_tasks(
         )
 
         model.eval()
+
+        # Task-incremental eval: mask logits to this task's classes.
+        # Matches the DNH paper's evaluation protocol (Anbar Jafari 2025,
+        # Table 2) where each task is evaluated using only its own class
+        # logits, preventing head bias toward recently trained classes.
+        if hasattr(model, "_eval_task_classes"):
+            model._eval_task_classes = eval_task.get("class_ids", None)
+
         results = eval_trainer.test(model=model, datamodule=dm)
         acc = results[0].get("test/acc", float("nan")) if results else float("nan")
         tracker.update(train_task_id, eval_id, acc)
+
+        # Clear task-incremental mask
+        if hasattr(model, "_eval_task_classes"):
+            model._eval_task_classes = None
 
         log.info(f"  Eval task {eval_id} ({eval_task['name']}): acc={acc:.4f}")
 
