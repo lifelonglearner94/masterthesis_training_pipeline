@@ -450,13 +450,15 @@ class ACHOPEViT(nn.Module):
         Returns:
             Attention mask tensor on the same device as x.
         """
+        if self.attn_mask is None:
+            return None
         seq_len = x.size(1)
         return self.attn_mask[:seq_len, :seq_len].to(
             device=x.device, non_blocking=True
         ).clone()
 
     def _process_hope_blocks(
-        self, x: Tensor, attn_mask: Tensor, T: int, cond_tokens: int,
+        self, x: Tensor, attn_mask: Tensor | None, T: int, cond_tokens: int,
         target_timestep: int | None = None,
     ) -> Tensor:
         """Process tokens through HOPE backbone blocks.
