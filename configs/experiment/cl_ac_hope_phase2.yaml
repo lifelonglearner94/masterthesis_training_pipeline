@@ -57,11 +57,11 @@ model:
   # HOPE architecture (param-matched: depth=6, ~42M params)
   depth: 6
   titan_hidden_multiplier: 2
-  use_rope: true
+  use_rope: true # RoPE makes no sense here, as it would need Self-Attention to work!!!!!!!!
   titan_grad_clip_inner: 1.0
   chunk_size: 1
   titan_detach_interval: 2  # PHASE 2 FIX: unroll 2 DGD steps before detach → richer meta-gradient for M_{□,0} (3 causes NaN)
-  surprise_threshold: 0.1  # PHASE 1 FIX: novelty gate — only update memory when retrieval error exceeds threshold
+  surprise_threshold: 0.1  # PHASE 2 FIX: novelty gate — only update memory when retrieval error exceeds threshold
 
   # CMS levels
   cms_level_specs:
@@ -172,5 +172,5 @@ cl:
   task_training:
     max_epochs: 10
     val_split: 0.0
-    # PHASE 1 FIX: more conservative outer-loop LR to reduce weight drift during CL
+    # PHASE 2 FIX: more conservative outer-loop LR to reduce weight drift during CL
     learning_rate: 2e-5

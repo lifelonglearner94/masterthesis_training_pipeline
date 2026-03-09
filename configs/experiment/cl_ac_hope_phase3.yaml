@@ -74,7 +74,7 @@ model:
   # HOPE architecture — depth=8, CMS hidden_mult=2.0 for param matching
   depth: 8                        # [A] Up from 6: +33% compositional depth
   titan_hidden_multiplier: 4
-  use_rope: true
+  use_rope: true # RoPE makes no sense here, as it would need Self-Attention to work!!!!!!!!
   titan_grad_clip_inner: 1.0
   chunk_size: 1
   titan_detach_interval: 2        # [M] Retained from Phase 2: richer meta-gradients

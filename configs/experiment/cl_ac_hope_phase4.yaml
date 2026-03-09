@@ -69,7 +69,7 @@ model:
   # HOPE architecture — depth=5, titan_mult=4, heterogeneous CMS
   depth: 5                        # [A] Down from 8: stronger per-block capacity
   titan_hidden_multiplier: 4      # [B] Retained: strong Titan persistent memories
-  use_rope: false                 # [E] Disabled: RoPE requires Q·K dot product (attention),
+  use_rope: false                 # [E] Disabled: RoPE requires Q·K dot product (attention),  # RoPE makes no sense here, as it would need Self-Attention to work!!!!!!!!
                                   #     but HOPE feeds Q→MLP and K→DGD separately — no
                                   #     relative-position benefit. V-JEPA2 features already
                                   #     have position info from the encoder.
