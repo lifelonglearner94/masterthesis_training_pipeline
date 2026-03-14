@@ -152,7 +152,7 @@ model:
 # TRAINER DEFAULTS
 # =============================================================================
 trainer:
-  max_epochs: 65
+  max_epochs: 40
   precision: 32
   gradient_clip_val: 1.5
   gradient_clip_algorithm: norm
@@ -169,7 +169,7 @@ cl:
   base_training:
     clip_start: 0
     clip_end: 5000
-    max_epochs: 65
+    max_epochs: 40
     val_split: 0.1
 
   tasks:

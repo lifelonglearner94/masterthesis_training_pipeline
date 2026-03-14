@@ -119,7 +119,7 @@ model:
 
   # Loss
   loss_weight_teacher: 1.0
-  loss_weight_jump: 1.5            # Upweight jump loss for better multi-step CL plasticity
+  loss_weight_jump: 1.0            # Upweight jump loss for better multi-step CL plasticity
   loss_type: "l1"                  # Base training uses L1 (Huber only during task training)
   huber_delta: 0.3                 # Used during task training via cl_train.py override
 
@@ -166,7 +166,7 @@ model:
 # TRAINER DEFAULTS
 # =============================================================================
 trainer:
-  max_epochs: 45
+  max_epochs: 40
   precision: 32
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
@@ -183,7 +183,7 @@ cl:
   base_training:
     clip_start: 0
     clip_end: 5000
-    max_epochs: 45
+    max_epochs: 40
     val_split: 0.1
 
   tasks:
@@ -208,7 +208,7 @@ cl:
 
   # ─── Phase 10: Task training (same as Phase 9 + replay) ───
   task_training:
-    max_epochs: 15
+    max_epochs: 10
     val_split: 0.0
     learning_rate: 1.4e-4
 
@@ -235,7 +235,7 @@ cl:
 
     # Training loss — Huber for robustness to outlier gradients
     # (evaluation always uses L1 — enforced by cl_train.py)
-    loss_type: "huber"
+    loss_type: "l1"
     huber_delta: 0.3              # Tight delta: L1-like for large errors, smooth near zero
 
   # ─── Phase 10: Experience Replay Configuration ───
