@@ -1,0 +1,50 @@
+# @package _global_
+
+# Benchmark Classification Wrapper — GatedDeltaNet (~43M params)
+# Parameter-matched to cl_gated_delta_net experiment.
+#
+# Architecture: Gated Delta Rule linear attention — SAME backbone dimensions
+# as cl_gated_delta_net (hidden_dim=768, n_layers=5, num_heads=12,
+# expand_k=0.75, expand_v=1.5, intermediate_size=2048).
+#
+# Usage:
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_gdn_43m data.batch_size=128
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_gdn_43m data.batch_size=128
+
+defaults:
+  - /model/_empty
+
+model:
+  _target_: src.models.benchmark_classifier.BackboneClassifierModule
+
+  # -- Patch Embedding & Image --
+  in_channels: 3
+  img_size: 32
+  patch_size: 4
+  embed_dim: 1024                  # PatchEmbed output dim = backbone input_dim
+
+  # -- Classification --
+  num_classes: 100
+  action_dim: 1
+
+  # -- Optimizer (paper: AdamW, lr=3e-4) --
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  warmup_epochs: 5
+  max_epochs: 100
+
+  # -- GatedDeltaNet Backbone (~43M params, matching cl_gated_delta_net) --
+  backbone:
+    _target_: src.models.gated_delta_net.GatedDeltaNetBackbone
+    input_dim: 1024                # Must match embed_dim
+    hidden_dim: 768                # Same as cl_gated_delta_net
+    action_dim: 1                  # Dummy action (zeroed out)
+    spatial_size: 8                # 32/4 = 8×8 = 64 patches
+    n_layers: 5                    # Same as cl_gated_delta_net
+    num_heads: 12                  # Same as cl_gated_delta_net
+    expand_k: 0.75                 # Same as cl_gated_delta_net
+    expand_v: 1.5                  # Same as cl_gated_delta_net
+    intermediate_size: 2048        # Same as cl_gated_delta_net
+    conv_size: 4                   # Short conv kernel
+    num_timesteps: 1               # Single image = 1 timestep

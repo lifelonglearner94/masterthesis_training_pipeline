@@ -23,9 +23,9 @@
 #   • No aux_loss needed (projections get direct outer-loop gradients)
 #   • depth=12 (deeper than 5, possible because per-block cost is lower)
 #
-# Architecture: depth=12, attention+titan(mult=2)+CMS({2.0/2.5/3.0}),
+# Architecture: depth=10, attention+titan(mult=2)+CMS({2.0/2.5/3.0}),
 #               longterm_memory=true (for CL)
-# Param budget: ~44M (comparable to 43M ViT baseline)
+# Param budget: ~47M (comparable to 43M ViT baseline)
 #
 # Usage:
 #   uv run src/cl_train.py experiment=cl_ac_hope_phase8 paths.data_dir=/path/to/clips
@@ -57,7 +57,7 @@ data:
   pin_memory: true
 
 # =============================================================================
-# MODEL: AC-HOPE-Hybrid-ViT Phase 8 (depth=12, ~44M params)
+# MODEL: AC-HOPE-Hybrid-ViT Phase 8 (depth=10, ~47M params)
 # =============================================================================
 model:
   T_teacher: 7
@@ -66,7 +66,7 @@ model:
   action_embed_dim: 2
 
   # ─── Hybrid architecture ───
-  depth: 12
+  depth: 10
   num_heads: 16
 
   # Titan memory (compact: augments attention, doesn't replace it)

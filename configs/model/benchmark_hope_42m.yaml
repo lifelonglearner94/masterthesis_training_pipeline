@@ -1,0 +1,85 @@
+# @package _global_
+
+# Benchmark Classification Wrapper — AC-HOPE-ViT (~42M params)
+# Parameter-matched to cl_ac_hope_phase2 experiment.
+#
+# Architecture: Pure Titan Memory + CMS (no attention) — SAME backbone
+# dimensions as cl_ac_hope_phase2 (embed_dim=1024, predictor_embed_dim=384,
+# depth=6, titan_hidden_multiplier=2, CMS hidden_multiplier=4.0).
+#
+# Usage:
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_hope_42m data.batch_size=128
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_hope_42m data.batch_size=128
+
+defaults:
+  - /model/_empty
+
+model:
+  _target_: src.models.benchmark_classifier.BackboneClassifierModule
+
+  # -- Patch Embedding & Image --
+  in_channels: 3
+  img_size: 32
+  patch_size: 4
+  embed_dim: 1024                  # Must match backbone's embed_dim
+
+  # -- Classification --
+  num_classes: 100
+  action_dim: 1
+
+  # -- Optimizer (paper: AdamW, lr=3e-4) --
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  warmup_epochs: 5
+  max_epochs: 100
+
+  # -- AC-HOPE-ViT Backbone (~42M params, matching cl_ac_hope_phase2) --
+  backbone:
+    _target_: src.models.hope.ACHOPEViT
+    img_size: [32, 32]             # 32/4 = 8×8 = 64 patches per frame
+    patch_size: 4
+    num_timesteps: 1               # Single image = 1 timestep
+    embed_dim: 1024                # Same as cl_ac_hope_phase2
+    predictor_embed_dim: 384       # Same as cl_ac_hope_phase2
+    depth: 6                       # Same as cl_ac_hope_phase2
+    num_heads: 16                  # Same as cl_ac_hope_phase2
+    action_embed_dim: 1            # Dummy action (zeroed out)
+    is_frame_causal: false         # No causality needed for single-image classification
+    use_activation_checkpointing: false
+    use_extrinsics: false
+    use_rope: false                # No RoPE (HOPE has no attention for Q·K)
+    # Titan memory — same settings as cl_ac_hope_phase2
+    titan_hidden_multiplier: 2
+    titan_layers: 2
+    titan_activation: gelu
+    titan_grad_clip_inner: 1.0
+    titan_grad_clip_backward: 1.0
+    titan_detach_interval: 2       # Same as cl_ac_hope_phase2
+    surprise_threshold: 0.1        # Same as cl_ac_hope_phase2
+    chunk_size: 1                  # Same as cl_ac_hope_phase2
+    # No longterm memory (cl_ac_hope_phase2 default: false)
+    use_longterm_memory: false
+    longterm_hidden_multiplier: 2
+    longterm_lr_scale: 0.1
+    # CMS — multi-frequency MLPs (same as cl_ac_hope_phase2: all hidden_multiplier=4.0)
+    cms_use_chunk_scheduling: false
+    cms_level_specs:
+      - name: "fast"
+        update_period: 1
+        hidden_multiplier: 4.0
+        warmup_steps: 0
+      - name: "medium"
+        update_period: 4
+        hidden_multiplier: 4.0
+        warmup_steps: 0
+      - name: "slow"
+        update_period: 16
+        hidden_multiplier: 4.0
+        warmup_steps: 0
+    # Spatial mixing disabled (vanilla HOPE processes tokens independently)
+    use_spatial_mixing: false
+    # Regularization
+    drop_rate: 0.0
+    drop_path_rate: 0.1
+    log_hope_diagnostics: false

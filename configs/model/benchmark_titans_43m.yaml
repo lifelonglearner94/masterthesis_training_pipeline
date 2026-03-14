@@ -1,0 +1,49 @@
+# @package _global_
+
+# Benchmark Classification Wrapper — Titans MAC (~43M params)
+# Parameter-matched to cl_titans experiment.
+#
+# Architecture: Memory-as-a-Context with NMM — SAME backbone dimensions
+# as cl_titans (hidden_dim=768, n_layers=4, n_layers_nmm=2, pm_len=4).
+#
+# Usage:
+#   uv run src/cl_benchmark_train.py experiment=cl_split_cifar100 model=benchmark_titans_43m data.batch_size=128
+#   uv run src/cl_benchmark_train.py experiment=cl_permuted_mnist model=benchmark_titans_43m data.batch_size=128
+
+defaults:
+  - /model/_empty
+
+model:
+  _target_: src.models.benchmark_classifier.BackboneClassifierModule
+
+  # -- Patch Embedding & Image --
+  in_channels: 3
+  img_size: 32
+  patch_size: 4
+  embed_dim: 1024                  # PatchEmbed output dim = backbone input_dim
+
+  # -- Classification --
+  num_classes: 100
+  action_dim: 1
+
+  # -- Optimizer (paper: AdamW, lr=3e-4) --
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  warmup_epochs: 5
+  max_epochs: 100
+
+  # -- Titans (MAC) Backbone (~43M params, matching cl_titans) --
+  backbone:
+    _target_: src.models.titans.TitansBackbone
+    input_dim: 1024                # Must match embed_dim
+    hidden_dim: 768                # Same as cl_titans
+    action_dim: 1                  # Dummy action (zeroed out)
+    spatial_size: 8                # 32/4 = 8×8 = 64 patches
+    pm_len: 4                      # Same as cl_titans
+    n_layers: 4                    # Same as cl_titans
+    n_layers_nmm: 2                # Same as cl_titans
+    alpha: 0.999                   # Same as cl_titans
+    eta: 0.8                       # Same as cl_titans
+    theta: 0.3                     # Same as cl_titans
+    num_timesteps: 1               # Single image = 1 timestep
