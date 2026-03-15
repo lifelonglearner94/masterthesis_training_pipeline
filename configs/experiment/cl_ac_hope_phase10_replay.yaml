@@ -2,19 +2,9 @@
 # =============================================================================
 # Continual Learning Pipeline — AC-HOPE-Hybrid-ViT Phase 10 (Replay)
 # =============================================================================
-# SOFT-FROZEN ATTENTION + TITAN RESET + CMS ADAPTATION + EXPERIENCE REPLAY
+# Phase 10 = Phase 8 (Hybrid Architecture) + Experience Replay
 #
-# Phase 10 = Phase 9 (architectural CL mechanisms) + Experience Replay
-#
-# Phase 9 alone addresses:
-#   ✓ Forgetting: soft-frozen attention preserves token mixing (tiny LR)
-#   ✓ Plasticity: Titan reset removes stale memory interference
-#   ✓ Adaptation: CMS carries task-specific feature transforms
-#   ✓ Lifelong: attention slowly co-adapts with evolving CMS/Titan features
-#
-# But the fundamental bottleneck remains DATA ACCESS — the upper bound trains
-# on ALL data jointly. Phase 10 adds a replay buffer that samples from past
-# experiences and mixes them into each task training batch.
+# Architecture is IDENTICAL to Phase 8. The ONLY addition is the replay buffer.
 #
 # Replay buffer design:
 #   - Reservoir sampling ensures uniform coverage across all past data
@@ -23,21 +13,16 @@
 #   - Buffer grows as tasks complete (adds new task clips after training)
 #   - Random re-sampling each step prevents overfitting to buffer
 #
-# Memory cost: 500 clips × ~40KB = ~20MB (negligible vs model ~44M params)
+# Memory cost: 600 clips × ~40KB = ~24MB (negligible vs model ~47M params)
 #
 # Expected improvement path:
 #   Lower Bound (naive):  0.3720 avg error  →  0% gap closed
 #   Phase 8 (hybrid):     0.3594 avg error  → 10% gap closed
-#   Phase 9 (freeze+reset): estimated       → 15-25% gap closed
 #   Phase 10 (+ replay):  estimated         → 40-60% gap closed
 #   Upper Bound (joint):  0.2502 avg error  → 100% gap closed
 #
-# REQUIRES: base checkpoint from Phase 8 hybrid run
-#   cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt
-#
 # Usage:
 #   uv run src/cl_train.py experiment=cl_ac_hope_phase10_replay \
-#     cl.resume_from_base_checkpoint=/path/to/base_training_final.ckpt \
 #     paths.data_dir=/path/to/clips
 # =============================================================================
 
@@ -52,8 +37,8 @@ defaults:
 # EXPERIMENT METADATA
 # =============================================================================
 task_name: "cl_ac_hope_phase10_replay"
-tags: ["cl", "continual_learning", "ac_hope_hybrid", "phase10",
-       "soft_freeze_attention", "titan_reset", "cms_adaptation", "replay"]
+tags: ["cl", "continual_learning", "ac_hope_hybrid", "attention", "titan",
+       "cms", "phase10", "rope", "longterm_memory", "replay"]
 seed: 42
 train: True
 test: False
@@ -67,7 +52,7 @@ data:
   pin_memory: true
 
 # =============================================================================
-# MODEL: AC-HOPE-Hybrid-ViT (same architecture as Phase 9)
+# MODEL: AC-HOPE-Hybrid-ViT Phase 10 (identical to Phase 8, ~47M params)
 # =============================================================================
 model:
   T_teacher: 7
@@ -75,23 +60,23 @@ model:
   use_activation_checkpointing: false
   action_embed_dim: 2
 
-  # ─── Hybrid architecture (unchanged from Phase 8) ───
-  depth: 12
+  # ─── Hybrid architecture ───
+  depth: 10
   num_heads: 16
 
-  # Titan memory
+  # Titan memory (compact: augments attention, doesn't replace it)
   titan_hidden_multiplier: 2
   titan_layers: 2
   titan_activation: "gelu"
   titan_grad_clip_inner: 1.0
   titan_grad_clip_backward: 1.0
-  titan_detach_interval: 2
-  surprise_threshold: 0.0         # Disabled: all tokens update memory (avoids gating interference)
+  titan_detach_interval: 2       # Detach every step for VRAM safety
+  surprise_threshold: 0.1        # Only update on surprising inputs
 
   # Longterm memory for cross-clip CL
   use_longterm_memory: true
   longterm_hidden_multiplier: 2
-  longterm_lr_scale: 0.05          # Conservative: slow longterm accumulation reduces forgetting
+  longterm_lr_scale: 0.1          # 10× slower than clip-level DGD
 
   # CMS — heterogeneous multi-frequency
   cms_use_chunk_scheduling: true
@@ -119,9 +104,8 @@ model:
 
   # Loss
   loss_weight_teacher: 1.0
-  loss_weight_jump: 1.0            # Upweight jump loss for better multi-step CL plasticity
-  loss_type: "l1"                  # Base training uses L1 (Huber only during task training)
-  huber_delta: 0.3                 # Used during task training via cl_train.py override
+  loss_weight_jump: 1.0
+  loss_type: "l1"
 
   # Curriculum — mild schedule
   curriculum_schedule:
@@ -136,28 +120,25 @@ model:
   drop_rate: 0.0
   drop_path_rate: 0.1
 
-  # Optimizer — AdamW (base LR for base training)
+  # Optimizer — AdamW (base LR matches ViT baseline from V-JEPA2 paper)
   optimizer_type: "adamw"
   learning_rate: 4.25e-4
   weight_decay: 0.04
   betas: [0.9, 0.999]
 
-  # ─── Per-group LR scaling for BASE TRAINING ───
-  attention_lr_scale: 1.0
-  titan_lr_scale: 0.1
-  cms_lr_scale: 0.6
+  # Per-group LR scaling (4 groups: attention, titan, cms, projections)
+  attention_lr_scale: 1.0         # 4.25e-4 — match ViT baseline for token mixing
+  titan_lr_scale: 0.1             # 4.25e-5 — slow, augmentation role
+  cms_lr_scale: 0.6               # 2.55e-4 — moderate, feature transforms
   titan_weight_decay: 0.005
-  aux_loss_weight: 0.0
+  aux_loss_weight: 0.0            # Not needed for hybrid
 
-  # LR schedule — iteration-based
+  # LR schedule — iteration-based (V-JEPA2 paper)
   use_iteration_scheduler: true
   warmup_pct: 0.10
   constant_pct: 0.80
   decay_pct: 0.10
   warmup_start_lr: 7.5e-5
-
-  # Projections LR scale (base training uses 1.0, task training overrides)
-  projections_lr_scale: 1.0
 
   # TTA defaults
   tta_enabled: false
@@ -168,7 +149,7 @@ model:
 trainer:
   max_epochs: 40
   precision: 32
-  gradient_clip_val: 1.0
+  gradient_clip_val: 1.5
   gradient_clip_algorithm: norm
   accumulate_grad_batches: 1
 
@@ -178,7 +159,7 @@ trainer:
 cl:
   wandb_group: "cl_phase10_replay_${now:%Y%m%d_%H%M%S}"
   task_training_mode: "finetune"
-  resume_from_base_checkpoint: null    # SET THIS to your base checkpoint path
+  resume_from_base_checkpoint: null
 
   base_training:
     clip_start: 0
@@ -206,37 +187,12 @@ cl:
   eval:
     clips_per_task: 100
 
-  # ─── Phase 10: Task training (same as Phase 9 + replay) ───
   task_training:
     max_epochs: 10
     val_split: 0.0
     learning_rate: 1.4e-4
-
     warmup_pct: 0.05
     warmup_start_lr: 2.5e-5
-
-    # Attention gets very small LR — slowest timescale for lifelong co-adaptation
-    attention_lr_scale: 0.02      # 1.4e-4 × 0.02 = 2.8e-6 (slow co-adaptation)
-    # Titan gets aggressive LR — reset each task
-    titan_lr_scale: 2.0           # 1.4e-4 × 2.0 = 2.8e-4
-    # CMS is the primary adaptation mechanism
-    cms_lr_scale: 1.0             # 1.4e-4 × 1.0 = 1.4e-4
-
-    # Phase 9 CL mechanisms
-    freeze_attention: false       # Soft freeze: trainable with very low LR (0.02×)
-    reset_titan_memories: true    # Reset clip-level Titan memories at task boundary (longterm preserved)
-
-    # LR schedule shape — flat schedule for short task training (no decay waste)
-    constant_pct: 0.95            # Nearly all budget at peak LR
-    decay_pct: 0.0                # No decay phase for 15-epoch task training
-
-    # Projections LR — damped to reduce forgetting in shared layers
-    projections_lr_scale: 0.3     # 1.4e-4 × 0.3 = 4.2e-5 (moderate adaptation)
-
-    # Training loss — Huber for robustness to outlier gradients
-    # (evaluation always uses L1 — enforced by cl_train.py)
-    loss_type: "l1"
-    huber_delta: 0.3              # Tight delta: L1-like for large errors, smooth near zero
 
   # ─── Phase 10: Experience Replay Configuration ───
   # The presence of this section activates the replay buffer in cl_train.py.
