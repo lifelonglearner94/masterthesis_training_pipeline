@@ -92,5 +92,5 @@ cl:
     enabled: true
     monitor: "val/acc"
     mode: "max"
-    patience: 10             # Stop after 10 epochs with no val/acc improvement
+    patience: 15             # Stop after 15 epochs with no val/acc improvement
     min_delta: 0.001         # Minimum improvement to count as progress
