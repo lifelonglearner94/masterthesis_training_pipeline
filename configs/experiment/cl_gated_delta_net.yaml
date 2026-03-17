@@ -91,7 +91,7 @@ trainer:
   max_epochs: 40
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm
-  precision: "bf16-mixed"
+  precision: "16-mixed"
   accumulate_grad_batches: 2
 
 # =============================================================================

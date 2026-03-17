@@ -87,7 +87,7 @@ trainer:
   max_epochs: 40
   gradient_clip_val: 1.01
   gradient_clip_algorithm: norm
-  precision: 32
+  precision: "16-mixed"
 
 # =============================================================================
 # CONTINUAL LEARNING PIPELINE CONFIGURATION

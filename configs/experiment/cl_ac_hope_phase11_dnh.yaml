@@ -171,7 +171,7 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 45
-  precision: "bf16-mixed"            # fp32→bf16-mixed: ~40% VRAM savings
+  precision: "16-mixed"
   gradient_clip_val: 1.5
   gradient_clip_algorithm: norm
   accumulate_grad_batches: 2          # Effective batch = batch_size × 2

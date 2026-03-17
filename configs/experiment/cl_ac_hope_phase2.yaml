@@ -121,7 +121,7 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 40
-  precision: 32  # HOPE inner-loop needs full precision
+  precision: "16-mixed"
   gradient_clip_val: 3.0  # Keep original for base training (unrolled graph needs headroom); phase 1's 1.2 is too tight here
   gradient_clip_algorithm: norm
 

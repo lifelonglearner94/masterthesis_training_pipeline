@@ -139,7 +139,7 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 65                   # [G] Up from 40 — bi-level optimization needs more iters
-  precision: 32                    # HOPE inner-loop needs full precision
+  precision: "16-mixed"
   gradient_clip_val: 1.5           # [F] Down from 3.0 — tighter clip pairs with higher LR
   gradient_clip_algorithm: norm
   accumulate_grad_batches: 2

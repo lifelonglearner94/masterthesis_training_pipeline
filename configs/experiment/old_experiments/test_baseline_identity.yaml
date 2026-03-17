@@ -70,7 +70,7 @@ model:
 trainer:
   accelerator: auto
   devices: 1
-  precision: 32
+  precision: "16-mixed"
   max_epochs: 0
   enable_checkpointing: false
   enable_progress_bar: true

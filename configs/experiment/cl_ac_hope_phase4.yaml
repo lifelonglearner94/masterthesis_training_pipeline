@@ -141,7 +141,7 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 65                   # Retained from Phase 3
-  precision: 32                    # HOPE inner-loop needs full precision
+  precision: "16-mixed"
   gradient_clip_val: 1.5           # Retained from Phase 3
   gradient_clip_algorithm: norm
   accumulate_grad_batches: 1

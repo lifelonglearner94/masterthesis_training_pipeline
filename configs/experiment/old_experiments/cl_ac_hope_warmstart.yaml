@@ -122,7 +122,7 @@ model:
 # =============================================================================
 trainer:
   max_epochs: 40
-  precision: 32  # HOPE inner-loop needs full precision
+  precision: "16-mixed"
   gradient_clip_val: 3.0
   gradient_clip_algorithm: norm
 
