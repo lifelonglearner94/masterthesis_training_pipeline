@@ -429,6 +429,7 @@ def run_base_training(
     )
 
     # Create trainer
+    no_val = base_cfg.get("val_split", 0.1) <= 0.0
     trainer = create_trainer(
         cfg,
         wandb_logger,
@@ -437,6 +438,8 @@ def run_base_training(
         gradient_clip_val=OmegaConf.select(cfg, "trainer.gradient_clip_val", default=1.01),
         precision=OmegaConf.select(cfg, "trainer.precision", default="16-mixed"),
         accumulate_grad_batches=OmegaConf.select(cfg, "trainer.accumulate_grad_batches", default=1),
+        num_sanity_val_steps=0 if no_val else None,
+        limit_val_batches=0 if no_val else 1.0,
     )
 
     # ─── HOPE warm-start: disable inner-loop DGD + aux loss for base task ───
