@@ -129,6 +129,11 @@ class ACHOPEHybridViT(nn.Module):
         # Attention settings
         qkv_bias: bool = True,
         attn_drop_rate: float = 0.0,
+        # Ablation flags
+        disable_titan: bool = False,
+        disable_cms: bool = False,
+        titan_replacement_hidden: int = 2305,
+        cms_replacement_hidden: int = 2884,
         # Regularization
         drop_rate: float = DEFAULT_DROP_RATE,
         drop_path_rate: float = DEFAULT_DROP_PATH_RATE,
@@ -203,6 +208,10 @@ class ACHOPEHybridViT(nn.Module):
                     use_longterm_memory=use_longterm_memory,
                     longterm_hidden_multiplier=longterm_hidden_multiplier,
                     longterm_lr_scale=longterm_lr_scale,
+                    disable_titan=disable_titan,
+                    disable_cms=disable_cms,
+                    titan_replacement_hidden=titan_replacement_hidden,
+                    cms_replacement_hidden=cms_replacement_hidden,
                     drop_path=dpr[i],
                     drop=drop_rate,
                 ),
@@ -594,7 +603,7 @@ class ACHOPEHybridViT(nn.Module):
         titan_patterns = {
             "M_memory.", "M_longterm.", "mem_q_proj.", "mem_k_proj.",
             "mem_v_proj.", "mem_out_proj.", "eta_base", "alpha_base",
-            "longterm_gate.",
+            "longterm_gate.", "titan_replacement.",
         }
 
         attention_patterns = {
@@ -606,7 +615,7 @@ class ACHOPEHybridViT(nn.Module):
                 continue
             if any(pattern in name for pattern in titan_patterns):
                 titan_params.append(param)
-            elif "cms." in name:
+            elif "cms." in name or "ffn." in name:
                 cms_params.append(param)
             elif any(pattern in name for pattern in attention_patterns):
                 attention_params.append(param)

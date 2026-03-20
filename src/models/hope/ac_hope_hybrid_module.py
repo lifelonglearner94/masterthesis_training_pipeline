@@ -91,6 +91,11 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
         use_longterm_memory: bool = False,
         longterm_hidden_multiplier: int = 2,
         longterm_lr_scale: float = 0.1,
+        # Ablation flags
+        disable_titan: bool = False,
+        disable_cms: bool = False,
+        titan_replacement_hidden: int = 2305,
+        cms_replacement_hidden: int = 2884,
         # Optimizer: per-group LR/WD scaling
         attention_lr_scale: float = 1.0,
         titan_lr_scale: float = 0.1,
@@ -180,6 +185,10 @@ class ACHOPEHybridModule(TTAMixin, ACPredictorLossMixin, L.LightningModule):
             longterm_hidden_multiplier=longterm_hidden_multiplier,
             longterm_lr_scale=longterm_lr_scale,
             qkv_bias=qkv_bias,
+            disable_titan=disable_titan,
+            disable_cms=disable_cms,
+            titan_replacement_hidden=titan_replacement_hidden,
+            cms_replacement_hidden=cms_replacement_hidden,
         )
 
         self.T_teacher = T_teacher

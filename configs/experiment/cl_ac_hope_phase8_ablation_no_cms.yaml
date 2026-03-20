@@ -1,0 +1,146 @@
+# @package _global_
+# =============================================================================
+# ABLATION: AC-HOPE-Hybrid-ViT Phase 8 — WITHOUT CMS (replaced by simple MLP)
+# =============================================================================
+# Identical to cl_ac_hope_phase8_hybrid.yaml, except:
+#   Phase C (CMS) is REPLACED by a standard 2-layer MLP (FFN).
+#
+# This isolates the contribution of the multi-frequency CMS to the hybrid
+# architecture. The CMS cascade (fast/medium/slow frequency MLPs with
+# chunk-based scheduling) is replaced by a single GELU MLP.
+#
+# What remains: Attention (Phase A) + Titan Memory (Phase B) + simple MLP
+# What is removed: Multi-frequency scheduling, heterogeneous hidden dims,
+#                  frame-aware chunk scheduling
+#
+# Expected effect:
+#   - No multi-frequency temporal processing
+#   - No frame-aware chunk scheduling
+#   - Single-frequency feature transform (like a standard ViT FFN)
+#   - Titan memory still provides in-context DGD adaptation
+#
+# Usage:
+#   uv run src/cl_train.py experiment=cl_ac_hope_phase8_ablation_no_cms paths.data_dir=/path/to/clips
+# =============================================================================
+
+defaults:
+  - override /data_settings@data: precomputed_features
+  - override /model: ac_hope_hybrid_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "cl_ac_hope_phase8_ablation_no_cms"
+tags: ["cl", "continual_learning", "ac_hope_hybrid", "ablation", "no_cms",
+       "attention", "titan", "phase8", "rope", "longterm_memory", "simple_mlp"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA DEFAULTS (overridden per phase by cl_train.py)
+# =============================================================================
+data:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# MODEL: AC-HOPE-Hybrid-ViT Phase 8 — CMS REPLACED by simple MLP
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false
+  action_embed_dim: 2
+
+  # ─── Hybrid architecture ───
+  depth: 10
+  num_heads: 16
+
+  # ─── ABLATION: Replace CMS with param-matched simple MLP ───
+  disable_cms: true
+  cms_replacement_hidden: 2884     # Param-matched: MLP(384→2884→384) ≈ CMS (3-level) params
+
+  # Titan memory (UNCHANGED — fully active)
+  titan_hidden_multiplier: 2
+  titan_layers: 2
+  titan_activation: "gelu"
+  titan_grad_clip_inner: 1.0
+  titan_grad_clip_backward: 1.0
+  titan_detach_interval: 2
+  surprise_threshold: 0.1
+
+  # Longterm memory for cross-clip CL (UNCHANGED)
+  use_longterm_memory: true
+  longterm_hidden_multiplier: 2
+  longterm_lr_scale: 0.1
+
+  # CMS specs below are ignored when disable_cms=true, but kept
+  # for config completeness / diffing against the full hybrid.
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+
+  # Attention settings (UNCHANGED)
+  qkv_bias: true
+  attn_drop_rate: 0.0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+  diagnostics_log_interval: 50
+
+  # Loss (UNCHANGED)
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # Curriculum — mild schedule (UNCHANGED)
+  curriculum_schedule:
+    - epoch: 0
+      loss_weight_teacher: 1.0
+    - epoch: 15
+      loss_weight_teacher: 1.0
+    - epoch: 25
+      loss_weight_teacher: 1.0
+
+  # Regularization (UNCHANGED)
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # Optimizer (UNCHANGED)
+  optimizer_type: "adamw"
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  attention_lr_scale: 1.0
+  titan_lr_scale: 0.1
+  cms_lr_scale: 0.6               # Applied to the replacement MLP
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.0
+
+  # LR schedule (UNCHANGED)
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 7.5e-5
+
+  # TTA defaults
+  tta_enabled: false

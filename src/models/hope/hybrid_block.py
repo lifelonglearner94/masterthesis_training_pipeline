@@ -83,6 +83,12 @@ class HybridBlockConfig:
     longterm_hidden_multiplier: int = 2
     longterm_lr_scale: float = 0.1
 
+    # ─── Ablation flags ───
+    disable_titan: bool = False    # Replace Phase B (Titan memory) with param-matched MLP
+    disable_cms: bool = False      # Replace CMS with a param-matched simple MLP (FFN)
+    titan_replacement_hidden: int = 2305   # Hidden dim for titan replacement MLP (param-matched)
+    cms_replacement_hidden: int = 2884     # Hidden dim for CMS replacement MLP (param-matched)
+
     # ─── Regularization ───
     drop_path: float = 0.0
     drop: float = 0.0
@@ -131,42 +137,54 @@ class HybridBlock(nn.Module):
         )
 
         # ─── Phase B: Titan Memory (simplified) ───
-        self.norm2 = nn.LayerNorm(dim)
+        self._disable_titan = config.disable_titan
+        if config.disable_titan:
+            # Ablation: replace Titan memory with a param-matched plain MLP
+            self.norm2 = nn.LayerNorm(dim)
+            self.titan_replacement = nn.Sequential(
+                nn.Linear(dim, config.titan_replacement_hidden),
+                nn.GELU(),
+                nn.Dropout(config.drop),
+                nn.Linear(config.titan_replacement_hidden, dim),
+                nn.Dropout(config.drop),
+            )
+        else:
+            self.norm2 = nn.LayerNorm(dim)
 
-        # Query projection for memory retrieval
-        self.mem_q_proj = nn.Linear(dim, dim, bias=False)
+            # Query projection for memory retrieval
+            self.mem_q_proj = nn.Linear(dim, dim, bias=False)
 
-        # Key/Value projections for DGD write
-        self.mem_k_proj = nn.Linear(dim, dim, bias=False)
-        self.mem_v_proj = nn.Linear(dim, dim, bias=False)
+            # Key/Value projections for DGD write
+            self.mem_k_proj = nn.Linear(dim, dim, bias=False)
+            self.mem_v_proj = nn.Linear(dim, dim, bias=False)
 
-        # The main retrieval/adaptation memory
-        mem_cfg = TitanMemoryConfig(
-            dim=dim,
-            hidden_multiplier=config.titan_hidden_multiplier,
-            num_layers=config.titan_layers,
-            activation=config.titan_activation,
-            grad_clip_inner=config.titan_grad_clip_inner,
-            grad_clip_backward=config.titan_grad_clip_backward,
-            detach_interval=titan_detach_interval,
-        )
-        self.M_memory = TitanMemory(mem_cfg)
+            # The main retrieval/adaptation memory
+            mem_cfg = TitanMemoryConfig(
+                dim=dim,
+                hidden_multiplier=config.titan_hidden_multiplier,
+                num_layers=config.titan_layers,
+                activation=config.titan_activation,
+                grad_clip_inner=config.titan_grad_clip_inner,
+                grad_clip_backward=config.titan_grad_clip_backward,
+                detach_interval=titan_detach_interval,
+            )
+            self.M_memory = TitanMemory(mem_cfg)
 
-        # Output projection for Phase B
-        self.mem_out_proj = nn.Linear(dim, dim, bias=True)
+            # Output projection for Phase B
+            self.mem_out_proj = nn.Linear(dim, dim, bias=True)
 
-        # Simplified η and α: learned per-feature parameters.
-        # Instead of full TitanMemory networks (M_eta, M_alpha), we use
-        # learnable vectors that the outer optimizer tunes. This drastically
-        # reduces parameters while retaining per-feature DGD adaptation.
-        # η: softplus(eta_base) → positive learning rate per feature
-        # α: sigmoid(alpha_base) → decay factor in [0, 1] per feature
-        self.eta_base = nn.Parameter(torch.full((dim,), DEFAULT_ETA_INIT))
-        self.alpha_base = nn.Parameter(torch.full((dim,), DEFAULT_ALPHA_INIT))
+            # Simplified η and α: learned per-feature parameters.
+            # Instead of full TitanMemory networks (M_eta, M_alpha), we use
+            # learnable vectors that the outer optimizer tunes. This drastically
+            # reduces parameters while retaining per-feature DGD adaptation.
+            # η: softplus(eta_base) → positive learning rate per feature
+            # α: sigmoid(alpha_base) → decay factor in [0, 1] per feature
+            self.eta_base = nn.Parameter(torch.full((dim,), DEFAULT_ETA_INIT))
+            self.alpha_base = nn.Parameter(torch.full((dim,), DEFAULT_ALPHA_INIT))
 
         # ─── Longterm memory (optional, for CL persistence) ───
-        self.use_longterm_memory = config.use_longterm_memory
-        if config.use_longterm_memory:
+        self.use_longterm_memory = config.use_longterm_memory and not config.disable_titan
+        if self.use_longterm_memory:
             longterm_cfg = TitanMemoryConfig(
                 dim=dim,
                 hidden_multiplier=config.longterm_hidden_multiplier,
@@ -185,14 +203,25 @@ class HybridBlock(nn.Module):
 
             self.longterm_lr_scale = config.longterm_lr_scale
 
-        # ─── Phase C: CMS ───
+        # ─── Phase C: CMS or simple MLP (ablation) ───
+        self._disable_cms = config.disable_cms
         self.norm3 = nn.LayerNorm(dim)
-        self.cms = CMS(
-            dim=dim,
-            levels=config.cms_levels,
-            drop=config.drop,
-            use_chunk_scheduling=config.cms_use_chunk_scheduling,
-        )
+        if config.disable_cms:
+            # Ablation: replace CMS with a param-matched plain MLP
+            self.ffn = nn.Sequential(
+                nn.Linear(dim, config.cms_replacement_hidden),
+                nn.GELU(),
+                nn.Dropout(config.drop),
+                nn.Linear(config.cms_replacement_hidden, dim),
+                nn.Dropout(config.drop),
+            )
+        else:
+            self.cms = CMS(
+                dim=dim,
+                levels=config.cms_levels,
+                drop=config.drop,
+                use_chunk_scheduling=config.cms_use_chunk_scheduling,
+            )
 
         # ─── Drop path (stochastic depth) ───
         self.drop_path = (
@@ -242,16 +271,23 @@ class HybridBlock(nn.Module):
         x = x + self.drop_path(y)
 
         # ─── Phase B: Titan Memory Read + DGD Write ───
-        y = self.norm2(x)
-        y = self._titan_forward(y)
-        x = x + self.drop_path(y)
+        if self._disable_titan:
+            y = self.norm2(x)
+            y = self.titan_replacement(y)
+        else:
+            y = self.norm2(x)
+            y = self._titan_forward(y)
+            x = x + self.drop_path(y)
 
-        # ─── Phase C: CMS ───
+        # ─── Phase C: CMS or simple MLP ───
         y = self.norm3(x)
-        tokens_per_frame = (
-            (action_tokens + H * W) if H is not None and W is not None else None
-        )
-        y = self.cms(y, T=T, tokens_per_frame=tokens_per_frame)
+        if self._disable_cms:
+            y = self.ffn(y)
+        else:
+            tokens_per_frame = (
+                (action_tokens + H * W) if H is not None and W is not None else None
+            )
+            y = self.cms(y, T=T, tokens_per_frame=tokens_per_frame)
         x = x + self.drop_path(y)
 
         return x
@@ -361,9 +397,11 @@ class HybridBlock(nn.Module):
 
         M_longterm is NOT reset — it persists across clips.
         """
-        self.M_memory.reset_active_weights()
-        self.M_memory.reset_diagnostics()
-        self.cms.reset_step_counter()
+        if not self._disable_titan:
+            self.M_memory.reset_active_weights()
+            self.M_memory.reset_diagnostics()
+        if not self._disable_cms:
+            self.cms.reset_step_counter()
 
         # M_longterm: initialize on first call, detach thereafter
         if self.use_longterm_memory:
@@ -384,19 +422,20 @@ class HybridBlock(nn.Module):
         """Get diagnostic metrics from this block."""
         diag: dict[str, float] = {}
 
-        for key, val in self.M_memory.get_diagnostics().items():
-            diag[f"M_memory/{key}"] = val
+        if not self._disable_titan:
+            for key, val in self.M_memory.get_diagnostics().items():
+                diag[f"M_memory/{key}"] = val
 
-        if self.use_longterm_memory:
-            for key, val in self.M_longterm.get_diagnostics().items():
-                diag[f"M_longterm/{key}"] = val
+            if self.use_longterm_memory:
+                for key, val in self.M_longterm.get_diagnostics().items():
+                    diag[f"M_longterm/{key}"] = val
 
-        if self._last_surprise is not None:
-            diag["hope/mean_surprise"] = self._last_surprise.mean().item()
-            diag["hope/max_surprise"] = self._last_surprise.max().item()
+            if self._last_surprise is not None:
+                diag["hope/mean_surprise"] = self._last_surprise.mean().item()
+                diag["hope/max_surprise"] = self._last_surprise.max().item()
 
-        # Log learned η and α
-        diag["titan/mean_eta"] = F.softplus(self.eta_base).mean().item()
-        diag["titan/mean_alpha"] = torch.sigmoid(self.alpha_base).mean().item()
+            # Log learned η and α
+            diag["titan/mean_eta"] = F.softplus(self.eta_base).mean().item()
+            diag["titan/mean_alpha"] = torch.sigmoid(self.alpha_base).mean().item()
 
         return diag
