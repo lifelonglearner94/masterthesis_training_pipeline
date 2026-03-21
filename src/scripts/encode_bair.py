@@ -111,6 +111,7 @@ def load_vjepa2_encoder(device: torch.device) -> torch.nn.Module:
 
     if not repo_dir.exists():
         log.info("Downloading vjepa2 repo...")
+        Path(hub_dir).mkdir(parents=True, exist_ok=True)
         zip_path = Path(hub_dir) / "main.zip"
         torch.hub.download_url_to_file(
             "https://github.com/facebookresearch/vjepa2/zipball/main",
