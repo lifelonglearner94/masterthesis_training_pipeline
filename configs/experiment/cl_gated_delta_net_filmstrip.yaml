@@ -138,4 +138,4 @@ cl:
   # ─── Filmstrip visualization settings ───
   filmstrip:
     upsample_size: 128
-    pca_max_clips: 50
+    pca_max_clips: 10
