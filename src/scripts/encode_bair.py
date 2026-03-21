@@ -91,22 +91,65 @@ def load_bair_dataset(tfds_data_dir: str | None = None):
 def load_vjepa2_encoder(device: torch.device) -> torch.nn.Module:
     """Load V-JEPA2 ViT-Large encoder from torch.hub.
 
+    Uses a two-phase approach: first let torch.hub download the repo,
+    then manually load hubconf.py with the vjepa2 repo's ``src`` package
+    on sys.path (ahead of the project's own ``src``).
+
     Returns:
         V-JEPA2 encoder model in eval mode.
     """
+    import importlib
     import sys
 
     log.info("Loading V-JEPA2 ViT-Large from torch.hub...")
 
-    # Remove any stale vjepa2_repo entries from sys.path (e.g. left by Gemini)
-    # that can cause 'No module named src.hub' conflicts.
-    original_path = sys.path.copy()
-    sys.path = [p for p in sys.path if "vjepa2_repo" not in p]
+    # Phase 1: Download the repo via torch.hub (but don't load the model yet)
+    hub_dir = torch.hub.get_dir()
+    repo_dir = Path(hub_dir) / "facebookresearch_vjepa2_main"
+
+    if not repo_dir.exists():
+        log.info("Downloading vjepa2 repo...")
+        torch.hub._validate_not_a_forked_repo = lambda *a, **k: True  # skip check
+        torch.hub.download_url_to_file(
+            "https://github.com/facebookresearch/vjepa2/zipball/main",
+            str(Path(hub_dir) / "main.zip"),
+        )
+        import zipfile
+        with zipfile.ZipFile(str(Path(hub_dir) / "main.zip"), "r") as z:
+            # The zip contains a top-level directory like facebookresearch-vjepa2-<hash>
+            top = z.namelist()[0].split("/")[0]
+            z.extractall(hub_dir)
+        extracted = Path(hub_dir) / top
+        extracted.rename(repo_dir)
+
+    # Phase 2: Temporarily hijack sys.path and sys.modules so that
+    # `from src.hub.backbones import ...` resolves to the vjepa2 repo's src/
+    saved_path = sys.path.copy()
+    saved_src_module = sys.modules.pop("src", None)
+    # Also remove any sub-modules of our project's src that are cached
+    saved_src_submodules = {
+        k: sys.modules.pop(k) for k in list(sys.modules) if k.startswith("src.")
+    }
 
     try:
-        model = torch.hub.load("facebookresearch/vjepa2", "vjepa2_vit_large", force_reload=True)
+        sys.path.insert(0, str(repo_dir))
+        # Force Python to re-discover 'src' from the new path
+        spec = importlib.util.spec_from_file_location(
+            "hubconf", str(repo_dir / "hubconf.py")
+        )
+        hubconf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hubconf)
+        model = hubconf.vjepa2_vit_large()
     finally:
-        sys.path = original_path
+        # Restore everything
+        sys.path = saved_path
+        # Remove vjepa2's src from sys.modules, restore ours
+        for k in list(sys.modules):
+            if k == "src" or k.startswith("src."):
+                sys.modules.pop(k, None)
+        if saved_src_module is not None:
+            sys.modules["src"] = saved_src_module
+        sys.modules.update(saved_src_submodules)
 
     model = model.to(device).eval()
     log.info("V-JEPA2 encoder loaded successfully.")
