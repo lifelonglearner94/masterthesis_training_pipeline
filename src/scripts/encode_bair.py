@@ -327,8 +327,8 @@ def save_clip(
     fm_dir.mkdir(parents=True, exist_ok=True)
     as_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(fm_dir / "vjepa2_vitl16.npy", features)
-    np.save(as_dir / "actions.npy", actions)
+    np.savez_compressed(fm_dir / "vjepa2_vitl16.npz", features=features.astype(np.float16))
+    np.savez_compressed(as_dir / "actions.npz", actions=actions)
 
 
 @torch.no_grad()
@@ -373,7 +373,7 @@ def encode_dataset(
 
         # Skip already encoded clips (resume support)
         clip_dir = output_dir / f"clip_{clip_id:05d}"
-        if (clip_dir / "feature_maps" / "vjepa2_vitl16.npy").exists():
+        if (clip_dir / "feature_maps" / "vjepa2_vitl16.npz").exists():
             clips_encoded += 1
             if clips_encoded % 1000 == 0:
                 log.info(f"  Skipped {clips_encoded}/{total_clips} (already encoded)")

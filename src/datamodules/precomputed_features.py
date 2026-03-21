@@ -61,7 +61,7 @@ class DatasetNotFoundError(ValueError):
         self.data_dir = data_dir
         self.clip_prefix = clip_prefix
         self.feature_map_name = feature_map_name
-        expected_structure = f"{clip_prefix}XXXXX/{FEATURE_MAPS_DIR}/{feature_map_name}.npy"
+        expected_structure = f"{clip_prefix}XXXXX/{FEATURE_MAPS_DIR}/{feature_map_name}.npy (or .npz)"
         super().__init__(
             f"No valid clips found in {data_dir}. "
             f"Expected structure: {expected_structure}"
@@ -148,13 +148,14 @@ class PrecomputedFeaturesDataset(Dataset):
         if num_timesteps < MIN_NUM_TIMESTEPS:
             raise TimestepsValidationError(num_timesteps)
 
-        # Find all clip directories with the expected structure
-        feature_map_path = f"{FEATURE_MAPS_DIR}/{feature_map_name}.npy"
+        # Find all clip directories with the expected structure (.npz or .npy)
+        feature_npz_path = f"{FEATURE_MAPS_DIR}/{feature_map_name}.npz"
+        feature_npy_path = f"{FEATURE_MAPS_DIR}/{feature_map_name}.npy"
         self.episode_dirs = sorted([
             d for d in self.data_dir.iterdir()
             if d.is_dir()
             and d.name.startswith(clip_prefix)
-            and (d / feature_map_path).exists()
+            and ((d / feature_npz_path).exists() or (d / feature_npy_path).exists())
         ])
 
         # Filter by clip range if specified
@@ -165,9 +166,12 @@ class PrecomputedFeaturesDataset(Dataset):
             raise DatasetNotFoundError(self.data_dir, clip_prefix, feature_map_name)
 
         # Infer action_dim from first clip
-        first_actions = np.load(
-            self.episode_dirs[0] / ACTIONS_STATES_DIR / ACTIONS_FILE
-        )
+        first_npz = self.episode_dirs[0] / ACTIONS_STATES_DIR / "actions.npz"
+        first_npy = self.episode_dirs[0] / ACTIONS_STATES_DIR / ACTIONS_FILE
+        if first_npz.exists():
+            first_actions = np.load(first_npz)["actions"]
+        else:
+            first_actions = np.load(first_npy)
         self.action_dim = first_actions.shape[-1]
 
     def _filter_by_clip_range(self, directories: list[Path]) -> list[Path]:
@@ -256,9 +260,12 @@ class PrecomputedFeaturesDataset(Dataset):
         Returns:
             Feature array with shape [T, N, D].
         """
-        features = np.load(
-            episode_dir / FEATURE_MAPS_DIR / f"{self.feature_map_name}.npy"
-        )
+        npz_path = episode_dir / FEATURE_MAPS_DIR / f"{self.feature_map_name}.npz"
+        npy_path = episode_dir / FEATURE_MAPS_DIR / f"{self.feature_map_name}.npy"
+        if npz_path.exists():
+            features = np.load(npz_path)["features"].astype(np.float32)
+        else:
+            features = np.load(npy_path)
 
         # Handle different feature shapes:
         # - [T*N, D] flattened -> reshape to [T, N, D]
@@ -288,7 +295,12 @@ class PrecomputedFeaturesDataset(Dataset):
         Returns:
             Action array with shape [T_actions, action_dim].
         """
-        actions_original = np.load(episode_dir / ACTIONS_STATES_DIR / ACTIONS_FILE)
+        npz_path = episode_dir / ACTIONS_STATES_DIR / "actions.npz"
+        npy_path = episode_dir / ACTIONS_STATES_DIR / ACTIONS_FILE
+        if npz_path.exists():
+            actions_original = np.load(npz_path)["actions"]
+        else:
+            actions_original = np.load(npy_path)
 
         if self.use_full_actions:
             # Use all action timesteps directly (e.g., BAIR robot pushing)
