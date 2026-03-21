@@ -88,24 +88,8 @@ def load_bair_dataset(tfds_data_dir: str | None = None):
     return ds_train, ds_test
 
 
-def load_vjepa2_encoder(device: torch.device) -> torch.nn.Module:
-    """Load V-JEPA2 ViT-Large encoder from torch.hub.
-
-    Handles the ``src`` package name collision between our project and the
-    vjepa2 repo by explicitly pre-registering the vjepa2 ``src`` package in
-    ``sys.modules`` before executing ``hubconf.py``.
-
-    Returns:
-        V-JEPA2 encoder model in eval mode.
-    """
-    import importlib
-    import importlib.util
-    import sys
-    import types
-
-    log.info("Loading V-JEPA2 ViT-Large from torch.hub...")
-
-    # Phase 1: Ensure the vjepa2 repo is downloaded
+def _setup_vjepa2_repo() -> Path:
+    """Ensure the vjepa2 repo is downloaded and return its path."""
     hub_dir = torch.hub.get_dir()
     repo_dir = Path(hub_dir) / "facebookresearch_vjepa2_main"
 
@@ -124,59 +108,163 @@ def load_vjepa2_encoder(device: torch.device) -> torch.nn.Module:
         (Path(hub_dir) / top).rename(repo_dir)
         zip_path.unlink(missing_ok=True)
 
+    return repo_dir
+
+
+def _import_vjepa2_hubconf(repo_dir: Path):
+    """Import vjepa2's hubconf.py with proper src module isolation.
+
+    Returns a context-manager-like object that provides the hubconf module
+    and keeps the vjepa2 src modules active until explicitly cleaned up.
+    """
+    import importlib
+    import importlib.util
+    import types
+
     vjepa2_src_dir = repo_dir / "src"
 
-    # Phase 2: Temporarily replace *all* 'src' and 'src.*' modules so that
-    # `from src.hub.backbones import ...` inside hubconf.py resolves to
-    # the vjepa2 repo's src/ instead of our project's src/.
     saved_path = sys.path.copy()
     saved_modules = {}
     for k in list(sys.modules):
         if k == "src" or k.startswith("src."):
             saved_modules[k] = sys.modules.pop(k)
 
-    try:
-        # Put the vjepa2 repo dir first on sys.path
-        sys.path.insert(0, str(repo_dir))
+    sys.path.insert(0, str(repo_dir))
 
-        # Pre-register vjepa2's 'src' package in sys.modules.
-        # This is critical: it prevents Python's import machinery from
-        # falling back to the editable-install finder for our project.
-        src_init = vjepa2_src_dir / "__init__.py"
-        if src_init.exists():
-            spec = importlib.util.spec_from_file_location(
-                "src", str(src_init),
-                submodule_search_locations=[str(vjepa2_src_dir)],
-            )
-            src_mod = importlib.util.module_from_spec(spec)
-            sys.modules["src"] = src_mod
-            spec.loader.exec_module(src_mod)
-        else:
-            # Namespace package fallback
-            src_mod = types.ModuleType("src")
-            src_mod.__path__ = [str(vjepa2_src_dir)]
-            src_mod.__package__ = "src"
-            sys.modules["src"] = src_mod
-
-        importlib.invalidate_caches()
-
-        # Execute hubconf.py — its `from src.hub.backbones import ...`
-        # will now resolve to the vjepa2 repo's src/hub/backbones.py
-        hubconf_spec = importlib.util.spec_from_file_location(
-            "hubconf", str(repo_dir / "hubconf.py"),
+    src_init = vjepa2_src_dir / "__init__.py"
+    if src_init.exists():
+        spec = importlib.util.spec_from_file_location(
+            "src", str(src_init),
+            submodule_search_locations=[str(vjepa2_src_dir)],
         )
-        hubconf = importlib.util.module_from_spec(hubconf_spec)
-        hubconf_spec.loader.exec_module(hubconf)
+        src_mod = importlib.util.module_from_spec(spec)
+        sys.modules["src"] = src_mod
+        spec.loader.exec_module(src_mod)
+    else:
+        src_mod = types.ModuleType("src")
+        src_mod.__path__ = [str(vjepa2_src_dir)]
+        src_mod.__package__ = "src"
+        sys.modules["src"] = src_mod
 
-        model = hubconf.vjepa2_vit_large()
-    finally:
-        # Cleanup: remove vjepa2's src modules, restore ours
+    importlib.invalidate_caches()
+
+    hubconf_spec = importlib.util.spec_from_file_location(
+        "hubconf", str(repo_dir / "hubconf.py"),
+    )
+    hubconf = importlib.util.module_from_spec(hubconf_spec)
+    hubconf_spec.loader.exec_module(hubconf)
+
+    def cleanup():
         for k in list(sys.modules):
             if k == "src" or k.startswith("src."):
                 sys.modules.pop(k, None)
         sys.modules.update(saved_modules)
-        sys.path = saved_path
+        sys.path[:] = saved_path
         importlib.invalidate_caches()
+
+    return hubconf, cleanup
+
+
+def _find_weights_url(repo_dir: Path) -> str | None:
+    """Extract the ViT-Large weights URL from the vjepa2 backbones source."""
+    import re
+    backbones_file = repo_dir / "src" / "hub" / "backbones.py"
+    if not backbones_file.exists():
+        return None
+    text = backbones_file.read_text()
+    # Look for URL near vit_large / vitl / "large" entries
+    urls = re.findall(r'https?://[^"\s]+vitl[^"\s]*\.pt[^"\s]*', text)
+    if urls:
+        return urls[0]
+    # Fallback: find any .pt URL
+    urls = re.findall(r'https?://[^"\s]+\.pt[^"\s]*', text)
+    # Try to pick the large one
+    for u in urls:
+        if "large" in u.lower() or "vitl" in u.lower():
+            return u
+    return urls[-1] if urls else None
+
+
+def _download_with_wget(url: str, dest: Path) -> bool:
+    """Download a file using wget (bypasses Python urllib issues)."""
+    import subprocess
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    log.info(f"Downloading weights via wget: {url}")
+    result = subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), url],
+        capture_output=False,
+    )
+    return result.returncode == 0
+
+
+def load_vjepa2_encoder(
+    device: torch.device,
+    weights_path: str | None = None,
+) -> torch.nn.Module:
+    """Load V-JEPA2 ViT-Large encoder.
+
+    Handles the ``src`` package name collision between our project and the
+    vjepa2 repo. If the automatic weights download fails (e.g. network issues
+    on cloud instances), falls back to wget or a user-supplied weights file.
+
+    Args:
+        device: Torch device.
+        weights_path: Optional path to pre-downloaded .pt weights file.
+
+    Returns:
+        V-JEPA2 encoder model in eval mode.
+    """
+    log.info("Loading V-JEPA2 ViT-Large...")
+
+    repo_dir = _setup_vjepa2_repo()
+    hubconf, cleanup = _import_vjepa2_hubconf(repo_dir)
+
+    try:
+        # Try normal loading first
+        try:
+            model = hubconf.vjepa2_vit_large(pretrained=(weights_path is None))
+        except (OSError, Exception) as e:
+            if weights_path:
+                raise
+            log.warning(f"Automatic weight download failed: {e}")
+            log.info("Attempting fallback: create model without weights, then load manually...")
+
+            # Create model architecture without pretrained weights
+            model = hubconf.vjepa2_vit_large(pretrained=False)
+
+            # Try to find and download the weights URL via wget
+            weights_url = _find_weights_url(repo_dir)
+            if weights_url:
+                cache_dir = Path(torch.hub.get_dir()) / "checkpoints"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cached_weights = cache_dir / Path(weights_url).name.split("?")[0]
+
+                if not cached_weights.exists():
+                    if _download_with_wget(weights_url, cached_weights):
+                        weights_path = str(cached_weights)
+                    else:
+                        log.error(
+                            f"Could not download weights. Please download manually:\n"
+                            f"  wget -O /tmp/vjepa2_vitl.pt '{weights_url}'\n"
+                            f"Then re-run with: --weights_path /tmp/vjepa2_vitl.pt"
+                        )
+                        sys.exit(1)
+                else:
+                    weights_path = str(cached_weights)
+            else:
+                log.error(
+                    "Could not determine weights URL. Please download the "
+                    "V-JEPA2 ViT-Large weights manually and pass --weights_path."
+                )
+                sys.exit(1)
+    finally:
+        cleanup()
+
+    # Load weights from local file if provided
+    if weights_path:
+        log.info(f"Loading weights from {weights_path}")
+        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state_dict, strict=False)
 
     model = model.to(device).eval()
     log.info("V-JEPA2 encoder loaded successfully.")
@@ -455,6 +543,11 @@ def main():
         "--skip_test", action="store_true",
         help="Skip encoding of the test split.",
     )
+    parser.add_argument(
+        "--weights_path", type=str, default=None,
+        help="Path to pre-downloaded V-JEPA2 ViT-Large .pt weights file. "
+             "Use if automatic download fails on cloud instances.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -469,7 +562,7 @@ def main():
     ds_train, ds_test = load_bair_dataset(args.tfds_data_dir)
 
     # Load V-JEPA2 encoder
-    encoder = load_vjepa2_encoder(device)
+    encoder = load_vjepa2_encoder(device, weights_path=args.weights_path)
 
     # Encode train split → clip_00000 to clip_43263
     if not args.skip_train:
