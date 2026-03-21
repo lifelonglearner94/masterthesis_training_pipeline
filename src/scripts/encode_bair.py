@@ -91,65 +91,91 @@ def load_bair_dataset(tfds_data_dir: str | None = None):
 def load_vjepa2_encoder(device: torch.device) -> torch.nn.Module:
     """Load V-JEPA2 ViT-Large encoder from torch.hub.
 
-    Uses a two-phase approach: first let torch.hub download the repo,
-    then manually load hubconf.py with the vjepa2 repo's ``src`` package
-    on sys.path (ahead of the project's own ``src``).
+    Handles the ``src`` package name collision between our project and the
+    vjepa2 repo by explicitly pre-registering the vjepa2 ``src`` package in
+    ``sys.modules`` before executing ``hubconf.py``.
 
     Returns:
         V-JEPA2 encoder model in eval mode.
     """
     import importlib
+    import importlib.util
     import sys
+    import types
 
     log.info("Loading V-JEPA2 ViT-Large from torch.hub...")
 
-    # Phase 1: Download the repo via torch.hub (but don't load the model yet)
+    # Phase 1: Ensure the vjepa2 repo is downloaded
     hub_dir = torch.hub.get_dir()
     repo_dir = Path(hub_dir) / "facebookresearch_vjepa2_main"
 
     if not repo_dir.exists():
         log.info("Downloading vjepa2 repo...")
-        torch.hub._validate_not_a_forked_repo = lambda *a, **k: True  # skip check
+        zip_path = Path(hub_dir) / "main.zip"
         torch.hub.download_url_to_file(
             "https://github.com/facebookresearch/vjepa2/zipball/main",
-            str(Path(hub_dir) / "main.zip"),
+            str(zip_path),
         )
         import zipfile
-        with zipfile.ZipFile(str(Path(hub_dir) / "main.zip"), "r") as z:
-            # The zip contains a top-level directory like facebookresearch-vjepa2-<hash>
+        with zipfile.ZipFile(str(zip_path), "r") as z:
             top = z.namelist()[0].split("/")[0]
             z.extractall(hub_dir)
-        extracted = Path(hub_dir) / top
-        extracted.rename(repo_dir)
+        (Path(hub_dir) / top).rename(repo_dir)
+        zip_path.unlink(missing_ok=True)
 
-    # Phase 2: Temporarily hijack sys.path and sys.modules so that
-    # `from src.hub.backbones import ...` resolves to the vjepa2 repo's src/
+    vjepa2_src_dir = repo_dir / "src"
+
+    # Phase 2: Temporarily replace *all* 'src' and 'src.*' modules so that
+    # `from src.hub.backbones import ...` inside hubconf.py resolves to
+    # the vjepa2 repo's src/ instead of our project's src/.
     saved_path = sys.path.copy()
-    saved_src_module = sys.modules.pop("src", None)
-    # Also remove any sub-modules of our project's src that are cached
-    saved_src_submodules = {
-        k: sys.modules.pop(k) for k in list(sys.modules) if k.startswith("src.")
-    }
+    saved_modules = {}
+    for k in list(sys.modules):
+        if k == "src" or k.startswith("src."):
+            saved_modules[k] = sys.modules.pop(k)
 
     try:
+        # Put the vjepa2 repo dir first on sys.path
         sys.path.insert(0, str(repo_dir))
-        # Force Python to re-discover 'src' from the new path
-        spec = importlib.util.spec_from_file_location(
-            "hubconf", str(repo_dir / "hubconf.py")
+
+        # Pre-register vjepa2's 'src' package in sys.modules.
+        # This is critical: it prevents Python's import machinery from
+        # falling back to the editable-install finder for our project.
+        src_init = vjepa2_src_dir / "__init__.py"
+        if src_init.exists():
+            spec = importlib.util.spec_from_file_location(
+                "src", str(src_init),
+                submodule_search_locations=[str(vjepa2_src_dir)],
+            )
+            src_mod = importlib.util.module_from_spec(spec)
+            sys.modules["src"] = src_mod
+            spec.loader.exec_module(src_mod)
+        else:
+            # Namespace package fallback
+            src_mod = types.ModuleType("src")
+            src_mod.__path__ = [str(vjepa2_src_dir)]
+            src_mod.__package__ = "src"
+            sys.modules["src"] = src_mod
+
+        importlib.invalidate_caches()
+
+        # Execute hubconf.py — its `from src.hub.backbones import ...`
+        # will now resolve to the vjepa2 repo's src/hub/backbones.py
+        hubconf_spec = importlib.util.spec_from_file_location(
+            "hubconf", str(repo_dir / "hubconf.py"),
         )
-        hubconf = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(hubconf)
+        hubconf = importlib.util.module_from_spec(hubconf_spec)
+        hubconf_spec.loader.exec_module(hubconf)
+
         model = hubconf.vjepa2_vit_large()
     finally:
-        # Restore everything
-        sys.path = saved_path
-        # Remove vjepa2's src from sys.modules, restore ours
+        # Cleanup: remove vjepa2's src modules, restore ours
         for k in list(sys.modules):
             if k == "src" or k.startswith("src."):
                 sys.modules.pop(k, None)
-        if saved_src_module is not None:
-            sys.modules["src"] = saved_src_module
-        sys.modules.update(saved_src_submodules)
+        sys.modules.update(saved_modules)
+        sys.path = saved_path
+        importlib.invalidate_caches()
 
     model = model.to(device).eval()
     log.info("V-JEPA2 encoder loaded successfully.")
