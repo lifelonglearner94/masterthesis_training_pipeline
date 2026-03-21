@@ -68,7 +68,11 @@ def autoregressive_rollout(
         Tensor [8, N, D] on CPU — frame 0 is GT, frames 1–7 are predictions.
     """
     model.eval()
+    # Force CUDA — Triton/fla kernels (GatedDeltaNet) cannot run on CPU
+    if torch.cuda.is_available():
+        model = model.cuda()
     device = next(model.parameters()).device
+    log.info(f"  autoregressive_rollout: model device = {device}")
     features = features.to(device)
     actions = actions.to(device)
     states = states.to(device)

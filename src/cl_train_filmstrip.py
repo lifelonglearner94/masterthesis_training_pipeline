@@ -48,6 +48,13 @@ from src.utils.filmstrip_rollout import (
 log = logging.getLogger(__name__)
 
 
+def _ensure_cuda(model):
+    """Ensure model is on CUDA — required for Triton/fla kernels (GatedDeltaNet)."""
+    if torch.cuda.is_available():
+        model = model.cuda()
+    return model
+
+
 # =============================================================================
 # Sequential Pipeline + Filmstrips
 # =============================================================================
@@ -89,9 +96,7 @@ def _run_sequential_pipeline_with_filmstrip(cfg: DictConfig) -> None:
     else:
         model, _base_ckpt = run_base_training(cfg, wandb_group, output_dir)
 
-    # Ensure model is on GPU (Triton/fla kernels require CUDA tensors)
-    if torch.cuda.is_available():
-        model = model.cuda()
+    model = _ensure_cuda(model)
 
     # ── FIT PCA (once on base eval clips, reused for every filmstrip) ──
     log.info("\n--- Fitting PCA on base evaluation clips ---")
@@ -116,11 +121,13 @@ def _run_sequential_pipeline_with_filmstrip(cfg: DictConfig) -> None:
 
     # ── EVAL + FILMSTRIP after base ────────────────────────────────────
     log.info("\n--- Evaluation after Base Training ---")
+    model = _ensure_cuda(model)
     evaluate_all_tasks(
         model=model, cfg=cfg, tracker=tracker, train_exp_id=0,
         phase_name="after_base", wandb_group=wandb_group,
         output_dir=output_dir, is_hope=is_hope,
     )
+    model = _ensure_cuda(model)  # re-enforce after Lightning Trainer.test()
     generate_filmstrips_for_phase(
         model=model, cfg=cfg, pca=pca,
         phase_name="after_base", output_dir=output_dir,
@@ -160,6 +167,7 @@ def _run_sequential_pipeline_with_filmstrip(cfg: DictConfig) -> None:
 
         # --- eval ---
         log.info(f"\n--- Evaluation after Task {task_idx} ({task.name}) ---")
+        model = _ensure_cuda(model)
         evaluate_all_tasks(
             model=model, cfg=cfg, tracker=tracker, train_exp_id=task_idx,
             phase_name=f"after_task_{task_idx}", wandb_group=wandb_group,
@@ -167,6 +175,7 @@ def _run_sequential_pipeline_with_filmstrip(cfg: DictConfig) -> None:
         )
 
         # --- filmstrip ---
+        model = _ensure_cuda(model)  # re-enforce after Lightning Trainer.test()
         generate_filmstrips_for_phase(
             model=model, cfg=cfg, pca=pca,
             phase_name=f"after_task_{task_idx}", output_dir=output_dir,
