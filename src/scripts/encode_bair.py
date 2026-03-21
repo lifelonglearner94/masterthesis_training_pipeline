@@ -172,17 +172,23 @@ def _find_weights_url(repo_dir: Path) -> str | None:
     if not backbones_file.exists():
         return None
     text = backbones_file.read_text()
-    # Look for URL near vit_large / vitl / "large" entries
-    urls = re.findall(r'https?://[^"\s]+vitl[^"\s]*\.pt[^"\s]*', text)
-    if urls:
-        return urls[0]
-    # Fallback: find any .pt URL
-    urls = re.findall(r'https?://[^"\s]+\.pt[^"\s]*', text)
-    # Try to pick the large one
-    for u in urls:
+
+    # Find all URLs in the file
+    all_urls = re.findall(r'["\']+(https?://[^"\']+)["\']', text)
+    if not all_urls:
+        return None
+
+    # Prefer URLs with "large" or "vitl" in the name
+    for u in all_urls:
         if "large" in u.lower() or "vitl" in u.lower():
             return u
-    return urls[-1] if urls else None
+
+    # Fallback: find any .pt or model-like URL
+    for u in all_urls:
+        if u.endswith((".pt", ".pth", ".bin", ".safetensors")):
+            return u
+
+    return all_urls[0] if all_urls else None
 
 
 def _download_with_wget(url: str, dest: Path) -> bool:
@@ -204,8 +210,9 @@ def load_vjepa2_encoder(
     """Load V-JEPA2 ViT-Large encoder.
 
     Handles the ``src`` package name collision between our project and the
-    vjepa2 repo. If the automatic weights download fails (e.g. network issues
-    on cloud instances), falls back to wget or a user-supplied weights file.
+    vjepa2 repo. If the automatic weights download fails (e.g. Python urllib
+    issues on cloud instances), falls back to wget or a user-supplied weights
+    file by monkey-patching ``torch.hub.load_state_dict_from_url``.
 
     Args:
         device: Torch device.
@@ -217,54 +224,49 @@ def load_vjepa2_encoder(
     log.info("Loading V-JEPA2 ViT-Large...")
 
     repo_dir = _setup_vjepa2_repo()
-    hubconf, cleanup = _import_vjepa2_hubconf(repo_dir)
 
-    try:
-        # Try normal loading first
-        try:
-            model = hubconf.vjepa2_vit_large(pretrained=(weights_path is None))
-        except (OSError, Exception) as e:
-            if weights_path:
-                raise
-            log.warning(f"Automatic weight download failed: {e}")
-            log.info("Attempting fallback: create model without weights, then load manually...")
+    # If user provided weights, or we need to pre-download them,
+    # ensure we have a local weights file ready
+    if weights_path is None:
+        # Pre-download weights via wget (bypasses Python urllib issues)
+        weights_url = _find_weights_url(repo_dir)
+        if weights_url:
+            cache_dir = Path(torch.hub.get_dir()) / "checkpoints"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            fname = weights_url.split("/")[-1].split("?")[0]
+            cached_weights = cache_dir / fname
 
-            # Create model architecture without pretrained weights
-            model = hubconf.vjepa2_vit_large(pretrained=False)
-
-            # Try to find and download the weights URL via wget
-            weights_url = _find_weights_url(repo_dir)
-            if weights_url:
-                cache_dir = Path(torch.hub.get_dir()) / "checkpoints"
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                cached_weights = cache_dir / Path(weights_url).name.split("?")[0]
-
-                if not cached_weights.exists():
-                    if _download_with_wget(weights_url, cached_weights):
-                        weights_path = str(cached_weights)
-                    else:
-                        log.error(
-                            f"Could not download weights. Please download manually:\n"
-                            f"  wget -O /tmp/vjepa2_vitl.pt '{weights_url}'\n"
-                            f"Then re-run with: --weights_path /tmp/vjepa2_vitl.pt"
-                        )
-                        sys.exit(1)
-                else:
-                    weights_path = str(cached_weights)
+            if not cached_weights.exists():
+                log.info("Pre-downloading weights via wget (avoids Python urllib issues)...")
+                if not _download_with_wget(weights_url, cached_weights):
+                    log.error(
+                        f"Could not download weights. Please download manually:\n"
+                        f"  wget -O /tmp/vjepa2_vitl.pt '{weights_url}'\n"
+                        f"Then re-run with: --weights_path /tmp/vjepa2_vitl.pt"
+                    )
+                    sys.exit(1)
             else:
-                log.error(
-                    "Could not determine weights URL. Please download the "
-                    "V-JEPA2 ViT-Large weights manually and pass --weights_path."
-                )
-                sys.exit(1)
+                log.info(f"Using cached weights: {cached_weights}")
+
+            weights_path = str(cached_weights)
+
+    # Monkey-patch torch.hub.load_state_dict_from_url to load from local file
+    # instead of downloading (vjepa2_vit_large() always calls this internally)
+    original_load_fn = torch.hub.load_state_dict_from_url
+
+    def _patched_load(url, *args, **kwargs):
+        log.info(f"Intercepted weight download, loading from {weights_path}")
+        return torch.load(weights_path, map_location=kwargs.get("map_location", "cpu"), weights_only=True)
+
+    if weights_path:
+        torch.hub.load_state_dict_from_url = _patched_load
+
+    hubconf, cleanup = _import_vjepa2_hubconf(repo_dir)
+    try:
+        model = hubconf.vjepa2_vit_large()
     finally:
         cleanup()
-
-    # Load weights from local file if provided
-    if weights_path:
-        log.info(f"Loading weights from {weights_path}")
-        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
+        torch.hub.load_state_dict_from_url = original_load_fn
 
     model = model.to(device).eval()
     log.info("V-JEPA2 encoder loaded successfully.")
