@@ -357,6 +357,9 @@ def generate_filmstrips_for_phase(
             batch_size=1,
             val_split=0.0,
         )
+        # Force num_workers=0 to avoid DataLoader deadlocks on rental GPUs
+        dm.num_workers = 0
+        dm.persistent_workers = False
         dm.setup("test")
         dl = dm.test_dataloader()
 

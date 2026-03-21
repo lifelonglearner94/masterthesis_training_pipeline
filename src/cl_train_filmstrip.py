@@ -99,6 +99,9 @@ def _run_sequential_pipeline_with_filmstrip(cfg: DictConfig) -> None:
         batch_size=32,
         val_split=0.0,
     )
+    # Force num_workers=0 to avoid DataLoader deadlocks on rental GPUs
+    pca_dm.num_workers = 0
+    pca_dm.persistent_workers = False
     filmstrip_cfg = cl_cfg.get("filmstrip", {})
     pca = fit_pca_on_base_clips(
         pca_dm,
