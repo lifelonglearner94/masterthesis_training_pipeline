@@ -35,6 +35,8 @@ dev = [
 comparison-architectures = [
     "einops>=0.8.0",
     "flash-linear-attention>=0.4.0",  # fla — pure Triton, provides RetNet, GatedDeltaNet, conv1d ops
+    "matplotlib",
+    "scikit-learn",
 ]
 # Optional CUDA-compiled extensions for extra inference performance.
 # These require a CUDA toolkit matching your PyTorch CUDA version.
