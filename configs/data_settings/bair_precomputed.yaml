@@ -1,0 +1,40 @@
+# Pre-computed V-JEPA2 features for BAIR Robot Pushing dataset
+# Encoded with: python src/scripts/encode_bair.py --output_dir data/bair
+#
+# BAIR robot pushing small (Ebert et al., 2017):
+#   Train: 43,264 episodes → clip_00000 to clip_43263
+#   Test:  256 episodes    → clip_43264 to clip_43519
+#   Actions: 4D (robot end-effector dx, dy, dz, dtheta)
+#   Original frames: 64x64, upscaled to 256x256 for V-JEPA2 encoding
+#
+# use_full_actions=true: load ALL action timesteps (not just index 1)
+#   because BAIR has meaningful per-timestep robot commands.
+
+_target_: src.datamodules.PrecomputedFeaturesDataModule
+
+# Data paths
+data_dir: ${paths.data_dir}
+
+# File structure settings
+feature_map_name: "vjepa2_vitl16"
+clip_prefix: "clip_"
+
+# Clip range (BAIR train split)
+clip_start: 0
+clip_end: 43264
+
+# Validation split
+val_split: 0.1  # Last 10% of train clips for validation (~4326 clips)
+
+# Dataset settings
+num_timesteps: 8          # 16 original frames / tubelet_size=2
+patches_per_frame: 256    # 16x16 patches on 256x256 images
+use_extrinsics: false
+use_full_actions: true    # BAIR: use all action timesteps, not just index 1
+
+# DataLoader settings
+batch_size: 64
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+shuffle_test: false

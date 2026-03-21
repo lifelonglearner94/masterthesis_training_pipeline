@@ -108,6 +108,7 @@ class PrecomputedFeaturesDataset(Dataset):
         clip_prefix: str = "clip_",
         clip_start: int | None = None,
         clip_end: int | None = None,
+        use_full_actions: bool = False,
     ) -> None:
         """Initialize the dataset.
 
@@ -125,6 +126,9 @@ class PrecomputedFeaturesDataset(Dataset):
                 Clips are filtered by their numeric ID (e.g., clip_00042 -> 42).
             clip_end: End of clip range (exclusive). If None, no upper bound.
                 Example: clip_start=0, clip_end=5000 selects clips 0-4999.
+            use_full_actions: If True, load all action timesteps directly instead
+                of only preserving the action at IMPORTANT_ACTION_INDEX. Use this
+                for datasets with meaningful per-timestep actions (e.g., BAIR).
 
         Raises:
             TimestepsValidationError: If num_timesteps < 2.
@@ -138,6 +142,7 @@ class PrecomputedFeaturesDataset(Dataset):
         self.clip_prefix = clip_prefix
         self.clip_start = clip_start
         self.clip_end = clip_end
+        self.use_full_actions = use_full_actions
 
         # Validate num_timesteps
         if num_timesteps < MIN_NUM_TIMESTEPS:
@@ -284,6 +289,14 @@ class PrecomputedFeaturesDataset(Dataset):
             Action array with shape [T_actions, action_dim].
         """
         actions_original = np.load(episode_dir / ACTIONS_STATES_DIR / ACTIONS_FILE)
+
+        if self.use_full_actions:
+            # Use all action timesteps directly (e.g., BAIR robot pushing)
+            actions = np.zeros((T_actions, self.action_dim), dtype=np.float32)
+            copy_len = min(T_actions, actions_original.shape[0])
+            actions[:copy_len] = actions_original[:copy_len]
+            return actions
+
         actions = np.zeros((T_actions, self.action_dim), dtype=np.float32)
 
         # Preserve the important action value from index 1 -> index 0
@@ -389,6 +402,7 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
         pin_memory: bool | None = None,
         persistent_workers: bool = True,
         shuffle_test: bool = False,
+        use_full_actions: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the DataModule.
@@ -415,6 +429,8 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
                 Speeds up dataloader initialization. Requires num_workers > 0.
             shuffle_test: Whether to shuffle the test dataloader. Default False.
                 Set to False for TTA to ensure deterministic clip ordering.
+            use_full_actions: If True, load all action timesteps directly.
+                Use for datasets with per-timestep actions (e.g., BAIR).
 
         Raises:
             InvalidClipRangeError: If val_split would leave no clips for training.
@@ -442,6 +458,9 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
 
         # shuffle_test for TTA compatibility
         self.shuffle_test = shuffle_test
+
+        # Full actions mode (for BAIR-style datasets)
+        self.use_full_actions = use_full_actions
 
         self.train_dataset: PrecomputedFeaturesDataset | None = None
         self.val_dataset: PrecomputedFeaturesDataset | None = None
@@ -480,6 +499,7 @@ class PrecomputedFeaturesDataModule(L.LightningDataModule):
             "use_extrinsics": self.use_extrinsics,
             "feature_map_name": self.feature_map_name,
             "clip_prefix": self.clip_prefix,
+            "use_full_actions": self.use_full_actions,
         }
 
         if stage == "fit" or stage is None:

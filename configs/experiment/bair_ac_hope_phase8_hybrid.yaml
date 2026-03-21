@@ -1,0 +1,151 @@
+# @package _global_
+# =============================================================================
+# BAIR Robot Pushing Benchmark — AC-HOPE-Hybrid-ViT Phase 8
+# =============================================================================
+# Benchmarks the AC-HOPE Phase 8 Hybrid architecture on the public
+# BAIR Robot Pushing dataset (Ebert et al., 2017).
+#
+# Dataset: bair_robot_pushing_small (43,264 train + 256 test episodes)
+#   - 64x64 RGB frames upscaled to 256x256 for V-JEPA2 encoding
+#   - 4D actions (robot end-effector commands)
+#   - Pre-encoded with V-JEPA2 ViT-L → [8, 256, 1024] features
+#
+# Pre-encoding step (run BEFORE training):
+#   python src/scripts/encode_bair.py --output_dir data/bair
+#
+# Training:
+#   uv run src/train.py experiment=bair_ac_hope_phase8_hybrid paths.data_dir=data/bair
+#
+# Evaluation on BAIR test set (after training):
+#   uv run src/train.py experiment=bair_ac_hope_phase8_hybrid \
+#     paths.data_dir=data/bair \
+#     data.clip_start=43264 data.clip_end=43520 data.val_split=0.0 \
+#     train=false test=true ckpt_path=<path_to_best_ckpt>
+# =============================================================================
+
+defaults:
+  - override /data_settings@data: bair_precomputed
+  - override /model: ac_hope_hybrid_vit
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+# =============================================================================
+# EXPERIMENT METADATA
+# =============================================================================
+task_name: "bair_ac_hope_phase8"
+tags: ["bair", "benchmark", "ac_hope_hybrid", "attention", "titan",
+       "cms", "phase8", "rope", "public_dataset"]
+seed: 42
+train: True
+test: False
+
+# =============================================================================
+# DATA: BAIR Robot Pushing (pre-encoded V-JEPA2 features)
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+  # BAIR train split
+  clip_start: 0
+  clip_end: 43264
+  val_split: 0.1           # ~4326 clips for validation
+
+  # Full action loading (all timesteps, not just index 1)
+  use_full_actions: true
+
+# =============================================================================
+# MODEL: AC-HOPE-Hybrid-ViT Phase 8 (adapted for BAIR 4D actions)
+# =============================================================================
+model:
+  T_teacher: 7
+  jump_k: 3
+  use_activation_checkpointing: false
+  action_embed_dim: 4           # BAIR: 4D actions (dx, dy, dz, dtheta)
+
+  # ─── Hybrid architecture (same as phase 8) ───
+  depth: 10
+  num_heads: 16
+
+  # Titan memory
+  titan_hidden_multiplier: 2
+  titan_layers: 2
+  titan_activation: "gelu"
+  titan_grad_clip_inner: 1.0
+  titan_grad_clip_backward: 1.0
+  titan_detach_interval: 2
+  surprise_threshold: 0.1
+
+  # Longterm memory (disabled — no CL tasks for BAIR benchmark)
+  use_longterm_memory: false
+
+  # CMS — heterogeneous multi-frequency
+  cms_use_chunk_scheduling: true
+  cms_level_specs:
+    - name: "fast"
+      update_period: 1
+      hidden_multiplier: 2.0
+      warmup_steps: 0
+    - name: "medium"
+      update_period: 3
+      hidden_multiplier: 2.5
+      warmup_steps: 0
+    - name: "slow"
+      update_period: 7
+      hidden_multiplier: 3.0
+      warmup_steps: 0
+
+  # Attention settings
+  qkv_bias: true
+  attn_drop_rate: 0.0
+
+  # Diagnostics
+  log_hope_diagnostics: true
+  diagnostics_log_interval: 50
+
+  # Loss
+  loss_weight_teacher: 1.0
+  loss_weight_jump: 1.0
+  loss_type: "l1"
+
+  # No curriculum needed for single-distribution benchmark
+  curriculum_schedule: null
+
+  # Regularization
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+  # Optimizer
+  optimizer_type: "adamw"
+  learning_rate: 4.25e-4
+  weight_decay: 0.04
+  betas: [0.9, 0.999]
+
+  # Per-group LR scaling
+  attention_lr_scale: 1.0
+  titan_lr_scale: 0.1
+  cms_lr_scale: 0.6
+  titan_weight_decay: 0.005
+  aux_loss_weight: 0.0
+
+  # LR schedule
+  use_iteration_scheduler: true
+  warmup_pct: 0.10
+  constant_pct: 0.80
+  decay_pct: 0.10
+  warmup_start_lr: 7.5e-5
+
+  # TTA disabled
+  tta_enabled: false
+
+# =============================================================================
+# TRAINER
+# =============================================================================
+trainer:
+  max_epochs: 40
+  precision: "16-mixed"
+  gradient_clip_val: 1.5
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
