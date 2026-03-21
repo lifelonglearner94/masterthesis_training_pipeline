@@ -68,6 +68,7 @@ def load_bair_dataset(tfds_data_dir: str | None = None):
         Tuple of (train_dataset, test_dataset).
     """
     try:
+        import tensorflow as tf
         import tensorflow_datasets as tfds
     except ImportError:
         log.error(
@@ -75,6 +76,10 @@ def load_bair_dataset(tfds_data_dir: str | None = None):
             "  pip install tensorflow-datasets tensorflow"
         )
         sys.exit(1)
+
+    # Prevent TensorFlow from grabbing all GPU memory — we need it for PyTorch
+    for gpu in tf.config.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(gpu, True)
 
     log.info("Loading BAIR robot pushing dataset (this may download ~30GB on first run)...")
     kwargs = {}
@@ -239,7 +244,8 @@ def load_vjepa2_encoder(
     hubconf, cleanup = _import_vjepa2_hubconf(repo_dir)
     try:
         # vjepa2_vit_large() returns (encoder, predictor) — we only need encoder
-        encoder, _predictor = hubconf.vjepa2_vit_large()
+        # Pass num_frames=16 to match BAIR (default 64 wastes memory)
+        encoder, _predictor = hubconf.vjepa2_vit_large(num_frames=NUM_INPUT_FRAMES)
     finally:
         cleanup()
         torch.hub.load_state_dict_from_url = original_load_fn
