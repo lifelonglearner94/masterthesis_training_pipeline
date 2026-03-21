@@ -23,6 +23,7 @@ import logging
 
 import hydra
 import lightning as L
+import torch
 from omegaconf import DictConfig
 
 from src.cl_train import (
@@ -87,6 +88,10 @@ def _run_sequential_pipeline_with_filmstrip(cfg: DictConfig) -> None:
         load_checkpoint_weights(model, resume_ckpt)
     else:
         model, _base_ckpt = run_base_training(cfg, wandb_group, output_dir)
+
+    # Ensure model is on GPU (Triton/fla kernels require CUDA tensors)
+    if torch.cuda.is_available():
+        model = model.cuda()
 
     # ── FIT PCA (once on base eval clips, reused for every filmstrip) ──
     log.info("\n--- Fitting PCA on base evaluation clips ---")
