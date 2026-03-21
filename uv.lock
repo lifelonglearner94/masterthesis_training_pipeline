@@ -883,6 +883,8 @@ dependencies = [
 comparison-architectures = [
     { name = "einops" },
     { name = "flash-linear-attention" },
+    { name = "matplotlib" },
+    { name = "scikit-learn" },
 ]
 comparison-architectures-cuda = [
     { name = "causal-conv1d" },
@@ -913,6 +915,7 @@ requires-dist = [
     { name = "hydra-optuna-sweeper", specifier = ">=1.2.0" },
     { name = "ipykernel", marker = "extra == 'dev'" },
     { name = "lightning", specifier = ">=2.2.0" },
+    { name = "matplotlib", marker = "extra == 'comparison-architectures'" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "numpy", specifier = "<2.0.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
@@ -922,6 +925,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "rich", specifier = ">=13.7.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
+    { name = "scikit-learn", marker = "extra == 'comparison-architectures'" },
     { name = "scikit-learn", marker = "extra == 'dev'" },
     { name = "timm", specifier = ">=0.9.0" },
     { name = "torch", specifier = ">=2.2.0" },

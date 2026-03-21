@@ -274,6 +274,7 @@ class HybridBlock(nn.Module):
         if self._disable_titan:
             y = self.norm2(x)
             y = self.titan_replacement(y)
+            x = x + self.drop_path(y)
         else:
             y = self.norm2(x)
             y = self._titan_forward(y)
