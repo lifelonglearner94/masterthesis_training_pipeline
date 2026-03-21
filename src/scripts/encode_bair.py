@@ -94,8 +94,20 @@ def load_vjepa2_encoder(device: torch.device) -> torch.nn.Module:
     Returns:
         V-JEPA2 encoder model in eval mode.
     """
+    import sys
+
     log.info("Loading V-JEPA2 ViT-Large from torch.hub...")
-    model = torch.hub.load("facebookresearch/vjepa2", "vjepa2_vit_large")
+
+    # Remove any stale vjepa2_repo entries from sys.path (e.g. left by Gemini)
+    # that can cause 'No module named src.hub' conflicts.
+    original_path = sys.path.copy()
+    sys.path = [p for p in sys.path if "vjepa2_repo" not in p]
+
+    try:
+        model = torch.hub.load("facebookresearch/vjepa2", "vjepa2_vit_large", force_reload=True)
+    finally:
+        sys.path = original_path
+
     model = model.to(device).eval()
     log.info("V-JEPA2 encoder loaded successfully.")
     return model
