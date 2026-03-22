@@ -44,14 +44,14 @@ test: False
 # DATA: BAIR Robot Pushing (pre-encoded V-JEPA2 features)
 # =============================================================================
 data:
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   pin_memory: true
 
   # BAIR train split
   clip_start: 0
-  clip_end: 43264
-  val_split: 0.1           # ~4326 clips for validation
+  clip_end: 10000
+  val_split: 0.1           # ~1000 clips for validation
 
   # Full action loading (all timesteps, not just index 1)
   use_full_actions: true
